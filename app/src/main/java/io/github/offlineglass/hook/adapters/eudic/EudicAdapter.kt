@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.view.View
 import android.view.ViewGroup
+import kotlin.math.roundToInt
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
@@ -20,7 +21,10 @@ internal object EudicAdapter : TargetAdapter {
     override val nativeSelectionReliable = true
     override val skipNavigationSnapshot = true
     override val managesNativeTabVisibility = true
-    override val usesContentDarkMode = true
+    override val usesContentDarkMode = false
+
+    override fun hostBottomMarginPx(view: View, defaultGap: Int): Int =
+        defaultGap + (12f * view.resources.displayMetrics.density).roundToInt()
 
     override fun createNavigationState(context: Context, host: GlassHostLayout): AppNavigationState =
         EudicNavigationState(host)

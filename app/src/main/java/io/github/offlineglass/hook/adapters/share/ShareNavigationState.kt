@@ -1,6 +1,6 @@
 package io.github.offlineglass.hook.adapters.share
 
-import android.content.res.Configuration
+import android.content.res.ColorStateList
 import android.graphics.BlendMode
 import android.graphics.BlendModeColorFilter
 import android.graphics.Canvas
@@ -111,12 +111,14 @@ internal class ShareNavigationState(private val host: GlassHostLayout) : AppNavi
         val bar = source
         if (bar != null) {
             sampledNativeBgDark[bar]?.let { return it }
-            (bar.parent as? View)?.let(::backgroundDark)?.let { return it }
+            sampleBarBackgroundDark(bar)?.let { detected ->
+                sampledNativeBgDark[bar] = detected
+                return detected
+            }
         }
-        val uiNight = (host.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
-            Configuration.UI_MODE_NIGHT_YES
-        if (uiNight) return true
-        return (host as? GlassHostLayout)?.adapterContentOrSystemDark() ?: uiNight
+        // Share's theme manager writes MODE_NIGHT_YES into StatusActivity's AppCompatDelegate
+        // before resetting transparent flags on light themes, so ignore host Activity uiMode.
+        return (host as? GlassHostLayout)?.deviceNightMode() == true
     }
 
     override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
@@ -375,9 +377,7 @@ internal class ShareNavigationState(private val host: GlassHostLayout) : AppNavi
 
         internal fun suppressChrome(bar: ViewGroup) {
             if (!sampledNativeBgDark.containsKey(bar)) {
-                val detected = backgroundDark(bar)
-                    ?: (bar.parent as? View)?.let(::backgroundDark)
-                    ?: bar.rootView?.let(::backgroundDark)
+                val detected = sampleBarBackgroundDark(bar)
                 if (detected != null) sampledNativeBgDark[bar] = detected
             }
             if (bar.alpha != 0f) bar.alpha = 0f
@@ -416,12 +416,27 @@ internal class ShareNavigationState(private val host: GlassHostLayout) : AppNavi
             }
         }
 
+        private fun sampleBarBackgroundDark(bar: ViewGroup): Boolean? {
+            backgroundDark(bar)?.let { return it }
+            for (i in 0 until bar.childCount) {
+                val child = bar.getChildAt(i)
+                backgroundDark(child)?.let { return it }
+                if (child is ViewGroup) {
+                    for (j in 0 until child.childCount) {
+                        backgroundDark(child.getChildAt(j))?.let { return it }
+                    }
+                }
+            }
+            (bar.parent as? View)?.let(::backgroundDark)?.let { return it }
+            return bar.rootView?.let(::backgroundDark)
+        }
+
         private fun backgroundDark(view: View): Boolean? {
             val bg = view.background ?: return null
             val color = when (bg) {
                 is ColorDrawable -> bg.color
                 else -> runCatching {
-                    (XposedHelpers.callMethod(bg, "getFillColor") as? android.content.res.ColorStateList)?.defaultColor
+                    (XposedHelpers.callMethod(bg, "getFillColor") as? ColorStateList)?.defaultColor
                 }.getOrNull() ?: return null
             }
             if (Color.alpha(color) < 128) return null

@@ -6,12 +6,14 @@ import android.graphics.BlendModeColorFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
@@ -24,6 +26,7 @@ import io.github.offlineglass.hook.adapters.AppNavigationState
 import java.util.WeakHashMap
 import java.util.concurrent.Executors
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 /** Projects Eudic visible Material bottom tabs and expands the fragment container full-bleed. */
 internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavigationState {
@@ -42,12 +45,16 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
     private var reportedLabels = emptyList<String>()
     private var reportingLabels = false
     private var nextLabelProbe = 0L
+    private var nextClearanceAt = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
     private val iconLayerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val iconBounds = RectF()
     private val iconPosition = IntArray(2)
     private val badgePosition = IntArray(2)
+    private val scrollBasePaddings = WeakHashMap<ViewGroup, IntArray>()
+    private val controlBasePaddings = WeakHashMap<View, IntArray>()
+    private val controlBaseMargins = WeakHashMap<View, Int>()
 
     override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) {
         val visible = EudicAdapter.visibleTabViews(source)
@@ -58,11 +65,15 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
         }
         this.source = source
         refreshAt = now + 250L
+        nextClearanceAt = 0L
         items = visible.map(::inspectTabItem)
     }
 
     override fun onHostFrame(host: View) {
-        source?.let(::suppressChrome)
+        source?.let { nav ->
+            suppressChrome(nav)
+            syncContentClearance(host, nav)
+        }
         reportNativeLabels()
         if (items.any { item ->
                 (listOfNotNull(item.icon) + item.badges).any { it.visibility == View.VISIBLE && it.isDirty }
@@ -85,12 +96,12 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
         val nav = source
         if (nav != null) {
             sampledNativeBgDark[nav]?.let { return it }
+            themeBackgroundDark(nav)?.let { return it }
             (nav.parent as? View)?.let(::backgroundDark)?.let { return it }
         }
         val uiNight = (host.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
-        if (uiNight) return true
-        return (host as? GlassHostLayout)?.adapterContentOrSystemDark() ?: uiNight
+        return uiNight || ((host as? GlassHostLayout)?.deviceNightMode() == true)
     }
 
     override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
@@ -113,6 +124,7 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
 
     override fun onTapSucceeded(requestRefresh: (Long) -> Unit) {
         refreshAt = 0L
+        nextClearanceAt = 0L
         requestRefresh(0L)
         requestRefresh(80L)
     }
@@ -304,6 +316,191 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
         }
     }
 
+    /** Pads scrollable content and lifts bottom-anchored AI controls above the floating glass pill. */
+    private fun syncContentClearance(host: View, navigation: ViewGroup) {
+        val now = SystemClock.uptimeMillis()
+        if (now < nextClearanceAt) return
+        nextClearanceAt = now + 120L
+
+        if (!host.isShown || host.height <= 0) return
+        val container = navigation.parent as? ViewGroup ?: return
+        val pkg = navigation.context.packageName
+        val res = navigation.resources
+        val fragmentId = res.getIdentifier("fragment_container", "id", pkg)
+        if (fragmentId == 0) return
+        val fragmentContainer = container.findViewById<ViewGroup>(fragmentId) ?: return
+
+        val hostRect = Rect()
+        val containerRect = Rect()
+        if (!host.getGlobalVisibleRect(hostRect) || !fragmentContainer.getGlobalVisibleRect(containerRect)) return
+        if (hostRect.height() < host.height / 2 || hostRect.top <= containerRect.top || containerRect.bottom <= hostRect.top) {
+            return
+        }
+
+        val density = host.resources.displayMetrics.density
+        val wantedContentBottom = hostRect.top - (8f * density).roundToInt()
+        val fullClearance = (containerRect.bottom - wantedContentBottom).coerceAtLeast(0)
+        val pillLift = (containerRect.bottom - hostRect.top).coerceAtLeast(0)
+
+        applyScrollClearance(fragmentContainer, host, navigation, wantedContentBottom)
+        applyAiBottomControlClearance(fragmentContainer, pkg, fullClearance, pillLift)
+    }
+
+    private fun applyScrollClearance(
+        fragmentContainer: ViewGroup,
+        host: View,
+        navigation: ViewGroup,
+        wantedContentBottom: Int,
+    ) {
+        val candidates = ArrayList<ViewGroup>()
+        val stack = ArrayDeque<Pair<View, Int>>()
+        stack.addLast(fragmentContainer to 0)
+        val rect = Rect()
+
+        while (stack.isNotEmpty()) {
+            val (view, depth) = stack.removeLast()
+            if (view === host || view === navigation || !view.isShown) continue
+            if (view !is ViewGroup) continue
+
+            val className = view.javaClass.name
+            val parentName = view.parent?.javaClass?.name.orEmpty()
+            val isPager = className.contains("ViewPager") || parentName.contains("ViewPager2")
+            val scrollLike = !isPager && (
+                className.contains("ScrollView") ||
+                    className.contains("NestedScroll") ||
+                    className.contains("RecyclerView") ||
+                    className.contains("ListView")
+                )
+            if (scrollLike && !isHorizontalOnlyRecycler(view, className)) {
+                if (view.getGlobalVisibleRect(rect) &&
+                    rect.height() >= host.height * 2 &&
+                    rect.top < wantedContentBottom &&
+                    rect.bottom > wantedContentBottom &&
+                    candidates.none { isDescendantOf(view, it) }
+                ) {
+                    candidates += view
+                    continue
+                }
+            }
+            if (depth < 24) {
+                for (i in view.childCount - 1 downTo 0) {
+                    stack.addLast(view.getChildAt(i) to depth + 1)
+                }
+            }
+        }
+
+        for (view in candidates) {
+            if (!view.getGlobalVisibleRect(rect)) continue
+            val base = scrollBasePaddings.getOrPut(view) {
+                intArrayOf(view.paddingLeft, view.paddingTop, view.paddingRight, view.paddingBottom)
+            }
+            val requiredBottom = base[3] + (rect.bottom - wantedContentBottom).coerceAtLeast(0)
+            if (view.paddingBottom != requiredBottom || view.clipToPadding) {
+                view.setPadding(base[0], base[1], base[2], requiredBottom)
+                view.clipToPadding = false
+            }
+        }
+    }
+
+    private fun applyAiBottomControlClearance(
+        fragmentContainer: ViewGroup,
+        pkg: String,
+        fullClearance: Int,
+        pillLift: Int,
+    ) {
+        val res = fragmentContainer.resources
+        // Translation tab ("翻译"): preserve existing 20dp margin above the glass pill.
+        listOf("voice_button", "liv_voice_anim").forEach { entry ->
+            val id = res.getIdentifier(entry, "id", pkg)
+            if (id != 0) findAllViewsById(fragmentContainer, id).forEach { adjustBottomMargin(it, pillLift) }
+        }
+        // Simultaneous interpretation ("同传"): pad record_container so bottom mic clears pill.
+        val recordId = res.getIdentifier("record_container", "id", pkg)
+        val bottomContainerId = res.getIdentifier("bottom_container", "id", pkg)
+        if (recordId != 0 && bottomContainerId != 0) {
+            findAllViewsById(fragmentContainer, recordId).forEach { recordView ->
+                if (recordView.findViewById<View>(bottomContainerId) != null) {
+                    adjustBottomPadding(recordView, pillLift, clearClip = false)
+                }
+            }
+        }
+        // AI writing / correction ("批改"): pad root ConstraintLayout (keeps its full-bleed background).
+        val webEditorId = res.getIdentifier("web_editor", "id", pkg)
+        val toolbarId = res.getIdentifier("editor_toolbar", "id", pkg)
+        if (webEditorId != 0 && toolbarId != 0) {
+            findAllViewsById(fragmentContainer, webEditorId).forEach { editor ->
+                val writerRoot = editor.parent as? ViewGroup ?: return@forEach
+                if (writerRoot !== fragmentContainer && writerRoot.findViewById<View>(toolbarId) != null) {
+                    adjustBottomPadding(writerRoot, fullClearance, clearClip = true)
+                }
+            }
+        }
+        // AI chat / speaking ("口语"): lift bottom input bar above the pill.
+        val inputLayoutId = res.getIdentifier("input_layout", "id", pkg)
+        val chatContainerId = res.getIdentifier("chatContainer", "id", pkg)
+        if (inputLayoutId != 0 && chatContainerId != 0) {
+            findAllViewsById(fragmentContainer, inputLayoutId).forEach { input ->
+                val chatParent = input.parent as? View
+                if (chatParent?.id == chatContainerId) {
+                    adjustBottomMargin(input, fullClearance)
+                }
+            }
+        }
+    }
+
+    private fun adjustBottomMargin(view: View, extraMargin: Int) {
+        val lp = view.layoutParams as? ViewGroup.MarginLayoutParams ?: return
+        val base = controlBaseMargins.getOrPut(view) { lp.bottomMargin }
+        val target = base + extraMargin
+        if (lp.bottomMargin != target) {
+            lp.bottomMargin = target
+            view.layoutParams = lp
+        }
+    }
+
+    private fun adjustBottomPadding(view: View, extraPadding: Int, clearClip: Boolean) {
+        val base = controlBasePaddings.getOrPut(view) {
+            intArrayOf(view.paddingLeft, view.paddingTop, view.paddingRight, view.paddingBottom)
+        }
+        val target = base[3] + extraPadding
+        val needsClip = clearClip && view is ViewGroup && view.clipToPadding
+        if (view.paddingBottom != target || needsClip) {
+            view.setPadding(base[0], base[1], base[2], target)
+            if (needsClip) view.clipToPadding = false
+        }
+    }
+
+    private fun isHorizontalOnlyRecycler(view: ViewGroup, className: String): Boolean {
+        if (!className.contains("RecyclerView")) return false
+        val lm = runCatching { XposedHelpers.callMethod(view, "getLayoutManager") }.getOrNull() ?: return false
+        val horiz = runCatching { XposedHelpers.callMethod(lm, "canScrollHorizontally") as? Boolean == true }.getOrDefault(false)
+        val vert = runCatching { XposedHelpers.callMethod(lm, "canScrollVertically") as? Boolean == true }.getOrDefault(false)
+        return horiz && !vert
+    }
+
+    private fun findAllViewsById(root: ViewGroup, id: Int): List<View> {
+        val result = ArrayList<View>()
+        val stack = ArrayDeque<View>()
+        stack.addLast(root)
+        while (stack.isNotEmpty()) {
+            val view = stack.removeLast()
+            if (view.id == id) result += view
+            if (view is ViewGroup) {
+                for (i in view.childCount - 1 downTo 0) stack.addLast(view.getChildAt(i))
+            }
+        }
+        return result
+    }
+
+    private fun isDescendantOf(view: View, ancestor: ViewGroup): Boolean {
+        var current = view.parent
+        while (current is View) {
+            if (current === ancestor) return true
+            current = current.parent
+        }
+        return false
+    }
+
     private fun findFirstImage(root: View): ImageView? {
         if (root is ImageView) return root
         if (root is ViewGroup) {
@@ -342,7 +539,9 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
 
         internal fun suppressChrome(navigation: ViewGroup) {
             if (!sampledNativeBgDark.containsKey(navigation)) {
-                val detected = backgroundDark(navigation) ?: (navigation.parent as? View)?.let(::backgroundDark)
+                val detected = backgroundDark(navigation)
+                    ?: themeBackgroundDark(navigation)
+                    ?: (navigation.parent as? View)?.let(::backgroundDark)
                 if (detected != null) sampledNativeBgDark[navigation] = detected
             }
             if (navigation.alpha != 0f) navigation.alpha = 0f
@@ -384,25 +583,70 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
             }
             val fragmentId = res.getIdentifier("fragment_container", "id", pkg)
             if (fragmentId != 0) {
-                container.findViewById<View>(fragmentId)?.let(::expandFragmentFullBleed)
+                container.findViewById<View>(fragmentId)?.let { fragmentContainer ->
+                    expandFragmentFullBleed(fragmentContainer, navigation.id)
+                }
             }
         }
 
-        private fun expandFragmentFullBleed(fragmentContainer: View) {
+        private fun expandFragmentFullBleed(fragmentContainer: View, navId: Int) {
             val lp = fragmentContainer.layoutParams as? ViewGroup.MarginLayoutParams ?: return
             val lpClass = lp.javaClass
-            val topField = runCatching { lpClass.getField("bottomToTop") }.getOrNull() ?: return
-            val bottomField = runCatching { lpClass.getField("bottomToBottom") }.getOrNull() ?: return
-            val bottomToTop = runCatching { topField.getInt(lp) }.getOrNull() ?: return
-            val bottomToBottom = runCatching { bottomField.getInt(lp) }.getOrNull() ?: return
-            if (bottomToTop != -1 || bottomToBottom != 0 || lp.bottomMargin != 0) {
+            val topField = runCatching { lpClass.getField("bottomToTop") }.getOrNull()
+            val bottomField = runCatching { lpClass.getField("bottomToBottom") }.getOrNull()
+            if (topField != null && bottomField != null) {
+                val bottomToTop = runCatching { topField.getInt(lp) }.getOrNull() ?: return
+                val bottomToBottom = runCatching { bottomField.getInt(lp) }.getOrNull() ?: return
+                if (bottomToTop != -1 || bottomToBottom != 0 || lp.bottomMargin != 0) {
+                    runCatching {
+                        topField.setInt(lp, -1)
+                        bottomField.setInt(lp, 0)
+                        lp.bottomMargin = 0
+                        fragmentContainer.layoutParams = lp
+                    }
+                }
+                return
+            }
+
+            // R8 obfuscates ConstraintLayout$LayoutParams fields; match bottomToTop by nav_view id and fill height.
+            val navRefFields = if (navId != 0) {
+                lpClass.fields.filter { field ->
+                    !java.lang.reflect.Modifier.isStatic(field.modifiers) &&
+                        field.type == Int::class.javaPrimitiveType &&
+                        runCatching { field.getInt(lp) == navId }.getOrDefault(false)
+                }
+            } else {
+                emptyList()
+            }
+            if (navRefFields.isNotEmpty() || lp.bottomMargin != 0 || lp.height != ViewGroup.LayoutParams.MATCH_PARENT) {
                 runCatching {
-                    topField.setInt(lp, -1)
-                    bottomField.setInt(lp, 0)
+                    navRefFields.forEach { it.setInt(lp, -1) }
                     lp.bottomMargin = 0
+                    lp.height = ViewGroup.LayoutParams.MATCH_PARENT
                     fragmentContainer.layoutParams = lp
                 }
             }
+        }
+
+        private fun themeBackgroundDark(view: View): Boolean? {
+            val context = view.context
+            val res = view.resources
+            val attrIds = intArrayOf(
+                res.getIdentifier("bottom_nav_tab_background", "attr", context.packageName),
+                android.R.attr.colorBackground,
+            )
+            val tv = TypedValue()
+            for (attrId in attrIds) {
+                if (attrId == 0 || !context.theme.resolveAttribute(attrId, tv, true)) continue
+                val color = when {
+                    tv.type in TypedValue.TYPE_FIRST_COLOR_INT..TypedValue.TYPE_LAST_COLOR_INT -> tv.data
+                    tv.resourceId != 0 -> runCatching { res.getColor(tv.resourceId, context.theme) }.getOrNull()
+                    else -> null
+                } ?: continue
+                if (Color.alpha(color) < 128) continue
+                return colorLuminanceDark(color)
+            }
+            return null
         }
 
         private fun backgroundDark(view: View): Boolean? {
@@ -414,6 +658,10 @@ internal class EudicNavigationState(private val host: GlassHostLayout) : AppNavi
                 }.getOrNull() ?: return null
             }
             if (Color.alpha(color) < 128) return null
+            return colorLuminanceDark(color)
+        }
+
+        private fun colorLuminanceDark(color: Int): Boolean {
             val luminance = (0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color)) / 255.0
             return luminance < 0.5
         }

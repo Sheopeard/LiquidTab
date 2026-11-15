@@ -12700,6 +12700,13 @@ internal fun isDarkGlass(): Boolean {
     internal fun adapterContentOrSystemDark(): Boolean =
         systemNightMode() || config.systemDark || detectedContentDark == true
 
+    /**
+     * Checks device-wide dark mode without trusting the host Activity's
+     * overridden [Configuration.uiMode], for apps (such as Share) whose theme
+     * manager writes `UI_MODE_NIGHT_YES` into Activity resources on light themes.
+     */
+    internal fun deviceNightMode(): Boolean = config.systemDark || deviceUiNightMode()
+
     private fun systemNightMode(): Boolean {
 
         // 1. Check app's Configuration
@@ -12707,6 +12714,12 @@ internal fun isDarkGlass(): Boolean {
         if (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
 
             Configuration.UI_MODE_NIGHT_YES) return true
+
+        return deviceUiNightMode()
+
+    }
+
+    private fun deviceUiNightMode(): Boolean {
 
         // 2. Check system resources (not affected by per-app overrides)
 
