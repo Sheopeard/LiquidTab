@@ -6,6 +6,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 import androidx.core.graphics.PathParser
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 
@@ -55,6 +56,20 @@ internal object BilibiliRenderer {
             val groupOffsetY = height / 2f - (groupTop + groupBottom) / 2f
             val iconCenterY = baseIconCenterY + groupOffsetY
             val labelBaseline = baseLabelBaseline + groupOffsetY
+            val detached = barLayout
+            if (detached != null && !hideSelectedForOptics) {
+                val cx = detached.actionLeft + detached.actionSize / 2f
+                val cy = height / 2f
+                // The adapter supplies native pink as the sole surface tint.
+                iconPaint.color = if (darkGlass) Color.WHITE else Color.rgb(44, 44, 44)
+                iconPaint.style = Paint.Style.STROKE
+                iconPaint.strokeWidth = 2.6f * density
+                iconPaint.strokeCap = Paint.Cap.ROUND
+                val half = minOf(9f * density, detached.actionSize * 0.17f)
+                canvas.drawLine(cx - half, cy, cx + half, cy, iconPaint)
+                canvas.drawLine(cx, cy - half, cx, cy + half, iconPaint)
+                iconPaint.style = Paint.Style.FILL
+            }
             for ((visualIndex, index) in enabledIndices.withIndex()) {
                 if (index !in 0..4) continue
                 val centerX = horizontalPadding + (visualIndex + 0.5f) * slotWidth
@@ -77,7 +92,7 @@ internal object BilibiliRenderer {
                     continue
                 }
                 val pathIndex = if (index < PUBLISH_INDEX) index else index - 1
-                val selected = index == selectedIndex
+                val selected = hideSelectedForOptics
                 val path = if (selected) selectedPaths[pathIndex] else normalPaths[pathIndex]
                 iconPaint.color = if (selected) ACCENT else unselectedColor
                 canvas.save()
@@ -87,7 +102,7 @@ internal object BilibiliRenderer {
                 canvas.restore()
                 if (!iconOnly) {
                     labelPaint.color = if (selected) ACCENT else unselectedColor
-                    canvas.drawText(labels[index], centerX, labelBaseline, labelPaint)
+                    canvas.drawText(localizeNavigationLabel(labels[index]), centerX, labelBaseline, labelPaint)
                 }
                 canvas.restore()
             }

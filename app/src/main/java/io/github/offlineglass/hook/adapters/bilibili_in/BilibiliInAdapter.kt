@@ -8,9 +8,9 @@ import android.graphics.Insets
 import android.graphics.Canvas
 import android.os.Build
 import android.os.SystemClock
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
 import java.util.WeakHashMap
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
@@ -22,6 +22,26 @@ import io.github.offlineglass.config.GlassConfig
 /** International Bilibili's tab_host is Compose-backed, not a row of child Views. */
 internal object BilibiliInAdapter : TargetAdapter {
     override val key = "bilibili_in"
+    override val homeOnlyNavigation: Boolean get() = io.github.offlineglass.BuildConfig.BETA_BUILD
+    override fun installHooks(lpparam: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
+        if (lpparam.processName == "$PACKAGE_NAME:web") {
+            if (!io.github.offlineglass.BuildConfig.BETA_BUILD) {
+                io.github.offlineglass.hook.adapters.bilibili.BilibiliWebInsetsHooks.install(packageName = PACKAGE_NAME)
+            }
+            return
+        }
+        runCatching { BilibiliInSplashHooks.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international splash: $it") }
+        if (!io.github.offlineglass.BuildConfig.BETA_BUILD) {
+            runCatching { io.github.offlineglass.hook.adapters.bilibili.BilibiliPlaylistGlassHooks.install(PACKAGE_NAME) }
+                .onFailure { XposedBridge.log("LiquidTab international playlist glass: $it") }
+            runCatching { io.github.offlineglass.hook.adapters.bilibili.BilibiliWebInsetsHooks.install(authorSpace = true, packageName = PACKAGE_NAME) }
+                .onFailure { XposedBridge.log("LiquidTab international author space: $it") }
+            runCatching { BilibiliInVideoAmbient.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international video ambient: $it") }
+            runCatching { BilibiliInCommentHooks.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international comments: $it") }
+            runCatching { BilibiliInHomeLayoutHooks.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international home install: $it") }
+            runCatching { BilibiliInSpeedHaptics.install() }.onFailure { XposedBridge.log("LiquidTab international speed haptics: $it") }
+        }
+    }
     override val ownsNavigationFinding = true
     override val nativeSelectionReliable: Boolean = false
     const val PACKAGE_NAME = "com.bilibili.app.in"
@@ -39,6 +59,38 @@ internal object BilibiliInAdapter : TargetAdapter {
         latestPushedConfig = config.normalized()
         return true
     }
+    override val foregroundNavigationOverSelection = true
+    override val ownsNavigationTap = true
+    override val commitSelectionAfterTap = true
+    override val suppressPlatformElevation = true
+    override val recheckNavigationBindingOnLayout = true
+    override fun barLayout(config: GlassConfig, width: Int, height: Int, density: Float, slots: Int): io.github.offlineglass.hook.adapters.AdapterBarLayout? {
+        if (!config.bilibiliTopBar || !config.bilibiliInDetachedSearch || slots != 4 || height <= 0 || width <= height+12*density) return null
+        val left = width-height.toFloat()
+        return io.github.offlineglass.hook.adapters.AdapterBarLayout(
+            mainWidth = left-12*density, actionLeft = left, actionSize = height.toFloat(), actionIndex = 4,
+            navigationIndices = (0..3).filter { config.hiddenMask and (1 shl it) == 0 },
+        )
+    }
+    override val usesNavigationOpticalMix = true
+    override val persistentNavigationOpticalMix = true
+    override fun createNavigationState(context: android.content.Context): io.github.offlineglass.hook.adapters.AppNavigationState =
+        object : io.github.offlineglass.hook.adapters.AppNavigationState {
+            override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
+                if (index == 4) {
+                    // This action is not a fifth native page and must never commit tab selection.
+                    BilibiliInHomeLayoutHooks.openSearch(host.rootView)
+                    return false
+                }
+                return dispatchTabTap(source, index, slotCount)
+            }
+            override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = drawNavigation(canvas, frame)
+            override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = true
+            override fun drawForeground(canvas: Canvas, frame: AdapterNavigationFrame,
+                selectionPath: android.graphics.Path, drawSource: () -> Unit) =
+                io.github.offlineglass.hook.adapters.bilibili.BilibiliOpticalForeground.draw(
+                    canvas, frame, selectionPath, drawSource)
+        }
     override val ownsNavigationDrawing = true
     override val usesCommittedSelection = true
     override val usesContentDarkMode = true
@@ -47,11 +99,18 @@ internal object BilibiliInAdapter : TargetAdapter {
     override val suppressSourceOnHostRebind = true
     override val accentColor: Int = ACCENT_COLOR
     override fun configureNavigationInsets(decor: View, enabled: Boolean) = configureInsets(decor, enabled)
-    override fun drawNavigation(canvas: Canvas, frame: AdapterNavigationFrame) = BilibiliInRenderer.draw(
+    override fun drawNavigation(canvas: Canvas, frame: AdapterNavigationFrame) {
+        BilibiliInRenderer.draw(
         canvas, frame.extraScale, frame.slotCount, frame.width, frame.height, frame.slotWidth,
         frame.density, frame.iconScale, frame.textSize, frame.scaledDensity,
-        frame.selectedIndex, frame.enabledIndices, frame.iconOnly, frame.darkGlass,
-    )
+        frame.selectedIndex, frame.enabledIndices, frame.iconOnly, frame.darkGlass, frame.hideSelectedForOptics,
+        frame.managerEnglishLabels,
+        )
+        if (!frame.hideSelectedForOptics) frame.barLayout?.let { layout ->
+            BilibiliInHomeLayoutHooks.drawSearchGlyph(canvas, layout.actionLeft+layout.actionSize/2,
+                frame.height/2f, frame.density*1.15f, frame.darkGlass)
+        }
+    }
     override fun dispatchNavigationTap(source: ViewGroup?, index: Int, slotCount: Int): Boolean =
         dispatchTabTap(source, index, slotCount)
     override fun suppressNativeBottomChrome(navigation: ViewGroup) = suppressNativeBottomBar(navigation)

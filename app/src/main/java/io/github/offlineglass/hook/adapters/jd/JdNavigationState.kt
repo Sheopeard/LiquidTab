@@ -29,6 +29,8 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     val layoutProbe = JdLayoutProbe(host, chromeFinder, checkoutController, flashControlsController)
     val surfaceRenderQueue = OpticalSurfaceRenderQueue()
     private val frameCopyScheduler = JdFrameCopyScheduler()
+    private val pagePreview = JdPagePreview(host)
+    private val tabTouch = JdTabTouch(host, pagePreview)
     private var pixelCopyThread: HandlerThread? = null
     private var pixelCopyHandler: Handler? = null
     private var navigationGroupClass: Class<*>? = null
@@ -37,10 +39,64 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     private var lastUiBarAnimating = false
     private var lostWindowFocus = false
     private var lastPageIndex = -1
+    private var nativeBackdropScene: android.view.View? = null
+    private var previewSceneRevision = -1
+    private var backdropGeometry = Long.MIN_VALUE
+    private val backdropSceneLocation = IntArray(2)
+    private val backdropHostLocation = IntArray(2)
+    private var backdropOffsetX = Int.MIN_VALUE
+    private var backdropOffsetY = Int.MIN_VALUE
+    private val nativeSceneSelector = JdNativeSceneSelector()
+    private var lastNativeTab = -1
+    private var interactionFrameRate = 0f
+    private val releaseFrameRate = Runnable {
+        if (android.os.Build.VERSION.SDK_INT >= 35 && interactionFrameRate != 0f) {
+            interactionFrameRate = 0f
+            host.setRequestedFrameRate(0f)
+        }
+    }
+
+    private fun prioritizeInteractionFrames() {
+        if (android.os.Build.VERSION.SDK_INT < 35) return
+        if (interactionFrameRate == 0f) {
+            interactionFrameRate = host.display?.supportedModes?.maxOfOrNull { it.refreshRate }?.coerceAtMost(120f) ?: 120f
+            host.setRequestedFrameRate(interactionFrameRate)
+        }
+        host.removeCallbacks(releaseFrameRate)
+        host.postDelayed(releaseFrameRate, 700L)
+    }
+
+    override fun onBarGesture(phase: Int, host: android.view.View) = prioritizeInteractionFrames()
+
+    override fun suppressNativeChromeEarly(source: ViewGroup?) {
+        JdMessageClassLookup.bindHost(host)
+        JdHomeColdBatch.bindHost(host)
+        if (source != null && artwork.jdStaticIconsPopulated)
+            JdNativePageTransitions.bindHiddenBar(source, host)
+        val nativeSelected = tabTouch.selected(source, 5)
+        val actual = nativeSelected ?: host.navigationIndex
+        if (actual == 3) checkoutController.ensureCartOverlay(host)
+        if (nativeSelected != null && nativeSelected != lastNativeTab) {
+            lastNativeTab = nativeSelected
+            pageState.onNativeTabChanged(nativeSelected)
+        }
+        // Keep JD's page independent from its native nav BEFORE the first
+        // destination draw, including the host's 240ms animation-priority phase.
+        source?.let { JdClassicLayout.adjust(host, it, !pageState.newProductsActive) }
+        checkoutController.setPreviewScene(pagePreview.scene.takeIf { pagePreview.target == 3 })
+        checkoutController.syncPageVisibility(pagePreview.target.takeIf { it >= 0 } ?: actual)
+        // This callback runs before drawing even when ordinary maintenance is
+        // deferred for the slider. Bind a newly mounted footer on its first frame.
+        if (actual == 3) (host.rootView as? ViewGroup)?.let { root ->
+            checkoutController.lift(root, root.height, host)
+        }
+    }
 
     override fun onHostFrame(host: android.view.View) {
         val glassHost = host as? GlassHostLayout ?: return
         updateBackdropRendererMode(glassHost)
+        // First-visit switching retains the actual page, not a screenshot.
+        // Do not keep producing/encoding unused historical preview frames.
         if (lastPageIndex != glassHost.navigationIndex) {
             lastPageIndex = glassHost.navigationIndex
             contentViewport.invalidateGeometry()
@@ -126,14 +182,14 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         visualAnimating: Boolean, slotCount: Int, now: Long,
     ): Boolean {
         artwork.prepare(source, slotCount)
-        if (artwork.jdStaticIconsPopulated) {
+        if (artwork.jdStaticIconsPopulated && !artwork.artworkRefreshPending) {
             if (!touching && !visualAnimating && snapshot?.isRecycled == false) {
                 artwork.prepare(source, slotCount)
                 artwork.refreshBadges(snapshot)
             }
             return true
         }
-        return !shouldProbeSnapshot(source, now)
+        return touching || visualAnimating || !shouldProbeSnapshot(source, now)
     }
 
     override fun inspectNavigationCaptureLabels(source: ViewGroup, hasSnapshot: Boolean): NavigationCaptureLabels {
@@ -183,7 +239,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         opticalCache.outerRecordedHeight = height
     }
 
-    override fun reuseCombinedIndicatorScene(surfaceActive: Boolean): Boolean = surfaceActive
+    override fun reuseCombinedIndicatorScene(surfaceActive: Boolean): Boolean = surfaceActive || nativeBackdropScene != null
 
     override fun combinedIndicatorSceneNeedsRecord(
         backdrop: Bitmap?, navigation: Bitmap?, signature: Long, width: Int, height: Int,
@@ -230,7 +286,10 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     }
 
     override fun skipLiveBackdrop(selectedIndex: Int): Boolean =
-        selectedIndex == JD_BROWSE_INDEX || pageState.fullscreenVideoActive
+        // No verified live scene means readback mode, including custom H5
+        // pages on Home. Falling through to the host's generic scene while
+        // its Surface starts would invoke the WebView functor a second time.
+        nativeBackdropScene == null
 
     override fun requiresSampledBackdrop(): Boolean =
         host.config.enabled && host.config.backdropCapture && !host.config.solidBarEnabled &&
@@ -238,6 +297,10 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     override fun maintainsCompositorSamplingWithoutSurface(): Boolean =
         requiresSampledBackdrop() && pageState.newProductsActive
+
+    override fun allowsOpticalSurfacePipeline(): Boolean =
+        nativeBackdropScene == null && requiresSampledBackdrop()
+    override fun opticalCaptureEpoch(): Long = opticalCache.backdropEpoch.toLong()
 
     override fun opticalSurfaceCopyHandler(): Handler {
         pixelCopyHandler?.let { return it }
@@ -257,8 +320,10 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         // so publication stays serial while GPU readback can overlap submission.
         // Only a moving page chains copies. Arm before the next
         // UI traversal; idle probing backs off.
+        val epoch = opticalCache.backdropEpoch
         root.post {
-            if (requiresSampledBackdrop() && host.isAttachedToWindow && host.hasWindowFocus() &&
+            if (epoch == opticalCache.backdropEpoch && allowsOpticalSurfacePipeline() &&
+                host.isAttachedToWindow && host.hasWindowFocus() &&
                 android.os.SystemClock.uptimeMillis() < pageState.contentMotionUntil) {
                 frameCopyScheduler.schedule(root, nextCopy)
             }
@@ -279,7 +344,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     fun updateFullscreenVideoState(host: GlassHostLayout): Boolean {
         val probe = pageState.probeFullscreenVideo(
-            host.rootView as? ViewGroup, host.opticalSurfaceViewForAdapter,
+            host.rootView as? ViewGroup, host.opticalSurfaceViewForAdapter, lastNativeTab,
         )
         if (probe.changed) host.onAdapterScrollHideTimerChanged(
             probe.active, JdPageState.VIDEO_IDLE_HIDE_DELAY_MS,
@@ -294,6 +359,48 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     }
 
     override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
+        val nativeScene = pagePreview.scene ?: if (requiresSampledBackdrop()) nativeSceneSelector.pick(
+            host, host.navigationIndex, pageState.newProductsActive || pageState.fullscreenVideoActive,
+        ) else null
+        nativeScene?.getLocationInWindow(backdropSceneLocation)
+        host.getLocationInWindow(backdropHostLocation)
+        val dx = backdropSceneLocation[0] - backdropHostLocation[0]
+        val dy = backdropSceneLocation[1] - backdropHostLocation[1]
+        if (backdropOffsetX == Int.MIN_VALUE || kotlin.math.abs(dx - backdropOffsetX) > 1) backdropOffsetX = dx
+        if (backdropOffsetY == Int.MIN_VALUE || kotlin.math.abs(dy - backdropOffsetY) > 1) backdropOffsetY = dy
+        var geometry = host.width.toLong() * 31L + host.height
+        geometry = geometry * 31L + (nativeScene?.width ?: 0)
+        geometry = geometry * 31L + (nativeScene?.height ?: 0)
+        geometry = geometry * 31L + backdropOffsetX
+        geometry = geometry * 31L + backdropOffsetY
+        if (nativeScene !== nativeBackdropScene || previewSceneRevision != pagePreview.sceneRevision || backdropGeometry != geometry) {
+            backdropGeometry = geometry
+            previewSceneRevision = pagePreview.sceneRevision
+            nativeBackdropScene = nativeScene
+            frameCopyScheduler.cancel()
+            // Preview and real pages can share the same tab and bitmap-copy
+            // generation. None of the retained blur/indicator wrappers may
+            // keep referencing the preview RenderNode after it becomes GONE.
+            opticalCache.backdropEpoch++
+            opticalCache.captureGeneration++
+            opticalCache.outerRecordedGeneration = -1L
+            opticalCache.sharedOpticalGeneration = -1L
+            opticalCache.indicatorCombinedGeneration = -1L
+            opticalCache.liveBackdropEpoch = -1
+            opticalCache.liveBackdropTab = -1
+            host.liveBackdropNodeForAdapter.discardDisplayList()
+            host.clearLiveBackdropForAdapter()
+            // Dirty the host's own display list as well as its sampled child.
+            // A root scroll/layout need not redraw this otherwise-static View.
+            host.invalidate()
+        }
+        if (nativeScene != null) {
+            host.disableOpticalSurfaceNativeBlurForAdapter()
+            host.disableOpticalSurfaceRendererForAdapter()
+            // Android owns the native page RenderNodes. The host records a
+            // narrow live reference and draws optics in the same window frame.
+            return true
+        }
         if (!requiresSampledBackdrop()) {
             frameCopyScheduler.cancel()
             opticalCache.directBackdropActive = false
@@ -319,10 +426,16 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         selectedIndex == JD_BROWSE_INDEX && artwork.jdStaticIconsPopulated
 
     override fun retainNavigationWithoutNativeSource(selectedIndex: Int): Boolean =
-        pageState.fullscreenVideoActive || retainNavigationWhenNativeRowHidden(selectedIndex)
+        artwork.jdStaticIconsPopulated || pagePreview.target >= 0 || tabTouch.pendingTarget >= 0 ||
+            pageState.fullscreenVideoActive || retainNavigationWhenNativeRowHidden(selectedIndex)
+
+    override fun resolveBackdropScene(host: android.view.View): android.view.View? = nativeBackdropScene
+
+    override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<android.view.View>? =
+        nativeBackdropScene?.let { listOf(it) }
 
     override fun canReuseLiveBackdrop(selectedIndex: Int): Boolean =
-        opticalCache.liveBackdropEpoch == opticalCache.backdropEpoch &&
+        nativeBackdropScene != null && opticalCache.liveBackdropEpoch == opticalCache.backdropEpoch &&
             opticalCache.liveBackdropTab == selectedIndex
 
     override fun onLiveBackdropRecorded(selectedIndex: Int) {
@@ -338,7 +451,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     override fun enterDirectOpticalBackdrop(
         surface: android.view.SurfaceView, pipelineActive: Boolean,
     ): Boolean {
-        if (!requiresSampledBackdrop()) {
+        if (!requiresSampledBackdrop() || nativeBackdropScene != null) {
             // This mode paints in the host. Keeping a transparent Surface alive
             // and clearing it through lockCanvas can block every UI traversal.
             if (!pipelineActive && surface.visibility == android.view.View.GONE) return false
@@ -350,7 +463,10 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         return JdSurfaceModeController.enterDirectMode(surface, opticalCache, pipelineActive)
     }
 
-    override fun onOpticalSurfaceFrameInvalidated() { opticalCache.surfaceFrameReady = false }
+    override fun onOpticalSurfaceFrameInvalidated() {
+        opticalCache.surfaceFrameReady = false
+        host.postInvalidateOnAnimation()
+    }
 
     override fun onOpticalRendererConfigurationChanged() = nativeChrome.invalidateOuterEffect()
 
@@ -372,7 +488,16 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     override fun holdDirectBackdropUntilOpticalFrame(
         liveBackdropActive: Boolean, hasDisplayList: Boolean,
-    ): Boolean = !opticalCache.surfaceFrameReady && liveBackdropActive && hasDisplayList
+    ): Boolean {
+        // A previously posted buffer is not proof of current presentation.
+        // Surface teardown/visibility callbacks and page-mode changes can
+        // arrive in a different order. Never surrender host drawing to a GONE,
+        // invalid, or no-longer-owned compositor layer (shadow-only failure).
+        val surface = host.opticalSurfaceViewForAdapter
+        return nativeBackdropScene != null || !opticalCache.surfaceFrameReady ||
+            !host.opticalSurfaceRunningForAdapter || surface?.visibility != android.view.View.VISIBLE ||
+            !surface.isShown
+    }
 
     override fun shouldQueueOpticalRenderFromUi(animating: Boolean): Boolean {
         val queue = animating || lastUiBarAnimating
@@ -406,25 +531,33 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         get() = artwork.jdStaticIconsPopulated
 
     override fun onNavigationTabSwitched(index: Int, slotCount: Int, now: Long) {
+        opticalCache.indicatorCombinedGeneration = -1
         pageState.tabSwitchUntil = now + TAB_SWITCH_HOLD_MS
         pageState.newProductsSnapshotDirty = true
     }
 
     override fun onNavigationSelectionRequested(index: Int, slotCount: Int, now: Long): Boolean {
+        opticalCache.indicatorCombinedGeneration = -1
         selectionFollow.start(index, slotCount, now)
         opticalCache.backdropEpoch++
         return true
     }
 
-    override fun dispatchNativeNavigationTap(
-        host: GlassHostLayout, source: ViewGroup?, index: Int, slotCount: Int,
-    ): Boolean {
-        val item = host.navigationSlotForAdapter(index) ?: return false
-        return JdTabTouch.dispatch(item, source)
+    override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? = tabTouch.selected(source, slotCount)
+
+    override fun performTap(host: android.view.View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
+        prioritizeInteractionFrames()
+        val handled = tabTouch.dispatch(source, index, slotCount)
+        if (handled) onNavigationSelectionRequested(index, slotCount, android.os.SystemClock.uptimeMillis())
+        return handled
     }
 
-    override fun acceptNativeNavigationSelection(index: Int, now: Long): Boolean =
+    override fun acceptNativeNavigationSelection(index: Int, now: Long): Boolean {
         selectionFollow.acceptNativeSelection(index, now)
+        // Only a live, bounded native-click request may hold off its old state.
+        // Once accepted, exhausted, cancelled or detached, native state wins.
+        return tabTouch.pendingTarget < 0 || index == tabTouch.pendingTarget
+    }
 
     override fun followingNativeNavigationAnimation(now: Long): Boolean = selectionFollow.isFollowing(now)
 
@@ -434,6 +567,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = artwork.draw(canvas, frame)
 
     override fun dispose() {
+        pagePreview.clear(dispose = true)
         artwork.dispose()
         selectionFollow.reset()
         lastSnapshotProbeSource = null
@@ -441,9 +575,16 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     }
 
     override fun onHostDetached() {
+        lastNativeTab = -1
+        JdClassicLayout.release(host)
+        host.removeCallbacks(releaseFrameRate)
+        releaseFrameRate.run()
+        tabTouch.cancel()
         JdScrollSignals.unbind(this)
         lostWindowFocus = false
         lastPageIndex = -1
+        nativeBackdropScene = null
+        nativeSceneSelector.detach()
         frameCopyScheduler.cancel()
         selectionFollow.reset()
         navigationGroupClass = null
@@ -475,7 +616,12 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     }
 
     override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+        nativeSceneSelector.onFocusChanged(hasFocus)
+        if (!hasFocus) pagePreview.clear()
         if (!hasFocus) {
+            host.removeCallbacks(releaseFrameRate)
+            releaseFrameRate.run()
+            tabTouch.cancel()
             lostWindowFocus = true
             return
         }

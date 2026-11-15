@@ -6,6 +6,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Typeface
 import androidx.core.graphics.PathParser
+import io.github.offlineglass.hook.adapters.NavigationLabelLocalization
 
 /** International Bilibili owns its vector artwork and tab layout independently of the CN app. */
 internal object BilibiliInRenderer {
@@ -53,6 +54,8 @@ internal object BilibiliInRenderer {
         enabledIndices: List<Int>,
         iconOnly: Boolean,
         darkGlass: Boolean,
+        opticalSelected: Boolean = false,
+        managerEnglishLabels: Boolean = false,
     ) {
         if (slotCount != 4 || width <= 0 || height <= 0) return
         val horizontalPadding = 4f * density
@@ -71,7 +74,7 @@ internal object BilibiliInRenderer {
             val centerX = horizontalPadding + (visualIndex + 0.5f) * slotWidth
             canvas.save()
             canvas.scale(extraScale, extraScale, centerX, height / 2f)
-            val selected = index == selectedIndex
+            val selected = opticalSelected
             val path = if (selected) selectedPaths[index] else normalPaths[index]
             iconPaint.color = if (selected) ACCENT else unselectedColor
             canvas.save()
@@ -81,7 +84,8 @@ internal object BilibiliInRenderer {
             canvas.restore()
             if (!iconOnly) {
                 labelPaint.color = if (selected) ACCENT else unselectedColor
-                canvas.drawText(labels[index], centerX, labelBaseline, labelPaint)
+                val label = if (managerEnglishLabels) NavigationLabelLocalization.toEnglish("bilibili_in", labels[index]) else labels[index]
+                canvas.drawText(label, centerX, labelBaseline, labelPaint)
             }
             canvas.restore()
         }

@@ -1,5 +1,8 @@
 package io.github.offlineglass.hook
 
+import io.github.offlineglass.rendering.setFloatUniformExact
+import io.github.offlineglass.hook.setBottomBarSquircle as buildCanonicalSquircle
+
 
 import android.animation.Animator
 
@@ -111,6 +114,7 @@ import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.NavigationLabelLocalization
 import io.github.offlineglass.hook.adapters.TargetAdapterRegistry
 import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
 
@@ -140,12 +144,13 @@ import androidx.graphics.shapes.CornerRounding
 import androidx.graphics.shapes.RoundedPolygon
 
 import androidx.graphics.shapes.toPath
+import androidx.graphics.shapes.transformed
 
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.offlineglass.hook.compat.XC_MethodHook
 
 import io.github.offlineglass.config.GlassConfig
 
@@ -185,13 +190,15 @@ import kotlin.math.sqrt
 
  */
 
+private val extendedCornerPaths = android.util.LruCache<List<Float>, Path>(12)
+
 internal fun Path.setBottomBarSquircle(rect: RectF, radius: Float, smoothing: Float = 0.5f) {
 
     reset()
 
     if (rect.isEmpty) return
 
-    val strength = smoothing.coerceIn(-1f, 1f)
+    val strength = smoothing.coerceIn(-2f, 1f)
 
     val cornerRadius = max(0f, radius).coerceAtMost(min(rect.width(), rect.height()) * 0.5f)
 
@@ -204,6 +211,11 @@ internal fun Path.setBottomBarSquircle(rect: RectF, radius: Float, smoothing: Fl
     }
 
     if (strength < 0f) {
+        val extendedKey = if (strength < -1f)
+            listOf(rect.left, rect.top, rect.right, rect.bottom, cornerRadius, strength) else null
+        extendedKey?.let { key ->
+            extendedCornerPaths.get(key)?.let { cached -> set(cached); return }
+        }
 
         // AndroidX graphics-shapes keeps the rectangle bounds fixed and builds
 
@@ -213,7 +225,7 @@ internal fun Path.setBottomBarSquircle(rect: RectF, radius: Float, smoothing: Fl
 
         // single cubic control point (that creates pinched, non-G2 corners).
 
-        RoundedPolygon(
+        val continuous = RoundedPolygon(
 
             vertices = floatArrayOf(
 
@@ -227,13 +239,34 @@ internal fun Path.setBottomBarSquircle(rect: RectF, radius: Float, smoothing: Fl
 
             ),
 
-            rounding = CornerRounding(cornerRadius, -strength),
+            rounding = CornerRounding(cornerRadius, (-strength).coerceAtMost(1f)),
 
             centerX = rect.centerX(),
 
             centerY = rect.centerY(),
 
-        ).toPath(this)
+        )
+        if (strength < -1f) {
+            // Continue toward a smooth elliptical contour with the SAME four
+            // rounded corners. A bevel target collapses to six pointed vertices
+            // at a half-height radius and must never be used for this lens.
+            val side = min(rect.width(), rect.height())
+            val inner = RoundedPolygon(
+                vertices = floatArrayOf(0f, 0f, side, 0f, side, side, 0f, side),
+                rounding = CornerRounding(cornerRadius, 1f),
+                centerX = side / 2f, centerY = side / 2f,
+            )
+            val innerBounds = RectF()
+            inner.toPath().computeBounds(innerBounds, true)
+            val boundsMatrix = android.graphics.Matrix().apply {
+                setRectToRect(innerBounds, rect, android.graphics.Matrix.ScaleToFit.FILL)
+            }
+            androidx.graphics.shapes.Morph(continuous, inner.transformed(boundsMatrix))
+                .toPath(progress = (-strength - 1f).coerceIn(0f, 1f), path = this)
+            extendedKey?.let { extendedCornerPaths.put(it, Path(this)) }
+        } else {
+            continuous.toPath(this)
+        }
 
         return
 
@@ -374,10 +407,20 @@ internal object BloomTiltTracker {
     private var smoothY = 0f
 
     private var initialized = false
+    // Refraction needs a faster response than the decorative bloom highlight.
+    var refractionX = 0f
+        private set
+    var refractionY = 0f
+        private set
+    var refractionZ = 0f
+        private set
+    private var lastRefractionZ = 0f
 
     private var lastDirX = 0f
 
     private var lastDirY = -1f
+    private var lastRefractionX = 0f
+    private var lastRefractionY = 0f
 
 
 
@@ -430,12 +473,16 @@ internal object BloomTiltTracker {
                 val gx = -rotationMatrix[6]
 
                 val gy = -rotationMatrix[7]
+                val gz = -rotationMatrix[8]
 
                 if (!initialized) {
 
                     smoothX = gx
 
                     smoothY = gy
+                    refractionX = gx
+                    refractionY = gy
+                    refractionZ = gz
 
                     initialized = true
 
@@ -444,6 +491,9 @@ internal object BloomTiltTracker {
                     smoothX += (gx - smoothX) * SMOOTHING
 
                     smoothY += (gy - smoothY) * SMOOTHING
+                    refractionX += (gx - refractionX) * 0.55f
+                    refractionY += (gy - refractionY) * 0.55f
+                    refractionZ += (gz - refractionZ) * 0.55f
 
                 }
 
@@ -517,11 +567,21 @@ internal object BloomTiltTracker {
 
         val deltaSq = (dirX - lastDirX) * (dirX - lastDirX) + (dirY - lastDirY) * (dirY - lastDirY)
 
-        if (deltaSq < INVALIDATE_DELTA_SQ) return
+        val directionChanged = deltaSq >= INVALIDATE_DELTA_SQ
+        // Reuse the one already-running GAME-rate sensor, but invalidate at a
+        // finer angular step so slow hand tilts do not look quantized.
+        val refractionChanged = (refractionX - lastRefractionX) * (refractionX - lastRefractionX) +
+            (refractionY - lastRefractionY) * (refractionY - lastRefractionY) +
+            (refractionZ - lastRefractionZ) * (refractionZ - lastRefractionZ) >= 0.00000625f
+        if (!directionChanged && !refractionChanged) return
+        io.github.offlineglass.rendering.PostureCompose.update()
+        if (refractionChanged) {
+            lastRefractionX = refractionX; lastRefractionY = refractionY; lastRefractionZ = refractionZ
+        }
 
-        lastDirX = dirX
+        if (directionChanged) lastDirX = dirX
 
-        lastDirY = dirY
+        if (directionChanged) lastDirY = dirY
 
         for (client in clients) {
 
@@ -529,7 +589,10 @@ internal object BloomTiltTracker {
 
             if (view.isAttachedToWindow && view.isShown && view.windowVisibility == View.VISIBLE) {
 
-                view.postInvalidateOnAnimation()
+                if (directionChanged || (refractionChanged &&
+                    ((view is GlassHostLayout && view.tiltRefractionEnabled) ||
+                        io.github.offlineglass.rendering.PostureGlass.isTracking(view))))
+                    view.postInvalidateOnAnimation()
 
             }
 
@@ -553,7 +616,7 @@ internal object BloomTiltTracker {
 
  */
 
-class GlassHostLayout(
+class GlassHostLayout internal constructor(
 
     context: Context,
 
@@ -572,12 +635,58 @@ class GlassHostLayout(
 
     sliderEnabled: Boolean = true,
 
+    // Independent native accessories can reuse the renderer without running
+    // their application's main-navigation controller.
+    adapterOverride: io.github.offlineglass.hook.adapters.TargetAdapter? = null,
+
+    // Only the verified main-navigation installer opts in. Reused material
+    // hosts (top bars, players, dialogs) retain immediate native actions.
+    private val primaryNavigationHost: Boolean = false,
+
 ) : FrameLayout(context) {
     private val targetAdapter by lazy(LazyThreadSafetyMode.NONE) {
-        TargetAdapterRegistry.forPackage(context.packageName)
+        adapterOverride ?: TargetAdapterRegistry.forPackage(context.packageName)
+    }
+    private val followsBottomBarMaterial = adapterOverride == null
+    private val configuredIndicatorInteractionPolicy = targetAdapter?.indicatorInteractionPolicy
+        ?: io.github.offlineglass.rendering.IndicatorInteractionPolicy.EXPANDING
+    private val indicatorInteractionPolicy
+        get() = if (followsBottomBarMaterial && !config.liquidGlassEnabled)
+            io.github.offlineglass.rendering.IndicatorInteractionPolicy.FIXED_SIZE
+        else configuredIndicatorInteractionPolicy
+    private val exactGeometryWork by lazy {
+        if (targetAdapter?.reuseExactOpticalWork == true)
+            io.github.offlineglass.rendering.ExactOpticalGeometryCache() else null
+    }
+    private val exactBloomWork by lazy {
+        if (targetAdapter?.reuseExactOpticalWork == true)
+            java.util.IdentityHashMap<RuntimeShader, io.github.offlineglass.rendering.ExactOpticalUniformCache>() else null
+    }
+    // Member extension routes every host path through the same opt-in cache.
+    // The canonical top-level builder and all other adapters remain unchanged.
+    private fun Path.setBottomBarSquircle(rect: RectF, radius: Float, smoothing: Float = 0.5f) {
+        val cache = exactGeometryWork
+        if (cache == null) buildCanonicalSquircle(rect, radius, smoothing)
+        else cache.copyInto(this, rect, radius, smoothing)
     }
     internal val appNavigationState: AppNavigationState? by lazy(LazyThreadSafetyMode.NONE) {
         targetAdapter?.createNavigationState(context, this)
+    }
+    private val firstVisitPageSwitch by lazy(LazyThreadSafetyMode.NONE) {
+        targetAdapter?.takeIf { primaryNavigationHost }?.let { owner ->
+            io.github.offlineglass.rendering.FirstVisitPageSwitch(
+                this, owner, { isBarVisualStateAnimating() },
+                { actual ->
+                    if (actual != null && actual in 0 until slotCount && !isNavigationEntryDisabled(actual)) {
+                        selectedIndex = actual
+                        dragTarget = visualPositionForNavigationIndex(actual)
+                        positionSpring.animateTo(dragTarget)
+                    }
+                    postInvalidateOnAnimation()
+                },
+                createPresentation = { appNavigationState?.firstVisitPresentation(this) },
+            )
+        }
     }
     private val appNativeChromeController by lazy(LazyThreadSafetyMode.NONE) {
         targetAdapter?.createNativeChromeController()
@@ -595,6 +704,13 @@ class GlassHostLayout(
 
     /** Keep Weibo on the live window backdrop instead of a retained row bitmap. */
 
+    private fun adapterSurfaceOpacity(color: Int): Int {
+        val base = config.withSurfaceOpacity(color)
+        val scale = targetAdapter?.surfaceOpacityScale(config)?.coerceIn(0f, 1f) ?: 1f
+        if (scale == 1f) return base
+        return (base and 0x00ffffff) or ((Color.alpha(base) * scale).roundToInt().coerceIn(0, 255) shl 24)
+    }
+
     private fun packageConfig(raw: GlassConfig): GlassConfig {
 
         // Always use the cross-device Android backdrop pipeline. Do not rewrite
@@ -607,11 +723,14 @@ class GlassHostLayout(
         val adapted = targetAdapter?.normalizeConfig(normalized) ?: normalized
         // Rendering switches are enforced after app-specific normalization so
         // no adapter can accidentally re-enable a retired or disabled path.
-        val solid = adapted.solidBarEnabled
+        val solid = if (followsBottomBarMaterial) normalized.solidBarEnabled else adapted.solidBarEnabled
+        val liquid = adapted.liquidGlassEnabled && !solid &&
+            (!followsBottomBarMaterial || normalized.liquidGlassEnabled)
         return adapted.copy(
-            liquidGlassEnabled = adapted.liquidGlassEnabled && !solid,
+            solidBarEnabled = solid,
+            liquidGlassEnabled = liquid,
             backdropCapture = adapted.backdropCapture && !solid &&
-                (adapted.liquidGlassEnabled || adapted.blurRadius > 0f),
+                (liquid || adapted.blurRadius > 0f),
             nativeBlur = false,
             bottomGradientBlurEnabled = false,
         )
@@ -679,9 +798,7 @@ internal var barVisibilityAnimating = false
 
     private var barVisibilityAnimator: ValueAnimator? = null
 
-    private val meituanTakeoutScrollBasePaddings = java.util.WeakHashMap<View, IntArray>()
 
-    private var lastMeituanTakeoutScrollProbe = 0L
 
     internal var adapterMsgHideTime = 0L
 
@@ -797,9 +914,13 @@ internal var barVisibilityAnimating = false
 
             val targetBottom = (content.height - rect.bottom).coerceAtLeast(0)
 
+            val targetHeight = if (currentId == FILE_MANAGER_BOTTOM_NAV_ID) {
+                glassHostHeightPx(density, config, context.packageName, 3)
+            } else rect.height()
+
             if (params.width == rect.width() &&
 
-                params.height == rect.height() &&
+                params.height == targetHeight &&
 
                 params.leftMargin == rect.left &&
 
@@ -811,7 +932,7 @@ internal var barVisibilityAnimating = false
 
             params.width = rect.width()
 
-            params.height = rect.height()
+            params.height = targetHeight
 
             params.leftMargin = rect.left
 
@@ -1013,7 +1134,9 @@ internal var barVisibilityAnimating = false
 
                         params.width = rect.width()
 
-                        params.height = rect.height()
+                        // Keep tab navigation on the manager's height contract
+                        // when the native source is rebound; native action bars stay native-sized.
+                        params.height = glassHostHeightPx(density, config, context.packageName, slotCount)
 
                         params.leftMargin = rect.left
 
@@ -1127,8 +1250,43 @@ internal val outerRect = RectF()
     private val tabsBackdropNode = RenderNode("OfflineGlassTabsBackdrop")
 
     private val indicatorCombinedNode = RenderNode("OfflineGlassIndicatorCombined")
+    private var indicatorReturnLayers: IndicatorReturnLayers? = null
+
+    private class IndicatorReturnLayers {
+        val panel = RenderNode("OfflineGlassIndicatorReturnPanel").apply {
+            setUseCompositingLayer(true, null)
+        }
+        val lift = RenderNode("OfflineGlassIndicatorReturnLift")
+        var panelPadding = -1
+        private var appliedHiddenEffect: RenderEffect? = null
+
+        fun updateHiddenEffect(hidden: RenderNode, effect: RenderEffect?) {
+            if (appliedHiddenEffect === effect) return
+            appliedHiddenEffect = effect
+            hidden.setRenderEffect(effect)
+        }
+
+        fun release() {
+            panel.discardDisplayList()
+            lift.discardDisplayList()
+        }
+
+        fun applyMix(hidden: RenderNode, panelMix: Float, liftMix: Float): Boolean {
+            // Match the byte opacity of the original saveLayerAlpha/paint path.
+            val panelAlpha = ((panelMix * 255f).toInt()) / 255f
+            val hiddenAlpha = (((1f - panelMix) * 255f).toInt()) / 255f
+            val liftAlpha = ((0.10f * liftMix * 255f).toInt()) / 255f
+            val changed = panel.alpha != panelAlpha || hidden.alpha != hiddenAlpha || lift.alpha != liftAlpha
+            if (panel.alpha != panelAlpha) panel.alpha = panelAlpha
+            if (hidden.alpha != hiddenAlpha) hidden.alpha = hiddenAlpha
+            if (lift.alpha != liftAlpha) lift.alpha = liftAlpha
+            return changed
+        }
+    }
 
     private val indicatorRenderNode = RenderNode("OfflineGlassIndicator")
+    private val sampledSpecularSource = RenderNode("OfflineGlassSampledSpecularSource")
+    private val sampledSpecularLens = RenderNode("OfflineGlassSampledSpecularLens")
 
     private val indicatorShadowNode = RenderNode("OfflineGlassIndicatorShadow")
 
@@ -1149,6 +1307,7 @@ internal val outerRect = RectF()
     private val sceneContentLocation = IntArray(2)
 
     private val sceneHostLocation = IntArray(2)
+    private val preciseSceneTransform = android.graphics.Matrix()
 
     private var sceneSweepInProgress = false
 
@@ -1171,6 +1330,31 @@ internal val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val lightingPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     internal val panelShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val directionalShadowMaskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        blendMode = BlendMode.DST_IN
+    }
+    private var shadowReferenceX = Float.NaN
+    private var shadowReferencePitch = Float.NaN
+    private val actionPanelShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val actionDirectionalShadowMaskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        blendMode = BlendMode.DST_IN
+    }
+    private val directionalShadowMask by lazy { createDirectionalShadowMask() }
+    private val actionDirectionalShadowMask by lazy { createDirectionalShadowMask() }
+    private fun createDirectionalShadowMask() = createRuntimeShader("""
+        uniform float4 bounds;
+        uniform float2 tilt;
+        half4 main(float2 coord) {
+            float2 center = (bounds.xy + bounds.zw) * 0.5;
+            float2 halfSize = max((bounds.zw - bounds.xy) * 0.5, float2(1.0));
+            float2 side = clamp((coord - center) / halfSize, -1.0, 1.0);
+            float horizontal = 1.0 - max(tilt.x, 0.0) * max(-side.x, 0.0)
+                - max(-tilt.x, 0.0) * max(side.x, 0.0);
+            float vertical = 1.0 - max(tilt.y, 0.0) * max(-side.y, 0.0)
+                - max(-tilt.y, 0.0) * max(side.y, 0.0);
+            return half4(1.0, 1.0, 1.0, clamp(horizontal * vertical, 0.0, 1.0));
+        }
+    """, "directional-shadow")
 
     private val hiddenTabsTintPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
@@ -1204,15 +1388,19 @@ internal val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     private var outerLensShader = createRuntimeShader(ROUNDED_RECT_REFRACTION_SHADER, "outer")
 
-    private var combinedOuterLensShader = createRuntimeShader(ROUNDED_RECT_REFRACTION_SHADER, "tabs")
+    private var combinedOuterLensShader = if (indicatorInteractionPolicy.rendersSelectionLens)
+        createRuntimeShader(ROUNDED_RECT_REFRACTION_SHADER, "tabs") else null
 
     private var opticalSurfaceOuterLensShader =
 
         createRuntimeShader(ROUNDED_RECT_REFRACTION_SHADER, "optical-surface-outer")
 
-    private var indicatorLensShader = createRuntimeShader(ROUNDED_RECT_DISPERSION_SHADER, "indicator")
+    private var indicatorLensShader = if (indicatorInteractionPolicy.rendersSelectionLens)
+        createRuntimeShader(ROUNDED_RECT_DISPERSION_SHADER, "indicator") else null
 
     private val outerBloomShader = runCatching { RuntimeShader(BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
+    private val sampledPanelBloomShader = if (configuredIndicatorInteractionPolicy.rendersSelectionLens)
+        runCatching { RuntimeShader(BLOOM_STROKE_DUAL_SHADER) }.getOrNull() else null
 
     private val indicatorBloomShader = runCatching { RuntimeShader(BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
 
@@ -1226,11 +1414,15 @@ internal val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
         val want = isAttachedToWindow &&
 
+            isShown && hasWindowFocus() &&
+
             windowVisibility == View.VISIBLE &&
 
             config.liquidGlassEnabled &&
+            config.postureEffectsEnabled &&
 
-            config.outlineEnabled
+            !config.solidBarEnabled &&
+            (config.outlineEnabled || tiltRefractionEnabled)
 
         if (want == bloomTiltRegistered) return
 
@@ -1241,6 +1433,113 @@ internal val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     }
 
     private var outerGlassEffect: RenderEffect? = null
+    private var postureBackdropBlurEffect: RenderEffect? = null
+    internal val tiltRefractionEnabled: Boolean
+        get() = config.postureEffectsEnabled &&
+            (targetAdapter?.tiltRefractionStrength ?: io.github.offlineglass.rendering.PostureGlass.STRENGTH) > 0f
+    private var lastTiltOpticsAt = 0L
+    private var lastTiltOpticsX = Float.NaN
+    private var lastTiltOpticsY = Float.NaN
+    private var lastTiltOpticsZ = Float.NaN
+    private var lastIndicatorGestureExpanded = false
+    private var lastIndicatorPostureBlend = Float.NaN
+    private var lastLiquidMotionActive = false
+
+    /** Reuse existing posture and backdrop; no timer, capture or additional GPU pass. */
+    private fun updateTiltRefractionEffects() {
+        if (!tiltRefractionEnabled || !config.liquidGlassEnabled || config.solidBarEnabled) return
+        val now = SystemClock.uptimeMillis()
+        val gestureExpanded = isIndicatorGestureExpanded()
+        val gestureStateChanged = gestureExpanded != lastIndicatorGestureExpanded
+        val postureBlend = indicatorPostureBlend()
+        val postureBlendChanged = !lastIndicatorPostureBlend.isFinite() ||
+            kotlin.math.abs(postureBlend - lastIndicatorPostureBlend) > 0.0005f
+        combinedOuterLensShader?.setFloatUniform("fullSurfaceWeight",
+            if (targetAdapter?.flowingLiquidEnabled == true) postureBlend else 0f)
+        val flowing = targetAdapter?.flowingLiquidEnabled == true
+        val liquidMotion = if (targetAdapter?.liquidMotionEnabled == true)
+            io.github.offlineglass.rendering.LiquidMotion.sample(this, config.liquidViscosity) else null
+        val motionChanged = liquidMotion?.active == true || lastLiquidMotionActive
+        lastLiquidMotionActive = liquidMotion?.active == true
+        if (!flowing && !gestureStateChanged && !postureBlendChanged && now - lastTiltOpticsAt < 16L) return
+        var x = BloomTiltTracker.refractionX
+        var y = BloomTiltTracker.refractionY
+        val z = BloomTiltTracker.refractionZ
+        when (display?.rotation) {
+            android.view.Surface.ROTATION_90 -> { val previous = x; x = -y; y = previous }
+            android.view.Surface.ROTATION_180 -> { x = -x; y = -y }
+            android.view.Surface.ROTATION_270 -> { val previous = x; x = y; y = -previous }
+        }
+        if (flowing) {
+            val pose = liquidMotion?.pose ?: io.github.offlineglass.rendering.FlowingLiquid.poseForFrame(this)
+            x = -pose[0] / io.github.offlineglass.rendering.PostureGlass.STRENGTH
+            y = -pose[1] / io.github.offlineglass.rendering.PostureGlass.STRENGTH
+        }
+        if (lastTiltOpticsX.isFinite() && lastTiltOpticsY.isFinite() &&
+            kotlin.math.abs(x - lastTiltOpticsX) + kotlin.math.abs(y - lastTiltOpticsY) +
+            kotlin.math.abs(z - lastTiltOpticsZ) < (if (flowing) 0.0008f else 0.004f) &&
+            !gestureStateChanged && !postureBlendChanged && !motionChanged) return
+        lastTiltOpticsAt = now
+        lastTiltOpticsX = x
+        lastTiltOpticsY = y
+        lastTiltOpticsZ = z
+        lastIndicatorGestureExpanded = gestureExpanded
+        lastIndicatorPostureBlend = postureBlend
+        val strength = targetAdapter?.tiltRefractionStrength ?: io.github.offlineglass.rendering.PostureGlass.STRENGTH
+        // Keep the lens RenderEffects and all screen-space layers fixed. Only
+        // update their sampling vector; rebuilding the effect graph per sensor
+        // sample stalls JD/Taobao and can make a pressed pill appear to shift.
+        val biasX = -x * strength
+        val biasY = -y * strength
+        outerLensShader?.setFloatUniform("tiltBias", biasX, biasY)
+        // The enlarged pill's hidden navigation/material sample is a stable
+        // optical scene while pressed or dragged; restore posture refraction
+        // to the resting tab layer immediately after the gesture settles.
+        combinedOuterLensShader?.setFloatUniform(
+            "tiltBias",
+            biasX * postureBlend,
+            biasY * postureBlend,
+        )
+        opticalSurfaceOuterLensShader?.setFloatUniform("tiltBias", biasX, biasY)
+        if (targetAdapter?.liquidMotionEnabled == true) {
+            val amplitude = liquidMotion?.rippleAmplitude ?: 0f
+            val age = liquidMotion?.rippleAge ?: 0f
+            val directionX = liquidMotion?.rippleX ?: 1f
+            val directionY = liquidMotion?.rippleY ?: 0f
+            outerLensShader?.setFloatUniform("flowRipple", amplitude, age, directionX, directionY)
+            combinedOuterLensShader?.setFloatUniform("flowRipple", amplitude * postureBlend, age, directionX, directionY)
+            opticalSurfaceOuterLensShader?.setFloatUniform("flowRipple", amplitude, age, directionX, directionY)
+            val reboundX = liquidMotion?.reboundX ?: 0f
+            val reboundY = liquidMotion?.reboundY ?: 0f
+            outerLensShader?.setFloatUniform("flowRebound", reboundX, reboundY)
+            combinedOuterLensShader?.setFloatUniform("flowRebound", reboundX * postureBlend, reboundY * postureBlend)
+            opticalSurfaceOuterLensShader?.setFloatUniform("flowRebound", reboundX, reboundY)
+        }
+        // RenderEffect snapshots RuntimeShader uniforms when the effect node is
+        // created. Re-wrap only after a meaningful sensor delta; updating the
+        // shader uniforms alone leaves every hooked app on its initial pose.
+        rebuildPostureEffectSnapshots(!flowing || postureBlend > 0f ||
+            postureBlendChanged || gestureStateChanged)
+    }
+
+    private fun rebuildPostureEffectSnapshots(rebuildTabs: Boolean = true) {
+        val blur = postureBackdropBlurEffect ?: return
+        outerLensShader?.let { shader ->
+            val lens = RenderEffect.createRuntimeShaderEffect(shader, "content")
+            outerGlassEffect = if (reuseOpticalBlur) lens else RenderEffect.createChainEffect(lens, blur)
+        }
+        combinedOuterLensShader?.takeIf { rebuildTabs }?.let { shader ->
+            val lens = RenderEffect.createRuntimeShaderEffect(shader, "content")
+            tabsBackdropEffect = if (reuseOpticalBlur) lens else RenderEffect.createChainEffect(lens, blur)
+        }
+        opticalSurfaceOuterLensShader?.takeIf {
+            targetAdapter?.flowingLiquidEnabled != true || usesOpticalSurfaceHybridBackdrop()
+        }?.let { shader ->
+            val lens = RenderEffect.createRuntimeShaderEffect(shader, "content")
+            opticalSurfaceOuterGlassEffect = RenderEffect.createChainEffect(lens, blur)
+        }
+        perfEffectRebuilds++
+    }
 
     private var opticalSurfaceOuterGlassEffect: RenderEffect? = null
 
@@ -1251,6 +1550,17 @@ internal val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 internal var selectedIndex = 0
     internal val adapterSlotCount: Int get() = slotCount
     internal val adapterSelectedIndex: Int get() = selectedIndex
+    internal val drawingNavigationForIndicatorOptics: Boolean get() = drawingHiddenNavigationForOptics
+    internal fun isNavigationSlotInsideIndicator(x: Float, y: Float): Boolean =
+        selectionRect.contains(x, y)
+    internal val adapterNavigationAnimationRunning: Boolean get() = isBarVisualStateAnimating()
+    internal val adapterOpticalStateForDiagnostics: String get() =
+        "hostAlpha=$alpha pipeline=$opticalSurfaceSurfacePipelineActive surfaceReady=$opticalSurfaceSurfaceReady " +
+            "surfaceVisibility=${opticalSurfaceSurfaceView?.visibility} surfaceSize=${opticalSurfaceSurfaceView?.width}x${opticalSurfaceSurfaceView?.height} live=$liveBackdropActive"
+    override fun toString(): String = super.toString() + " " + adapterOpticalStateForDiagnostics
+    internal val opticalSurfaceRunningForAdapter: Boolean get() =
+        opticalSurfaceSurfacePipelineActive && opticalSurfaceSurfaceReady &&
+            opticalSurfaceSurfaceView?.holder?.surface?.isValid == true
     internal fun adapterShowDuringScroll() {
         removeCallbacks(msgScrollHideRunnable)
         if (msgScrolledToStop) {
@@ -1273,6 +1583,12 @@ internal var selectedIndex = 0
         invalidate()
     }
     internal fun adapterResolvedSelection(): Int? = resolveSelectedFromViewState()
+    /** An adapter may wait for native page identity without inventing a selection. */
+    internal fun setAdapterSelectionVisible(visible: Boolean) {
+        if (sliderEnabled == visible) return
+        sliderEnabled = visible
+        invalidate()
+    }
 
     private var selectionInitialized = false
 
@@ -1283,6 +1599,63 @@ internal var selectedIndex = 0
     private var indicatorVelocity = 0f
 
     private var pressProgress = 0f
+    private var restingTintProgress = 1f
+    private var returningRestingTint = false
+    private var restingTintAnimator: android.animation.ValueAnimator? = null
+
+    /** The same return starts in ACTION_UP, before the scale spring settles. */
+    private fun indicatorPostureBlend(): Float = when {
+        !indicatorInteractionPolicy.expandsOnInteraction -> 1f
+        touching -> 0f
+        returningRestingTint -> restingTintProgress.coerceIn(0f, 1f)
+        isIndicatorGestureExpanded() -> 0f
+        else -> 1f
+    }
+
+    private fun resetRestingTint() {
+        restingTintAnimator?.cancel()
+        restingTintAnimator = null
+        restingTintProgress = 0f
+        returningRestingTint = false
+    }
+
+    private fun updateRestingTint() {
+        if (!indicatorInteractionPolicy.expandsOnInteraction) return
+        if (touching || (pressProgress > 0.001f && !returningRestingTint)) {
+            if (restingTintProgress != 0f || restingTintAnimator != null) resetRestingTint()
+            return
+        }
+        startRestingTintReturn()
+    }
+
+    private fun startRestingTintReturn() {
+        if (!indicatorInteractionPolicy.expandsOnInteraction) return
+        if (touching) return
+        returningRestingTint = true
+        if (restingTintProgress < 1f && restingTintAnimator == null) {
+            restingTintAnimator = android.animation.ValueAnimator.ofFloat(restingTintProgress, 1f).apply {
+                duration = io.github.offlineglass.rendering.BottomBarIndicatorStyle.RESTING_TINT_RETURN_MS
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener {
+                    restingTintProgress = it.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
+        }
+    }
+    private var combinedIndicatorTintSuppressed = false
+    private var combinedIndicatorRestingTint = 1f
+    private var combinedIndicatorNavigationIncluded = true
+    private var combinedIndicatorNavigationMix = Float.NaN
+    private var combinedIndicatorGestureExpanded = false
+    private var combinedIndicatorPanelMix = Float.NaN
+    private var combinedRetainedReturn = false
+    private fun continuousIndicatorReturnEnabled(): Boolean =
+        indicatorInteractionPolicy.rendersSelectionLens &&
+        targetAdapter?.completeIndicatorRestingHandoff == true && config.liquidGlassEnabled && !config.solidBarEnabled && hasUsableBackdrop()
+    private val opticalSettleGate = io.github.offlineglass.rendering.OpticalSettleGate()
+    private var lastIndicatorOpticsFailureAt = 0L
 
     private var outerPanelScale = 1f
 
@@ -1290,7 +1663,6 @@ internal var selectedIndex = 0
 
     private var indicatorScaleY = 1f
 
-    private var interactiveHighlightProgress = 0f
 
     private var touchX = 0f
 
@@ -1399,8 +1771,8 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
     private var opticalSurfaceNativeIndicatorActive = false
 
     private var opticalSurfaceNativeIndicatorShader =
-
-        createRuntimeShader(ROUNDED_RECT_DISPERSION_SHADER, "optical-surface-native-indicator")
+        if (configuredIndicatorInteractionPolicy.rendersSelectionLens)
+            createRuntimeShader(ROUNDED_RECT_DISPERSION_SHADER, "optical-surface-native-indicator") else null
 
     private var opticalSurfaceNativeIndicatorEffectSignature = Long.MIN_VALUE
 
@@ -1418,6 +1790,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
     // gate the copy cadence; must be visible across threads promptly.
 
     @Volatile private var opticalSurfaceRootCopyInFlight = false
+    @Volatile private var opticalSurfaceRootCopySerial = 0L
 
     private var opticalSurfaceRootCopyScratch: Bitmap? = null
 
@@ -1576,6 +1949,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
     private var perfEffectRebuilds = 0
 
     private var perfNodeRecords = 0
+    private var perfRetainedMixOnly = 0
 
     private var perfSurfaceRenders = 0
 
@@ -1583,71 +1957,23 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
 
 
-    private val positionSpring = SpringFloat(0f, 1_000f, 1f, 0.001f) { value, velocity ->
-
-        indicatorPosition = value
-
-        if (touching) {
-
-            velocitySpring.animateTo(velocity / (visualSlotCount() - 1).coerceAtLeast(1))
-
-        }
-
-        invalidate()
-
-    }
-
-    private val velocitySpring = SpringFloat(0f, 300f, 0.5f, 0.01f) { value, _ ->
-
-        indicatorVelocity = value
-
-        invalidate()
-
-    }
-
-    private val pressSpring = SpringFloat(0f, 1_000f, 1f, 0.001f) { value, _ ->
-
-        pressProgress = value.coerceIn(0f, 1f)
-
-        updateOuterScale()
-
-        invalidate()
-
-    }
-
-    private val scaleXSpring = SpringFloat(1f, 250f, 0.6f, 0.001f) { value, _ ->
-
-        indicatorScaleX = value
-
-        invalidate()
-
-    }
-
-    private val scaleYSpring = SpringFloat(1f, 250f, 0.7f, 0.001f) { value, _ ->
-
-        indicatorScaleY = value
-
-        invalidate()
-
-    }
-
-    private val interactiveSpring = SpringFloat(0f, 300f, 0.5f, 0.001f) { value, _ ->
-
-        interactiveHighlightProgress = value.coerceIn(0f, 1f)
-
-        invalidate()
-
-    }
-
-    private val panelOffsetSpring = SpringFloat(0f, 300f, 0.5f, 0.01f) { value, _ ->
-
-        panelDragOffset = value
-
-        updatePanelTranslation()
-
-        invalidate()
-
-    }
+    private val motionSprings = io.github.offlineglass.rendering.BottomBarMotionSprings(
+        initialPosition = 0f,
+        slotCount = { visualSlotCount() },
+        tracking = { touching && indicatorInteractionPolicy.expandsOnInteraction },
+        onPosition = { value, _ -> indicatorPosition = value; invalidate() },
+        onVelocity = { value -> indicatorVelocity = value; invalidate() },
+        onPress = { value -> pressProgress = value; updateOuterScale(); invalidate() },
+        onScaleX = { value -> indicatorScaleX = value; invalidate() },
+        onScaleY = { value -> indicatorScaleY = value; invalidate() },
+        onPanelOffset = { value -> panelDragOffset = value; updatePanelTranslation(); invalidate() },
+    )
+    private val positionSpring get() = motionSprings.position
+    private val velocitySpring get() = motionSprings.velocity
+    private val pressSpring get() = motionSprings.press
+    private val scaleXSpring get() = motionSprings.scaleX
+    private val scaleYSpring get() = motionSprings.scaleY
+    private val panelOffsetSpring get() = motionSprings.panelOffset
 
 
 
@@ -1717,8 +2043,6 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         scaleYSpring.snapTo(1f)
 
-        interactiveSpring.snapTo(0f)
-
         panelOffsetSpring.snapTo(0f)
 
     }
@@ -1785,7 +2109,6 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         appNavigationState?.suppressNativeChromeEarly(source)
 
-        suppressNativeMeituanTakeoutBottomBar(source)
 
         source?.let { targetAdapter?.suppressNativeBottomChrome(this, it) }
 
@@ -1927,7 +2250,9 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         context.findActivity()?.let { activity ->
 
-            if (targetAdapter?.navigationImmersionOverride != null) {
+            if (appNavigationState?.forceNavigationBarImmersed(this) == false) {
+                GlassInstaller.setNavigationBarImmersion(activity, false)
+            } else if (targetAdapter?.navigationImmersionOverride != null) {
 
                 GlassInstaller.updateAdapterNavigationBarForPage(activity)
 
@@ -2043,7 +2368,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
                         this, navigationSource,
                         { (resolveSelectedFromViewState() ?: selectedIndex).coerceIn(0, (slotCount - 1).coerceAtLeast(0)) },
                         config.enabled, density,
-                        glassHostHeightPx(density, config, context.packageName),
+                        glassHostHeightPx(density, config, context.packageName, visualSlotCount()),
                         { adapterNavigationSurfaceColor() },
                     )
                 }
@@ -2059,11 +2384,10 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
                 // positioning its independent bottom overlays.
 
-                if (!prioritizeTapTransition) appNavigationState?.onHostFrame(this)
+                if (!prioritizeTapTransition || targetAdapter?.updatesSceneDuringTapTransition == true)
+                    appNavigationState?.onHostFrame(this)
 
-                suppressNativeMeituanTakeoutBottomBar(source)
 
-                adjustMeituanTakeoutScrollSafety()
 
                 appNavigationState?.refreshNavigationSource(this)
                 source?.let { targetAdapter?.suppressNativeBottomChrome(this, it) }
@@ -2072,7 +2396,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
                 appNavigationState?.adjustFloatingActions(this, navigationSource)
 
-                source?.let { targetAdapter?.suppressNativeBottomChrome(this, it) }
+
 
 
 
@@ -2156,12 +2480,22 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
                     val hostParent = parent as? ViewGroup
 
-                    if (hostParent != null &&
+                    if (targetAdapter?.managesHostSiblingOrder != true && hostParent != null &&
 
                         hostParent.getChildAt(hostParent.childCount - 1) !== this
 
                     ) bringToFront()
 
+                }
+
+                // Home content may be appended after the splash exits while the
+                // native tab view itself remains attached. Repair ordering once,
+                // never request a layout on every frame.
+                if (sourceReady && targetAdapter?.keepNavigationOverlayOnTop == true) {
+                    val hostParent = parent as? ViewGroup
+                    if (hostParent != null &&
+                        hostParent.getChildAt(hostParent.childCount - 1) !== this
+                    ) bringToFront()
                 }
 
                 // While Shorts' back-peek window is open the bar must reappear
@@ -2258,12 +2592,36 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
         super.onWindowVisibilityChanged(visibility)
 
         updateBloomTiltRegistration()
+        io.github.offlineglass.rendering.PostureGlass.visibilityChanged(this)
 
+    }
+
+    override fun onVisibilityAggregated(isVisible: Boolean) {
+        super.onVisibilityAggregated(isVisible)
+        updateBloomTiltRegistration()
+        io.github.offlineglass.rendering.PostureGlass.visibilityChanged(this)
+        if (isVisible && hasWindowFocus() && opticalSurfaceSurfacePipelineActive && usesCompositorSurfaceProbe()) {
+            scheduleCompositorSurfaceProbe()
+        }
     }
 
 
 
+    private fun removeCompanionAfterDetach(view: View) {
+        val owner = view.parent as? ViewGroup ?: return
+        if (targetAdapter?.deferCompanionRemovalOnDetach == true) {
+            Handler(Looper.getMainLooper()).post {
+                if (view.parent === owner) owner.removeView(view)
+            }
+        } else owner.removeView(view)
+    }
+
     override fun onDetachedFromWindow() {
+        opticalSettleGate.reset()
+        exactGeometryWork?.clear()
+        exactBloomWork?.clear()
+        restingTintAnimator?.cancel()
+        restingTintAnimator = null
 
         if (targetAdapter?.requestedFrameRateMax != null && Build.VERSION.SDK_INT >= 35) {
             setRequestedFrameRate(0f)
@@ -2315,6 +2673,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         if (configSyncBroadcastRegistered) unregisterConfigSyncBroadcast()
 
+        firstVisitPageSwitch?.dispose()
         appNavigationState?.onHostDetached()
 
 
@@ -2355,8 +2714,6 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
             scaleYSpring,
 
-            interactiveSpring,
-
             panelOffsetSpring,
 
         )
@@ -2389,7 +2746,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
             disableOpticalSurfaceNativeBlur(blur)
 
-            (blur.parent as? ViewGroup)?.removeView(blur)
+            removeCompanionAfterDetach(blur)
 
         }
 
@@ -2403,7 +2760,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
             indicator.setRenderEffect(null)
 
-            (indicator.parent as? ViewGroup)?.removeView(indicator)
+            removeCompanionAfterDetach(indicator)
 
         }
 
@@ -2417,7 +2774,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
             surface.visibility = View.GONE
 
-            (surface.parent as? ViewGroup)?.removeView(surface)
+            removeCompanionAfterDetach(surface)
 
         }
 
@@ -2449,6 +2806,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
         compositorSurfaceStaticStreak = 0
 
         lastSurfaceRenderDark = null
+        lastSurfaceRenderConfig = null
 
         navigationSnapshot?.recycle()
 
@@ -2472,6 +2830,16 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
 
         outerRenderNode.setRenderEffect(null)
+        actionGlassNode.setRenderEffect(null)
+        actionGlassNode.discardDisplayList()
+        actionGlassShader = null
+        actionGlassEffect = null
+        actionGlassKey = null
+        mainGlassNode.setRenderEffect(null)
+        mainGlassNode.discardDisplayList()
+        mainGlassShader = null
+        mainGlassEffect = null
+        mainGlassKey = null
 
         tabsBackdropNode.setRenderEffect(null)
 
@@ -2492,6 +2860,11 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
         tabsBackdropNode.discardDisplayList()
 
         indicatorCombinedNode.discardDisplayList()
+        indicatorReturnLayers?.release()
+        indicatorReturnLayers = null
+        sampledSpecularSource.discardDisplayList()
+        sampledSpecularLens.setRenderEffect(null)
+        sampledSpecularLens.discardDisplayList()
 
         indicatorRenderNode.discardDisplayList()
 
@@ -2532,7 +2905,13 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
 
         super.onWindowFocusChanged(hasWindowFocus)
+        if (!hasWindowFocus) firstVisitPageSwitch?.cancel()
+        updateBloomTiltRegistration()
+        io.github.offlineglass.rendering.PostureGlass.visibilityChanged(this)
         appNavigationState?.onHostWindowFocusChanged(hasWindowFocus)
+        if (hasWindowFocus && opticalSurfaceSurfacePipelineActive && usesCompositorSurfaceProbe()) {
+            scheduleCompositorSurfaceProbe()
+        }
 
         if (hasWindowFocus) {
 
@@ -2572,7 +2951,8 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         }
 
-        if (targetAdapter?.liveBackdropFramePump != true) return
+        if (targetAdapter?.liveBackdropFramePump != true && targetAdapter?.continuousFramePump != true &&
+            appNavigationState?.needsContinuousHomeFrames(selectedIndex) != true) return
 
         if (hasWindowFocus) {
 
@@ -2629,11 +3009,11 @@ internal fun updateAnimatedVisibility(shouldShow: Boolean) {
 
             alpha = if (shouldShow) 1f else 0f
 
-            scaleX = if (shouldShow) 1f else OPTICAL_BAR_HIDDEN_SCALE_X
+            scaleX = if (shouldShow || APP_BAR_EXIT_ANIMATION_SCHEME == "A") 1f else OPTICAL_BAR_HIDDEN_SCALE_X
 
-            scaleY = if (shouldShow) 1f else OPTICAL_BAR_HIDDEN_SCALE_Y
+            scaleY = if (shouldShow || APP_BAR_EXIT_ANIMATION_SCHEME == "A") 1f else OPTICAL_BAR_HIDDEN_SCALE_Y
 
-            translationY = if (shouldShow) 0f else visibilityHiddenTranslationY()
+            translationY = if (shouldShow) 0f else activeBarHiddenTranslationY()
 
             visibility = if (shouldShow) View.VISIBLE else View.GONE
 
@@ -2679,6 +3059,28 @@ internal fun updateAnimatedVisibility(shouldShow: Boolean) {
 
         }
 
+        if (targetAdapter?.simpleSceneVisibilityAnimation == true) {
+            scaleX = 1f
+            scaleY = 1f
+            if (shouldShow) visibility = View.VISIBLE
+            setNativeBarTouchable(navigationSource, shouldShow)
+            animate().alpha(if (shouldShow) 1f else 0f)
+                .translationY(if (shouldShow) 0f else activeBarHiddenTranslationY())
+                .setDuration(240L)
+                .setInterpolator(android.view.animation.PathInterpolator(.2f, 0f, 0f, 1f))
+                .setUpdateListener { syncOpticalVisibilityCompanions(); invalidate() }
+                .withEndAction {
+                    if (generation == barVisibilityGeneration) {
+                        animate().setUpdateListener(null)
+                        if (shouldShow) {
+                            barVisibilityAnimating = false
+                            syncOpticalVisibilityCompanions()
+                        } else finishBarExit(generation)
+                    }
+                }.start()
+            return
+        }
+
         // SurfaceView buffers do not participate reliably in View-property
 
         // transforms.  While the bar is entering/leaving, render the same live
@@ -2717,11 +3119,11 @@ internal fun updateAnimatedVisibility(shouldShow: Boolean) {
 
             if (alpha <= 0.001f) {
 
-                scaleX = OPTICAL_BAR_HIDDEN_SCALE_X
+                scaleX = if (APP_BAR_EXIT_ANIMATION_SCHEME == "A") 1f else OPTICAL_BAR_HIDDEN_SCALE_X
 
-                scaleY = OPTICAL_BAR_HIDDEN_SCALE_Y
+                scaleY = if (APP_BAR_EXIT_ANIMATION_SCHEME == "A") 1f else OPTICAL_BAR_HIDDEN_SCALE_Y
 
-                translationY = visibilityHiddenTranslationY()
+                translationY = activeBarHiddenTranslationY()
 
             }
 
@@ -2807,48 +3209,36 @@ internal fun updateAnimatedVisibility(shouldShow: Boolean) {
 
             setNativeBarTouchable(navigationSource, false)
 
-            animateVisibilityFrameDriven(
-
-                targetAlpha = 0f,
-
-                targetScaleX = OPTICAL_BAR_HIDDEN_SCALE_X,
-
-                targetScaleY = OPTICAL_BAR_HIDDEN_SCALE_Y,
-
-                targetTranslationY = visibilityHiddenTranslationY(),
-
-                duration = OPTICAL_BAR_VISIBILITY_DURATION_MS,
-
-                interpolator = OPTICAL_BAR_HIDE_INTERPOLATOR,
-
-                generation = generation,
-
-            ) {
-
-                if (generation == barVisibilityGeneration && !barVisibilityTarget) {
-
-                    barVisibilityAnimating = false
-
-                    visibility = View.INVISIBLE
-
-                    // Invalidate the backdrop so the next show animates
-
-                    // from a fresh live scene instead of the frozen frame
-
-                    // captured at the end of the hide animation.
-
-                    liveBackdropSignature = Long.MIN_VALUE
-
-                    pendingBackdropSignature = Long.MIN_VALUE
-
-                    pendingBackdropStableFrames = 0
-
-                    restoreQqSteadyStateZ()
-
-                    syncOpticalVisibilityCompanions()
-
+            // Scheme A ports the module's AnimatedVisibility exit: fade while
+            // translating the complete bar height downward, without the
+            // previous horizontal/vertical collapse. Scheme B below preserves
+            // the former adapter animation intact for an easy rollback.
+            if (APP_BAR_EXIT_ANIMATION_SCHEME == "A") {
+                animateVisibilityFrameDriven(
+                    targetAlpha = 0f,
+                    targetScaleX = 1f,
+                    targetScaleY = 1f,
+                    targetTranslationY = activeBarHiddenTranslationY(),
+                    duration = OPTICAL_BAR_SCHEME_A_EXIT_MS,
+                    interpolator = OPTICAL_BAR_SCHEME_A_EXIT_INTERPOLATOR,
+                    generation = generation,
+                ) {
+                    finishBarExit(generation)
                 }
-
+            } else {
+                // Scheme B — archived original exit (scale + adapter-specific
+                // translation and timing). Select B above to restore it.
+                animateVisibilityFrameDriven(
+                    targetAlpha = 0f,
+                    targetScaleX = OPTICAL_BAR_HIDDEN_SCALE_X,
+                    targetScaleY = OPTICAL_BAR_HIDDEN_SCALE_Y,
+                    targetTranslationY = visibilityHiddenTranslationY(),
+                    duration = OPTICAL_BAR_VISIBILITY_DURATION_MS,
+                    interpolator = OPTICAL_BAR_HIDE_INTERPOLATOR,
+                    generation = generation,
+                ) {
+                    finishBarExit(generation)
+                }
             }
 
         }
@@ -2856,6 +3246,19 @@ internal fun updateAnimatedVisibility(shouldShow: Boolean) {
     }
 
 
+
+    private fun finishBarExit(generation: Int) {
+        if (generation != barVisibilityGeneration || barVisibilityTarget) return
+        barVisibilityAnimating = false
+        visibility = View.INVISIBLE
+        // Capture the next show from the live scene, not the frozen exit frame.
+        liveBackdropSignature = Long.MIN_VALUE
+        pendingBackdropSignature = Long.MIN_VALUE
+        pendingBackdropStableFrames = 0
+
+        restoreQqSteadyStateZ()
+        syncOpticalVisibilityCompanions()
+    }
 
     /**
 
@@ -2986,6 +3389,10 @@ internal fun updateAnimatedVisibility(shouldShow: Boolean) {
 
         targetAdapter?.hiddenBarTranslationPx(height, density) ?: opticalHiddenTranslationY()
 
+    private fun activeBarHiddenTranslationY(): Float =
+        targetAdapter?.sceneExitTranslationPx(height,density) ?:
+        if (APP_BAR_EXIT_ANIMATION_SCHEME == "A") height.toFloat() else visibilityHiddenTranslationY()
+
 
 
     private fun restoreQqSteadyStateZ() {
@@ -3004,6 +3411,7 @@ internal fun syncOpticalVisibilityCompanions() {
         if (appNavigationState?.syncVisibilityCompanion(this, selectedIndex) == true) return
 
         if (targetAdapter?.usesOpticalSurfacePipeline != true &&
+            targetAdapter?.usesDirectOpticalBackdropMode != true &&
             targetAdapter?.retainsOpticalSurfaceWhenBarHidden != true &&
 
             context.packageName != MEITUAN_TAKEOUT_PACKAGE
@@ -3079,6 +3487,7 @@ internal fun syncOpticalVisibilityCompanions() {
             // by a native process crash.
 
             val wantsOpticalSurface = wantsRootSurfaceOpticalPipeline() &&
+                appNavigationState?.allowsOpticalSurfacePipeline() != false &&
 
                 (visibleDuringTransition || targetAdapter?.retainsOpticalSurfaceWhenBarHidden == true)
 
@@ -3162,7 +3571,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         outerRect.set(0f, 0f, w.toFloat(), h.toFloat())
 
-        clipPath.setBottomBarSquircle(outerRect, outerCornerRadiusPx(), config.cornerSmoothing)
+        rebuildBarPath()
 
         invalidateOutline()
 
@@ -3192,7 +3601,11 @@ internal fun syncOpticalVisibilityCompanions() {
 
         super.onConfigurationChanged(newConfig)
 
-        context.findActivity()?.let(GlassInstaller::ensureNavigationBarImmersion)
+        context.findActivity()?.let { activity ->
+            if (appNavigationState?.forceNavigationBarImmersed(this) != false) {
+                GlassInstaller.ensureNavigationBarImmersion(activity)
+            }
+        }
 
         // Keep geometry, gesture state and springs alive while the theme-owned
 
@@ -3361,10 +3774,15 @@ internal fun syncOpticalVisibilityCompanions() {
         if (capturing) return
 
         super.onDraw(canvas)
+        updateTiltRefractionEffects()
 
-        if (opticalSurfaceSurfacePipelineActive) return
+        if (opticalSurfaceSurfacePipelineActive &&
+            appNavigationState?.holdDirectBackdropUntilOpticalFrame(
+                liveBackdropActive, liveBackdropNode.hasDisplayList(),
+            ) != true) return
 
-        sharedOpticalBlurPrepared = false
+        if (targetAdapter?.retainsLiveOpticalBlur != true || !liveBackdropActive)
+            sharedOpticalBlurPrepared = false
 
         val appWantsHostPanel = appNavigationState?.beforeHostDraw(
             this, navigationSource as? ViewGroup,
@@ -3373,7 +3791,8 @@ internal fun syncOpticalVisibilityCompanions() {
         val perfT0 = System.nanoTime()
 
         if (canvas.isHardwareAccelerated && !config.solidBarEnabled &&
-            SystemClock.uptimeMillis() >= barAnimationPriorityUntil &&
+            (SystemClock.uptimeMillis() >= barAnimationPriorityUntil ||
+                targetAdapter?.keepsBackdropDuringTapTransition == true) &&
             !compositorBlurBehind && appNavigationState?.maintainsCompositorSamplingWithoutSurface() != true &&
 
             // Pre-draw already prepared the live scene for this traversal. Its
@@ -3435,7 +3854,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         if (targetAdapter?.liveBackdropFramePump == true &&
 
-            liveBackdropActive && isShown && alpha > 0.001f
+            liveBackdropActive && isShown && hasWindowFocus() && windowVisibility == View.VISIBLE && alpha > 0.001f
 
         ) {
 
@@ -3447,7 +3866,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         if (appNavigationState?.needsContinuousHomeFrames(selectedIndex) == true &&
 
-            liveBackdropActive && isShown && alpha > 0.001f
+            liveBackdropActive && isShown && hasWindowFocus() && windowVisibility == View.VISIBLE && alpha > 0.001f
 
         ) {
 
@@ -3463,7 +3882,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         if (targetAdapter?.continuousFramePump == true &&
 
-            liveBackdropActive && isShown && alpha > 0.001f
+            liveBackdropActive && isShown && hasWindowFocus() && windowVisibility == View.VISIBLE && alpha > 0.001f
 
         ) {
 
@@ -3502,7 +3921,37 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
-    private fun drawGlassPanel(canvas: Canvas, dark: Boolean) {
+    private inline fun <T> traceOpticalWork(name: String, block: () -> T): T {
+        if (!io.github.offlineglass.BuildConfig.DEBUG || !android.os.Trace.isEnabled()) return block()
+        android.os.Trace.beginSection(name)
+        return try { block() } finally { android.os.Trace.endSection() }
+    }
+
+    private fun drawGlassPanel(canvas: Canvas, dark: Boolean) =
+        traceOpticalWork("LiquidTab.PanelCPU") { drawGlassPanelContent(canvas, dark) }
+
+    private fun drawGlassPanelContent(canvas: Canvas, dark: Boolean) {
+        val layout = adapterBarLayout()
+        if (layout == null) {
+            drawGlassPanelSurface(canvas, dark, outerPanelScale, width / 2f)
+            return
+        }
+        // Share retained backdrop/effects. Only the left panel receives the
+        // gesture transform; the right action is rendered in fixed host space.
+        val left = canvas.save()
+        canvas.translate(panelFollowOffset(layout.mainWidth), 0f)
+        clipPath.setBottomBarSquircle(compoundMainRect, outerCornerRadiusPx(), config.cornerSmoothing)
+        drawGlassPanelSurface(canvas, dark, outerPanelScale, layout.mainWidth / 2f, compoundMainRect)
+        canvas.restoreToCount(left)
+        val right = canvas.save()
+        clipPath.reset()
+        clipPath.addOval(compoundActionRect, Path.Direction.CW)
+        drawGlassPanelSurface(canvas, dark, 1f + 0.08f * (appNavigationState?.actionButtonPressProgress() ?: 0f), layout.actionLeft + layout.actionSize / 2f, compoundActionRect)
+        canvas.restoreToCount(right)
+        rebuildBarPath()
+    }
+
+    private fun drawGlassPanelSurface(canvas: Canvas, dark: Boolean, panelScale: Float, pivotX: Float, panelBounds: RectF = outerRect) {
 
         val appVideoBackdrop = appNavigationState?.videoBackdrop()
         if (appVideoBackdrop != null) {
@@ -3561,9 +4010,9 @@ internal fun syncOpticalVisibilityCompanions() {
 
         canvas.save()
 
-        canvas.scale(outerPanelScale, outerPanelScale, width / 2f, height / 2f)
+        canvas.scale(panelScale, panelScale, pivotX, height / 2f)
 
-        drawPanelAmbientShadow(canvas, dark, appChromeFade)
+        drawPanelAmbientShadow(canvas, dark, appChromeFade, panelBounds)
         appNavigationState?.drawAdditionalAmbientShadow(canvas, dark, appChromeFade)
 
         canvas.save()
@@ -3586,7 +4035,13 @@ internal fun syncOpticalVisibilityCompanions() {
 
         // opticalSurfaceOuterGlassEffect and reduced alpha.
 
-        if (hasUsableBackdrop() && !config.solidBarEnabled) drawOuterGlass(canvas)
+        if (hasUsableBackdrop() && !config.solidBarEnabled) {
+            if (panelBounds === compoundActionRect && adapterBarLayout()?.localActionOptics == true)
+                drawLocalActionGlass(canvas, panelBounds)
+            else if (panelBounds === compoundMainRect && adapterBarLayout()?.localMainOptics == true)
+                drawLocalActionGlass(canvas, panelBounds, mainPanel = true)
+            else drawOuterGlass(canvas)
+        }
 
 
 
@@ -3606,7 +4061,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
             val configuredFillColor = surfaceContainerColor(dark)
 
-            val fillColor = if (config.solidBarEnabled) {
+            val baseFillColor = if (config.solidBarEnabled) {
 
                 Color.argb(
 
@@ -3626,6 +4081,12 @@ internal fun syncOpticalVisibilityCompanions() {
 
             }
 
+            val fillColor = adapterSurfaceOpacity(
+                (if (panelBounds === compoundActionRect) adapterBarLayout()?.actionFillColor?.let {
+                    androidx.core.graphics.ColorUtils.blendARGB(it, Color.WHITE,
+                        0.25f * (appNavigationState?.actionButtonPressProgress() ?: 0f))
+                } else null)
+                ?: targetAdapter?.glassSurfaceFillColor(dark, selectedIndex, baseFillColor) ?: baseFillColor)
             val effectiveFillAlpha = if (isExiting) {
 
                 val fadeProgress = ((0.7f - alpha) / 0.7f).coerceIn(0f, 1f)
@@ -3670,7 +4131,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 }
 
-                lightingRect.set(outerRect)
+                lightingRect.set(panelBounds)
 
                 lightingRect.inset(inset, inset)
 
@@ -3684,13 +4145,17 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 )
 
+                if (adapterBarLayout() != null) {
+                    if (panelBounds === compoundActionRect) {
+                        outlinePath.reset()
+                        outlinePath.addOval(lightingRect, Path.Direction.CW)
+                    }
+                }
                 canvas.drawPath(outlinePath, plainBlurOutlinePaint)
 
             }
 
             if (config.liquidGlassEnabled) {
-
-                drawInteractiveHighlight(canvas)
 
                 if (config.outlineEnabled) {
 
@@ -3698,7 +4163,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                         canvas,
 
-                        outerRect,
+                        panelBounds,
 
                         outerCornerRadiusPx(),
 
@@ -3714,7 +4179,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
                             0.75f
 
-                        }) * if (dark) config.darkBarHighlightStrength else 1f)
+                        }) * if (dark || targetAdapter?.panelHighlightFollowsAllThemes == true)
+                            config.darkBarHighlightStrength else 1f)
 
                             .coerceAtMost(1f),
 
@@ -3731,6 +4197,8 @@ internal fun syncOpticalVisibilityCompanions() {
         }
 
         canvas.restore()
+
+        appNavigationState?.drawPanelEdgeGlow(canvas, clipPath, density)
 
         canvas.restore()
 
@@ -3752,21 +4220,50 @@ internal fun syncOpticalVisibilityCompanions() {
 
      */
 
-    private fun drawPanelAmbientShadow(canvas: Canvas, dark: Boolean, alphaScale: Float = 1f) {
+    private fun drawPanelAmbientShadow(canvas: Canvas, dark: Boolean, alphaScale: Float = 1f, shadowBounds: RectF = outerRect) {
 
-        if (outerRect.isEmpty || !canvas.isHardwareAccelerated) return
+        if (shadowBounds.isEmpty || !canvas.isHardwareAccelerated) return
 
+        // Detached surfaces have separate mutable paints/shaders. Updating the
+        // action's bounds must never overwrite the main panel's recorded mask.
+        val action = shadowBounds === compoundActionRect
+        val independentPath = adapterBarLayout()?.localMainOptics == true
+        val shadowPath = if (independentPath) {
+            if (action) actionAmbientOutline.apply {
+                reset(); addOval(shadowBounds, Path.Direction.CW)
+            } else mainAmbientOutline.apply {
+                setBottomBarSquircle(shadowBounds, outerCornerRadiusPx(), config.cornerSmoothing)
+            }
+        } else clipPath
+        val panelShadowPaint = if (action) actionPanelShadowPaint else this.panelShadowPaint
+        val directionalShadowMaskPaint = if (action) actionDirectionalShadowMaskPaint
+            else this.directionalShadowMaskPaint
         panelShadowPaint.color = Color.TRANSPARENT
 
-        // WeChat renders a much tighter ambient ring; every other app keeps the
-
-        // standard radius.
+        // App geometry may select a shadow radius; halo policy is shared.
 
         val blurDp = targetAdapter?.panelShadowBlurDp ?: PANEL_SHADOW_BLUR_DP
+        // Use the exact posture last presented by the lens, avoiding shadow/optics lag.
+        val postureShadow = tiltRefractionEnabled && config.liquidGlassEnabled &&
+            !config.solidBarEnabled && lastTiltOpticsX.isFinite() && lastTiltOpticsY.isFinite()
+        if (postureShadow && !shadowReferenceX.isFinite()) {
+            shadowReferenceX = lastTiltOpticsX
+            shadowReferencePitch = kotlin.math.atan2(-lastTiltOpticsY, -lastTiltOpticsZ)
+        }
+        val shadowTiltX = if (postureShadow)
+            ((lastTiltOpticsX - shadowReferenceX) * 2.4f).coerceIn(-1f, 1f) else 0f
+        val pitchDelta = if (postureShadow)
+            kotlin.math.atan2(-lastTiltOpticsY, -lastTiltOpticsZ) - shadowReferencePitch else 0f
+        val shadowTiltY = (kotlin.math.atan2(kotlin.math.sin(pitchDelta),
+            kotlin.math.cos(pitchDelta)) * 3f).coerceIn(-1f, 1f)
+        val postureMagnitude = if (postureShadow)
+            sqrt(lastTiltOpticsX * lastTiltOpticsX + lastTiltOpticsY * lastTiltOpticsY).coerceIn(0f, 1f)
+            else 0f
+        val shadowStrength = if (postureShadow) targetAdapter?.tiltShadowStrength ?: 1f else 1f
 
         panelShadowPaint.setShadowLayer(
 
-            blurDp * density,
+            blurDp * density * (1f + 0.12f * postureMagnitude),
 
             0f,
 
@@ -3776,7 +4273,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 ((if (dark) PANEL_SHADOW_ALPHA else PANEL_LIGHT_SHADOW_ALPHA) *
 
-                    255f * alphaScale.coerceIn(0f, 1f)).toInt(),
+                    255f * alphaScale.coerceIn(0f, 1f) * shadowStrength).toInt().coerceIn(0, 255),
 
                 0,
 
@@ -3788,13 +4285,38 @@ internal fun syncOpticalVisibilityCompanions() {
 
         )
 
-        canvas.save()
+        val mask = if (postureShadow &&
+            (kotlin.math.abs(shadowTiltX) + kotlin.math.abs(shadowTiltY) > 0.004f))
+            (if (action) actionDirectionalShadowMask else directionalShadowMask) else null
+        val shadowPadding = blurDp * density * 3.5f
+        val shadowSave = if (mask != null) canvas.saveLayer(
+            shadowBounds.left - shadowPadding, shadowBounds.top - shadowPadding,
+            shadowBounds.right + shadowPadding, shadowBounds.bottom + shadowPadding, null
+        ) else canvas.save()
 
-        canvas.clipOutPath(clipPath)
+        canvas.clipOutPath(shadowPath)
 
-        canvas.drawPath(clipPath, panelShadowPaint)
+        canvas.drawPath(shadowPath, panelShadowPaint)
+        if (mask != null) {
+            mask.setFloatUniform("bounds", shadowBounds.left, shadowBounds.top, shadowBounds.right, shadowBounds.bottom)
+            mask.setFloatUniform("tilt", shadowTiltX, shadowTiltY)
+            directionalShadowMaskPaint.shader = mask
+            canvas.drawRect(shadowBounds.left - shadowPadding, shadowBounds.top - shadowPadding,
+                shadowBounds.right + shadowPadding, shadowBounds.bottom + shadowPadding, directionalShadowMaskPaint)
+        }
 
-        canvas.restore()
+        canvas.restoreToCount(shadowSave)
+
+        if (dark) {
+            panelShadowPaint.setShadowLayer(
+                10f * density, 0f, 0f,
+                Color.argb((0.08f * 255f * alphaScale.coerceIn(0f, 1f)).toInt(), 255, 255, 255),
+            )
+            canvas.save()
+            canvas.clipOutPath(shadowPath)
+            canvas.drawPath(shadowPath, panelShadowPaint)
+            canvas.restore()
+        }
 
     }
 
@@ -3861,7 +4383,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
                     "sceneRec=$perfSceneReRecords eff=$perfEffectRebuilds nodeRec=$perfNodeRecords " +
 
-                    "surfR=$perfSurfaceRenders live=$liveBackdropActive",
+                    "surfR=$perfSurfaceRenders live=$liveBackdropActive" +
+                    (if (appNavigationState?.retainsIndicatorReturnLayers == true) " mixOnly=$perfRetainedMixOnly" else ""),
 
             )
 
@@ -3890,6 +4413,7 @@ internal fun syncOpticalVisibilityCompanions() {
         perfEffectRebuilds = 0
 
         perfNodeRecords = 0
+        perfRetainedMixOnly = 0
 
         perfSurfaceRenders = 0
 
@@ -3920,6 +4444,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         (if (nativeSelectionReliable) resolveSelectedFromViewState() else null)?.let { resolved ->
 
+            if (firstVisitPageSwitch?.waiting == true) return@let
             if (appNavigationState?.acceptNativeNavigationSelection(
                     resolved, SystemClock.uptimeMillis(),
                 ) == false
@@ -3933,6 +4458,10 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 resolved
 
+            }
+
+            if (isFirstVisitPage(effectiveResolved)) {
+                firstVisitPageSwitch?.observe(effectiveResolved, slotCount)
             }
 
             if (!selectionInitialized) {
@@ -3961,6 +4490,11 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
+        if (!isBarVisualStateAnimating() && navigationSource?.isAttachedToWindow == true &&
+            isFirstVisitPage(selectedIndex)) {
+            firstVisitPageSwitch?.seed(selectedIndex, slotCount)
+        }
+
         if (opticalSurfaceSurfacePipelineActive) {
 
             val holdForOpticalFrame = appNavigationState?.holdDirectBackdropUntilOpticalFrame(
@@ -3980,9 +4514,10 @@ internal fun syncOpticalVisibilityCompanions() {
             // Surface buffer waits must not block the application's UI thread.
 
             val animating = isBarVisualStateAnimating()
+            val terminalFrame = opticalSettleGate.shouldRender(animating, false) && !animating
             when (appNavigationState?.shouldQueueOpticalRenderFromUi(animating)) {
                 true -> queueOpticalSurfaceRender()
-                false -> Unit
+                false -> if (terminalFrame) queueOpticalSurfaceRender()
                 null -> renderOpticalSurfaceSurface()
             }
 
@@ -4187,10 +4722,27 @@ internal fun syncOpticalVisibilityCompanions() {
         if (slotCount <= 0 || width <= 0) return super.dispatchTouchEvent(event)
 
         if (appNavigationState?.allowsHostTouch() == false) return false
+        appNavigationState?.interceptNavigationTouch(this, event)?.let { return it }
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             appNavigationState?.onHostTouchDown(this, selectedIndex)
         }
 
+        val compound = adapterBarLayout()
+        if (compound != null) {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                if (event.x > compound.mainWidth && event.x < compound.actionLeft) return false
+                compoundActionTouch = event.x >= compound.actionLeft
+            }
+            if (compoundActionTouch) {
+                if (event.actionMasked == MotionEvent.ACTION_UP) {
+                    compoundActionTouch = false
+                    if (event.x >= compound.actionLeft && event.x <= width && event.y in 0f..height.toFloat()) {
+                        performNavigationSelection(compound.actionIndex)
+                    }
+                } else if (event.actionMasked == MotionEvent.ACTION_CANCEL) compoundActionTouch = false
+                return true
+            }
+        }
         val slotWidth = tabWidthPx()
 
         val visualSlots = visualSlotCount()
@@ -4250,7 +4802,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                     navigationIndexForVisualIndex(
 
-                        ((event.x - 4f * density) / slotWidth).toInt()
+                        ((uniformSlotTouchX(event.x) - 4f * density) / slotWidth).toInt()
 
                             .coerceIn(0, visualSlots - 1),
 
@@ -4297,19 +4849,22 @@ internal fun syncOpticalVisibilityCompanions() {
 
                     touchX = event.x
 
+
                     touchY = event.y
 
                     val delta = event.x - lastTouchX
 
                     if (event.x in 0f..width.toFloat() && lastTouchX in 0f..width.toFloat()) {
 
-                        dragTarget = (dragTarget + delta / slotWidth)
+                        val slotDelta = uniformSlotTouchX(event.x) - uniformSlotTouchX(lastTouchX)
+                        dragTarget = (dragTarget + slotDelta / slotWidth)
 
                             .coerceIn(0f, (visualSlots - 1).toFloat())
 
                         positionSpring.animateTo(dragTarget)
 
-                        panelOffsetSpring.snapTo(panelDragOffset + delta)
+                        if (indicatorInteractionPolicy.expandsOnInteraction)
+                            panelOffsetSpring.snapTo(panelDragOffset + delta)
 
                     }
 
@@ -4336,6 +4891,7 @@ internal fun syncOpticalVisibilityCompanions() {
                 if (indicatorGestureActive) {
 
                     touching = false
+                    startRestingTintReturn()
 
                     val generation = ++releaseGeneration
 
@@ -4369,9 +4925,10 @@ internal fun syncOpticalVisibilityCompanions() {
 
                     positionSpring.animateTo(dragTarget)
 
-                    velocitySpring.animateTo(0f)
-
-                    panelOffsetSpring.animateTo(0f)
+                    if (indicatorInteractionPolicy.expandsOnInteraction) {
+                        velocitySpring.animateTo(0f)
+                        panelOffsetSpring.animateTo(0f)
+                    }
 
                     if (event.actionMasked == MotionEvent.ACTION_UP) {
 
@@ -4385,7 +4942,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                     val upIndex = navigationIndexForVisualIndex(
 
-                        ((event.x - 4f * density) / slotWidth).toInt()
+                        ((uniformSlotTouchX(event.x) - 4f * density) / slotWidth).toInt()
 
                             .coerceIn(0, visualSlots - 1),
 
@@ -4457,50 +5014,36 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
     private fun press() {
+        if (!indicatorInteractionPolicy.expandsOnInteraction) return
+        resetRestingTint()
 
         if (!config.liquidGlassEnabled) {
 
-            pressSpring.snapTo(0f)
-
-            scaleXSpring.snapTo(1f)
-
-            scaleYSpring.snapTo(1f)
-
-            interactiveSpring.snapTo(0f)
+            motionSprings.resetPress()
 
             return
 
         }
 
-        pressSpring.animateTo(1f)
-
-        scaleXSpring.animateTo(PRESSED_SCALE)
-
-        scaleYSpring.animateTo(PRESSED_SCALE)
-
-        interactiveSpring.animateTo(1f)
+        motionSprings.press(targetAdapter?.pressedIndicatorScale ?: PRESSED_SCALE,
+            if (adapterBarLayout() != null) slotCount else visualSlotCount())
 
     }
 
 
 
     private fun release() {
+        if (!indicatorInteractionPolicy.expandsOnInteraction) return
+        startRestingTintReturn()
 
-        pressSpring.animateTo(0f)
-
-        scaleXSpring.animateTo(1f)
-
-        scaleYSpring.animateTo(1f)
-
-        interactiveSpring.animateTo(0f)
-
-        velocitySpring.animateTo(0f)
+        motionSprings.release()
 
     }
 
 
 
     private fun releaseWhenSettled(generation: Int) {
+        if (!indicatorInteractionPolicy.expandsOnInteraction) return
 
         if (generation != releaseGeneration || touching) return
 
@@ -4532,13 +5075,15 @@ internal fun syncOpticalVisibilityCompanions() {
 
         dragTarget = target
 
-        if (includePress) press()
+        val animatePress = includePress && indicatorInteractionPolicy.expandsOnInteraction
+        if (animatePress) press()
 
         positionSpring.animateTo(target)
 
-        velocitySpring.animateTo(0f)
+        if (indicatorInteractionPolicy.expandsOnInteraction) velocitySpring.animateTo(0f)
 
-        if (includePress) releaseWhenSettled(++releaseGeneration)
+        if (animatePress) releaseWhenSettled(++releaseGeneration)
+        if (animatePress && !touching) startRestingTintReturn()
 
     }
 
@@ -4546,7 +5091,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
     private fun updateOuterScale() {
 
-        if (!config.liquidGlassEnabled) {
+        if (!config.liquidGlassEnabled || !indicatorInteractionPolicy.expandsOnInteraction) {
 
             outerPanelScale = 1f
 
@@ -4554,7 +5099,9 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
-        val grow = if (width > 0) 16f * density / width else 0f
+        val panelWidth = adapterBarLayout()?.mainWidth ?: width.toFloat()
+        val grow = targetAdapter?.outerPanelPressScale?.minus(1f)
+            ?: if (panelWidth > 0f) 16f * density / panelWidth else 0f
 
         outerPanelScale = 1f + grow * pressProgress
 
@@ -4566,7 +5113,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
     private fun updatePanelTranslation() {
 
-        if (width <= 0) {
+        if (!indicatorInteractionPolicy.expandsOnInteraction || width <= 0 || adapterBarLayout() != null) {
 
             translationX = 0f
 
@@ -4574,12 +5121,12 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
-        val fraction = (panelDragOffset / width).coerceIn(-1f, 1f)
+        translationX = panelFollowOffset(width.toFloat())
 
-        val eased = easeOut.getInterpolation(abs(fraction))
+    }
 
-        translationX = 4f * density * if (fraction < 0f) -eased else eased
-
+    private fun panelFollowOffset(panelWidth: Float): Float {
+        return io.github.offlineglass.rendering.BottomBarMotionSprings.panelTranslation(panelDragOffset, panelWidth, density)
     }
 
 
@@ -4708,9 +5255,29 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
+    private fun adapterBarLayout() = targetAdapter?.barLayout(config, width, height, density, slotCount)
+
+    private val compoundMainRect = RectF()
+    private val compoundActionRect = RectF()
+    private val compoundActionPath = Path()
+    private var compoundActionTouch = false
+    private fun rebuildBarPath() {
+        val layout = adapterBarLayout()
+        if (layout == null) {
+            clipPath.setBottomBarSquircle(outerRect, outerCornerRadiusPx(), config.cornerSmoothing)
+            return
+        }
+        compoundMainRect.set(0f, 0f, layout.mainWidth, height.toFloat())
+        clipPath.setBottomBarSquircle(compoundMainRect, outerCornerRadiusPx(), config.cornerSmoothing)
+        compoundActionRect.set(layout.actionLeft, 0f, layout.actionLeft + layout.actionSize, height.toFloat())
+        compoundActionPath.reset()
+        compoundActionPath.addOval(compoundActionRect, Path.Direction.CW)
+        clipPath.addPath(compoundActionPath)
+    }
+
     private fun tabWidthPx(): Float =
 
-        ((width - 8f * density).coerceAtLeast(1f) / visualSlotCount().coerceAtLeast(1))
+        (((adapterBarLayout()?.mainWidth ?: width.toFloat()) - 8f * density).coerceAtLeast(1f) / visualSlotCount().coerceAtLeast(1))
 
 
 
@@ -4793,6 +5360,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
     private fun maybeReloadConfig() {
+
+        if (!isAttachedToWindow || !hasWindowFocus() || windowVisibility != View.VISIBLE) return
 
         val now = SystemClock.uptimeMillis()
 
@@ -4952,6 +5521,9 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
+    private val signatureWorkspace = io.github.offlineglass.rendering.ReusableDepthStack<View>()
+    private var signatureWorkspaceInUse = false
+
     private fun navigationLayoutSignature(source: ViewGroup?): Long {
 
         source ?: return Long.MIN_VALUE
@@ -4960,15 +5532,18 @@ internal fun syncOpticalVisibilityCompanions() {
 
         var signature = 17L
 
-        val stack = ArrayDeque<Pair<View, Int>>()
-
-        stack += source to 0
+        val wasInUse = signatureWorkspaceInUse
+        val stack = if (wasInUse) io.github.offlineglass.rendering.ReusableDepthStack<View>() else signatureWorkspace
+        signatureWorkspaceInUse = true
+        try {
+        stack.push(source,0)
 
         var laidOutViews = 0
 
         while (stack.isNotEmpty()) {
 
-            val (view, depth) = stack.removeLast()
+            val view = stack.pop()
+            val depth = stack.poppedDepth
 
             signature = signature * 31L + System.identityHashCode(view)
 
@@ -5026,6 +5601,11 @@ internal fun syncOpticalVisibilityCompanions() {
 
             }
 
+            if (view is ImageView && targetAdapter?.trackSourceImageBackgroundIdentity == true) {
+                val background = view.background
+                signature = signature * 31L + (background?.let { System.identityHashCode(it) } ?: 0)
+            }
+
             signature = signature * 31L + view.drawableState.contentHashCode()
 
             signature = signature * 31L + if (view.isSelected) 1 else 0
@@ -5042,14 +5622,14 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 signature = signature * 31L + view.childCount
 
-                for (index in 0 until view.childCount) stack += view.getChildAt(index) to (depth + 1)
+                for (index in 0 until view.childCount) stack.push(view.getChildAt(index),depth+1)
 
             }
 
         }
 
         return signature.takeIf { laidOutViews >= slotCount * 2 } ?: Long.MIN_VALUE
-
+        } finally { stack.clear();signatureWorkspaceInUse=wasInUse }
     }
 
 
@@ -5272,6 +5852,14 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 if (savedAlpha < 0.01f) source.alpha = 1f
 
+                val localizedLabels = if (config.managerEnglishNavigationLabels) {
+                    NavigationLabelLocalization.snapshotLabels(
+                        targetAdapter?.key.orEmpty(), source, captureLabels?.labels.orEmpty(),
+                    )
+                } else emptyList()
+                val localizedVisibility = localizedLabels.associate { it.view to it.view.visibility }
+                localizedLabels.forEach { if (it.view.visibility == View.VISIBLE) it.view.visibility = View.INVISIBLE }
+
                 val hiddenLabels = appNavigationState?.temporarilyHideNavigationLabels(
                     captureLabels?.labels.orEmpty(), selectedIndex,
                 ).orEmpty()
@@ -5286,7 +5874,11 @@ internal fun syncOpticalVisibilityCompanions() {
 
                     hiddenLabels.forEach { (view, visibility) -> view.visibility = visibility }
 
+                    localizedVisibility.forEach { (view, visibility) -> view.visibility = visibility }
+
                 }
+
+                NavigationLabelLocalization.drawSnapshotLabels(recording, source, localizedLabels)
 
                 true
 
@@ -5830,6 +6422,22 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
+    /** Re-evaluate adapter-owned native state without forging a committed settings revision. */
+    internal fun refreshAdapterDerivedConfig() {
+        val updated = packageConfig(config)
+        if (updated != config) applyLiveConfig(updated)
+        // Adapter-owned topology may change while the outer size and the
+        // detached-layout setting remain identical (e.g. native Create toggle).
+        // onSizeChanged will not rebuild the two panel rectangles in that case.
+        rebuildBarPath()
+        invalidateOutline()
+        opticalSurfaceNativeBlurView?.invalidateOutline()
+        opticalSurfaceNativeIndicatorView?.invalidateOutline()
+        configureGlassEffects()
+        invalidateProjectionCache()
+        invalidateNavigationSnapshot()
+    }
+
     private fun applyLiveConfig(updated: GlassConfig) {
 
         val old = config
@@ -5858,16 +6466,24 @@ internal fun syncOpticalVisibilityCompanions() {
 
         pendingBackdropStableFrames = 0
 
+        if (old.managerEnglishNavigationLabels != config.managerEnglishNavigationLabels) {
+            // Some adapters redraw labels directly; native-view adapters cache
+            // a bitmap snapshot. Force the latter to recapture on language flip.
+            navigationSnapshotSignature = Long.MIN_VALUE
+            pendingNavigationSignature = Long.MIN_VALUE
+            pendingNavigationStableFrames = 0
+        }
+
 
 
         if (old.classicNavigation != config.classicNavigation ||
             old.tabWidth != config.tabWidth || old.bottomPadding != config.bottomPadding ||
 
-            old.hiddenMask != config.hiddenMask || old.blurRadius != config.blurRadius ||
+            old.hiddenMask != config.hiddenMask || old.detachedPublish != config.detachedPublish || old.blurRadius != config.blurRadius ||
 
             old.cornerRadiusPercent != config.cornerRadiusPercent ||
 
-            old.cornerSmoothing != config.cornerSmoothing || old.barHeight != config.barHeight
+            old.cornerSmoothing != config.cornerSmoothing || old.barHeight != config.barHeight || old.detachedPublish != config.detachedPublish
 
         ) {
 
@@ -5877,11 +6493,11 @@ internal fun syncOpticalVisibilityCompanions() {
 
         if (old.cornerRadiusPercent != config.cornerRadiusPercent ||
 
-            old.cornerSmoothing != config.cornerSmoothing || old.barHeight != config.barHeight
+            old.cornerSmoothing != config.cornerSmoothing || old.barHeight != config.barHeight || old.detachedPublish != config.detachedPublish
 
         ) {
 
-            clipPath.setBottomBarSquircle(outerRect, outerCornerRadiusPx(), config.cornerSmoothing)
+            rebuildBarPath()
 
             invalidateOutline()
 
@@ -5891,7 +6507,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
-        if (old.hiddenMask != config.hiddenMask) {
+        if (old.hiddenMask != config.hiddenMask || old.detachedPublish != config.detachedPublish) {
 
             // Entry switches affect four independent layers: the retained
 
@@ -5944,14 +6560,20 @@ internal fun syncOpticalVisibilityCompanions() {
         applyLiveNavigationSizing()
 
         if (!config.liquidGlassEnabled) {
+            if (followsBottomBarMaterial) {
+                ++releaseGeneration
+                resetRestingTint()
+                restingTintProgress = 1f
+                velocitySpring.snapTo(0f)
+                motionSprings.panelOffset.snapTo(0f)
+                translationX = 0f
+            }
 
             pressSpring.snapTo(0f)
 
             scaleXSpring.snapTo(1f)
 
             scaleYSpring.snapTo(1f)
-
-            interactiveSpring.snapTo(0f)
 
             outerPanelScale = 1f
 
@@ -6009,12 +6631,15 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
     private fun updateHostLayoutForConfig() {
+        if (targetAdapter?.ownsHostLayout == true) return
 
         val content = parent as? ViewGroup ?: return
 
         val params = layoutParams as? FrameLayout.LayoutParams ?: return
 
-        val desiredHeight = glassHostHeightPx(density, config, context.packageName)
+        val layoutSlots = adapterBarLayout()?.let { it.navigationIndices.size + 1 } ?: visualSlotCount()
+        val baseHeight = glassHostHeightPx(density, config, context.packageName, layoutSlots)
+        val desiredHeight = appNavigationState?.hostPanelHeight(baseHeight) ?: baseHeight
 
         // Four-or-fewer bars share the five-tab height and bottom gap. Four
 
@@ -6022,7 +6647,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         // width. WeChat remains on its existing app-specific +10dp geometry.
 
-        val symmetricFloatingLayout = visualSlotCount() <= 4
+        val symmetricFloatingLayout = layoutSlots <= 4
 
         val desiredBottom = if (symmetricFloatingLayout) {
 
@@ -6044,16 +6669,17 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
-        val desiredWidth = if (symmetricFloatingLayout) {
+        val baseWidth = if (symmetricFloatingLayout) {
 
-            symmetricGlassHostWidthPx(content, density, config, visualSlotCount())
+            symmetricGlassHostWidthPx(content, density, config, layoutSlots)
 
         } else {
 
-            glassHostWidthPx(content, visualSlotCount(), config, density)
+            glassHostWidthPx(content, layoutSlots, config, density)
 
         }
 
+        val desiredWidth = appNavigationState?.hostPanelWidth(baseWidth) ?: baseWidth
         if (params.width != desiredWidth || params.height != desiredHeight ||
 
             params.bottomMargin != desiredBottom
@@ -6131,6 +6757,10 @@ internal fun syncOpticalVisibilityCompanions() {
         appNavigationState?.drawAppBadgeOverlay(canvas, this, heightScale)
 
     }
+
+    /** Optional adapter artwork can restore the original projection unchanged. */
+    internal fun drawOriginalNavigationForAdapter(canvas: Canvas, extraScale: Float) =
+        drawNavigationContent(canvas, extraScale, tintBySelection = false)
 
 
 
@@ -6336,15 +6966,19 @@ internal fun syncOpticalVisibilityCompanions() {
             scaledDensity = resources.displayMetrics.scaledDensity,
             selectedIndex = selectedSlot,
             enabledIndices = enabledNavigationIndices(),
+            barLayout = adapterBarLayout(),
             iconOnly = config.iconOnly,
             darkGlass = isDarkGlass(),
             accentColor = selectedNavigationAccent(),
             navigationOpticalMix = navigationOpticalMix(),
             hideSelectedForOptics = drawingHiddenNavigationForOptics,
+            targetKey = targetAdapter?.key.orEmpty(),
+            managerEnglishLabels = config.managerEnglishNavigationLabels,
         )
 
     private fun foregroundNavigationClipPath(): Path {
-        val cutout = RectF(selectionRect).apply { inset(-density, -density) }
+        val maskInset = density * (targetAdapter?.foregroundMaskInsetDp ?: 1f)
+        val cutout = RectF(selectionRect).apply { inset(-maskInset, -maskInset) }
         return Path().apply {
             setBottomBarSquircle(
                 cutout,
@@ -6355,7 +6989,10 @@ internal fun syncOpticalVisibilityCompanions() {
     }
 
     private fun navigationOpticalMix(): Float =
-        if (targetAdapter?.usesNavigationOpticalMix != true || !config.liquidGlassEnabled || !sliderEnabled) 0f
+        if (!indicatorInteractionPolicy.rendersSelectionLens ||
+            targetAdapter?.usesNavigationOpticalMix != true || appNavigationState?.navigationOpticalMixEnabled() == false ||
+            !config.liquidGlassEnabled || !sliderEnabled) 0f
+        else if (targetAdapter?.persistentNavigationOpticalMix == true) 1f
         else if (touching) 1f
         else pressProgress.coerceIn(0f, 1f)
 
@@ -6613,7 +7250,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 // WeChat: draw native tabs directly (source.draw() doesn't work)
 
-                appNavigationState?.drawNativeNavigation(canvas, source!!, density)
+                appNavigationState?.drawNativeNavigation(canvas, source!!, density, drawingHiddenNavigationForOptics)
 
             } else if (canvas.isHardwareAccelerated) {
 
@@ -6811,6 +7448,9 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
+    private fun uniformSlotTouchX(x: Float): Float =
+        appNavigationState?.uniformSlotTouchX(x, width, 4f * density) ?: x
+
     private fun nearestSelectableIndex(rawIndex: Int): Int {
 
         val clamped = rawIndex.coerceIn(0, (slotCount - 1).coerceAtLeast(0))
@@ -6849,13 +7489,14 @@ internal fun syncOpticalVisibilityCompanions() {
 
         index in 0 until slotCount &&
 
-            config.hiddenMask and (1 shl index) != 0
+            (config.hiddenMask and (1 shl index) != 0 || targetAdapter?.isNavigationEntryDisabled(index, slotCount) == true ||
+                appNavigationState?.isNavigationEntryAvailable(index) == false)
 
 
 
     private fun enabledNavigationIndices(): List<Int> =
 
-        (0 until slotCount).filterNot(::isNavigationEntryDisabled)
+        (adapterBarLayout()?.navigationIndices ?: (0 until slotCount).toList()).filterNot(::isNavigationEntryDisabled)
 
 
 
@@ -6931,17 +7572,38 @@ internal fun syncOpticalVisibilityCompanions() {
     private fun performNavigationSelection(index: Int) {
 
         if (isNavigationEntryDisabled(index)) return
+        // Native page loading must start at the input event, including first visits.
+        // Keep optical/animation scheduling independent from native navigation.
+        performNavigationSelectionNow(index)
+    }
+
+    private fun isFirstVisitPage(index: Int): Boolean =
+        primaryNavigationHost && sliderEnabled && index in 0 until slotCount && index !in nonSelectableIndices &&
+            navigationSource?.let { targetAdapter?.isFirstVisitPage(it, index, slotCount) } == true
+
+    private fun markFirstVisitDispatched(index: Int) {
+        if (isFirstVisitPage(index)) {
+            firstVisitPageSwitch?.dispatched(index, slotCount)
+        }
+    }
+
+    private fun performNavigationSelectionNow(index: Int) {
+
+        if (isNavigationEntryDisabled(index)) return
 
         if (!indicatorGestureActive) {
             barAnimationPriorityUntil = SystemClock.uptimeMillis() + 240L
         }
 
         if (targetAdapter?.ownsNavigationTap == true) {
-            if (appNavigationState?.performTap(this, navigationSource, index, slotCount) == true) {
+            if (traceOpticalWork("LiquidTab.NativeTapCPU") {
+                    appNavigationState?.performTap(this, navigationSource, index, slotCount)
+                } == true) {
                 if (targetAdapter?.commitSelectionAfterTap == true) {
                     selectedIndex = index.coerceIn(0, slotCount - 1)
                     selectionInitialized = true
                 }
+                markFirstVisitDispatched(index)
                 afterNativeNavigationClick()
                 appNavigationState?.onTapSucceeded { delay ->
                     if (delay <= 0L) postInvalidateOnAnimation()
@@ -6967,6 +7629,7 @@ internal fun syncOpticalVisibilityCompanions() {
         if (appNavigationState?.dispatchNativeNavigationTap(this, navigationSource, index, slotCount) == true ||
             targetAdapter?.dispatchNavigationTap(navigationSource, index, slotCount) == true
         ) {
+                markFirstVisitDispatched(index)
                 selectedIndex = index.coerceIn(0, slotCount - 1)
 
                 selectionInitialized = true
@@ -7031,6 +7694,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
                 selectionInitialized = true
 
+                markFirstVisitDispatched(index)
                 postInvalidateOnAnimation()
 
                 postDelayed({ postInvalidateOnAnimation() }, 80L)
@@ -7071,6 +7735,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
             if (target?.performClick() == true) {
 
+                markFirstVisitDispatched(index)
                 afterNativeNavigationClick()
 
                 return
@@ -7085,6 +7750,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         if (item.performClick()) {
 
+            markFirstVisitDispatched(index)
             afterNativeNavigationClick()
 
             return
@@ -7101,6 +7767,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
             if (view !== item && view.isShown && view.isClickable && view.performClick()) {
 
+                markFirstVisitDispatched(index)
                 afterNativeNavigationClick()
 
                 return
@@ -7188,10 +7855,20 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
     private fun configureGlassEffects() {
+        io.github.offlineglass.rendering.LiquidMotion.configure(this,
+            config.flowHorizontalStrength, config.flowVerticalStrength)
+        lastTiltOpticsX = Float.NaN
+        lastTiltOpticsY = Float.NaN
+
+        // Effect identity can change without a new backdrop or configuration
+        // value (for example when capture padding changes). Invalidate adapter
+        // wrappers as well as the shared blur node before replacing the chain.
+        appNavigationState?.onOpticalRendererConfigurationChanged()
 
         // A solid bar never draws the captured backdrop. Avoid constructing
         // GPU blur/shader chains during tab switches or theme updates.
         if (config.solidBarEnabled) {
+            postureBackdropBlurEffect = null
             outerGlassEffect = null
             tabsBackdropEffect = null
             opticalSurfaceOuterGlassEffect = null
@@ -7212,11 +7889,14 @@ internal fun syncOpticalVisibilityCompanions() {
         // reduce only Douyin's second blur pass so captured detail survives.
         val blurRadius = config.blurRadius * density * (targetAdapter?.secondaryBlurScale ?: 1f)
 
-        val blurred = io.github.offlineglass.rendering.NativeBackdropBlur.effect(blurRadius)
+        val blurred = targetAdapter?.backdropBlurEffect(blurRadius)
+            ?: io.github.offlineglass.rendering.NativeBackdropBlur.effect(blurRadius)
+
+        postureBackdropBlurEffect = blurred
 
         sharedOpticalBlurPrepared = false
 
-        sharedOpticalBlurEffect = if (reuseOpticalBlur) blurred else null
+        sharedOpticalBlurEffect = blurred
 
         if (!config.liquidGlassEnabled) {
 
@@ -7244,7 +7924,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
-        if (combinedOuterLensShader == null) {
+        if (indicatorInteractionPolicy.rendersSelectionLens && combinedOuterLensShader == null) {
 
             combinedOuterLensShader = createRuntimeShader(ROUNDED_RECT_REFRACTION_SHADER, "tabs-retry")
 
@@ -7258,7 +7938,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         }
 
-        if (indicatorLensShader == null) {
+        if (indicatorInteractionPolicy.rendersSelectionLens && indicatorLensShader == null) {
 
             indicatorLensShader = createRuntimeShader(ROUNDED_RECT_DISPERSION_SHADER, "indicator-retry")
 
@@ -7272,13 +7952,14 @@ internal fun syncOpticalVisibilityCompanions() {
 
         val indicator = indicatorLensShader
 
-        if (outer == null || combinedOuter == null || indicator == null || width <= 0 || height <= 0) return
+        if (outer == null || width <= 0 || height <= 0 ||
+            (indicatorInteractionPolicy.rendersSelectionLens && (combinedOuter == null || indicator == null))) return
 
 
 
         setOuterLensUniforms(outer)
 
-        setTabsBackdropLensUniforms(combinedOuter)
+        combinedOuter?.let(::setTabsBackdropLensUniforms)
 
         opticalSurfaceOuter?.let {
 
@@ -7301,7 +7982,6 @@ internal fun syncOpticalVisibilityCompanions() {
         val outerLensEffect = RenderEffect.createRuntimeShaderEffect(outer, "content")
 
         outerGlassEffect = if (reuseOpticalBlur) outerLensEffect else
-
             RenderEffect.createChainEffect(outerLensEffect, blurred)
 
         // The compositor supplies the live base. Blur the retained optical
@@ -7324,11 +8004,10 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
-        val tabLensEffect = RenderEffect.createRuntimeShaderEffect(combinedOuter, "content")
-
-        tabsBackdropEffect = if (reuseOpticalBlur) tabLensEffect else
-
-            RenderEffect.createChainEffect(tabLensEffect, blurred)
+        tabsBackdropEffect = combinedOuter?.let {
+            val tabLensEffect = RenderEffect.createRuntimeShaderEffect(it, "content")
+            if (reuseOpticalBlur) tabLensEffect else RenderEffect.createChainEffect(tabLensEffect, blurred)
+        }
 
         // The indicator effect is intentionally created in drawSelection.
 
@@ -7357,16 +8036,35 @@ internal fun syncOpticalVisibilityCompanions() {
         val padding = backdropPaddingPx()
 
         shader.setFloatUniform("size", width.toFloat(), height.toFloat())
+        val compound = adapterBarLayout()
+        shader.setFloatUniform("detachedGeometry", compound?.mainWidth ?: 0f,
+            compound?.let { it.actionLeft + it.actionSize / 2f } ?: 0f,
+            compound?.let { it.actionSize / 2f } ?: 0f)
 
         shader.setFloatUniform("offset", -padding, -padding)
+        shader.setFloatUniform("safeSampleBounds", padding + 0.5f, padding + 0.5f,
+            padding + width - 0.5f, padding + height - 0.5f)
 
         shader.setFloatUniform("cornerRadii", corner, corner, corner, corner)
 
-        shader.setFloatUniform("refractionHeight", refractionHeightDp * density)
+        shader.setFloatUniform("refractionHeight",
+            io.github.offlineglass.rendering.BottomBarRefraction.depthPx(
+                refractionHeightDp * density, height.toFloat(), density))
 
-        shader.setFloatUniform("refractionAmount", refractionAmountDp * density)
+        shader.setFloatUniform("refractionAmount", refractionAmountDp * density *
+            (targetAdapter?.outerRefractionScale ?: 1f))
 
         shader.setFloatUniform("depthEffect", 0f)
+        shader.setFloatUniform("tiltBias", 0f, 0f)
+        shader.setFloatUniformExact("flowingLiquidEnabled", if (targetAdapter?.flowingLiquidEnabled == true) 1f else 0f)
+        shader.setFloatUniform("fullSurfaceWeight",
+            if (tiltRefractionEnabled && targetAdapter?.flowingLiquidEnabled == true) 1f else 0f)
+        shader.setFloatUniformExact("unifiedDropletPilot", if (targetAdapter?.unifiedDropletPilot == true) 1f else 0f)
+        shader.setFloatUniformExact("directionalRimPilot", if (targetAdapter?.directionalRimPilot == true) 1f else 0f)
+        shader.setFloatUniformExact("monotoneFlowPilot", if (targetAdapter?.directionalRimPilot == true) 1f else 0f)
+        shader.setFloatUniform("flowRipple", 0f, 0f, 1f, 0f)
+        shader.setFloatUniform("flowRebound", 0f, 0f)
+        shader.setFloatUniformExact("flowMotionEnabled", if (targetAdapter?.liquidMotionEnabled == true) 1f else 0f)
 
     }
 
@@ -7380,7 +8078,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         val rowLeft = 4f * density
 
-        val rowWidth = (width - 8f * density).coerceAtLeast(1f)
+        val rowWidth = ((adapterBarLayout()?.mainWidth ?: width.toFloat()) - 8f * density).coerceAtLeast(1f)
 
         val corner = rowHeight / 2f
 
@@ -7397,16 +8095,35 @@ internal fun syncOpticalVisibilityCompanions() {
         // the clipped row, exposing its lower curve inside the selected pill.
 
         shader.setFloatUniform("size", rowWidth, rowHeight)
+        // Hidden navigation is always one main capsule, never the compound
+        // action geometry (including after a retained shader is reconfigured).
+        shader.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
 
         shader.setFloatUniform("offset", -(padding + rowLeft), -(padding + rowTop))
+        shader.setFloatUniform("safeSampleBounds", padding + rowLeft + 0.5f, padding + rowTop + 0.5f,
+            padding + rowLeft + rowWidth - 0.5f, padding + rowTop + rowHeight - 0.5f)
 
         shader.setFloatUniform("cornerRadii", corner, corner, corner, corner)
 
-        shader.setFloatUniform("refractionHeight", 24f * density)
+        // Match the manager hidden layer: opposing refraction bands must leave a neutral centre.
+        val hiddenRefractionHeight = io.github.offlineglass.rendering.BottomBarRefraction.depthPx(
+            24f * density, rowHeight, density)
+        shader.setFloatUniform("refractionHeight", hiddenRefractionHeight)
 
-        shader.setFloatUniform("refractionAmount", -24f * density)
+        shader.setFloatUniform("refractionAmount", -24f * density *
+            (targetAdapter?.outerRefractionScale ?: 1f))
 
         shader.setFloatUniform("depthEffect", 0f)
+        shader.setFloatUniform("tiltBias", 0f, 0f)
+        shader.setFloatUniformExact("flowingLiquidEnabled", if (targetAdapter?.flowingLiquidEnabled == true) 1f else 0f)
+        shader.setFloatUniform("fullSurfaceWeight",
+            if (tiltRefractionEnabled && targetAdapter?.flowingLiquidEnabled == true) indicatorPostureBlend() else 0f)
+        shader.setFloatUniformExact("unifiedDropletPilot", if (targetAdapter?.unifiedDropletPilot == true) 1f else 0f)
+        shader.setFloatUniformExact("directionalRimPilot", if (targetAdapter?.directionalRimPilot == true) 1f else 0f)
+        shader.setFloatUniformExact("monotoneFlowPilot", if (targetAdapter?.directionalRimPilot == true) 1f else 0f)
+        shader.setFloatUniform("flowRipple", 0f, 0f, 1f, 0f)
+        shader.setFloatUniform("flowRebound", 0f, 0f)
+        shader.setFloatUniformExact("flowMotionEnabled", if (targetAdapter?.liquidMotionEnabled == true) 1f else 0f)
 
     }
 
@@ -7543,7 +8260,10 @@ internal fun hasUsableBackdrop(): Boolean =
 
      */
 
-    private fun prepareLiveBackdropScene(): Boolean {
+    private fun prepareLiveBackdropScene(): Boolean =
+        traceOpticalWork("LiquidTab.SceneCPU") { prepareLiveBackdropSceneContent() }
+
+    private fun prepareLiveBackdropSceneContent(): Boolean {
         if (!config.backdropCapture || config.solidBarEnabled) {
             liveBackdropActive = false
             sharedOpticalBlurPrepared = false
@@ -7564,7 +8284,9 @@ internal fun hasUsableBackdrop(): Boolean =
         }
 
         if (appNavigationState?.canReuseLiveBackdrop(selectedIndex) == true &&
-            liveBackdropNode.hasDisplayList()
+            liveBackdropNode.hasDisplayList() && liveBackdropSignature != Long.MIN_VALUE &&
+            liveBackdropNode.width == width + backdropPaddingPx().roundToInt() * 2 &&
+            liveBackdropNode.height == height + backdropPaddingPx().roundToInt() * 2
         ) {
 
             // The wrapper keeps live references to JD's existing child
@@ -7738,7 +8460,11 @@ internal fun hasUsableBackdrop(): Boolean =
             val child = safeSceneViews?.get(index) ?: content.getChildAt(index)
 
 
-            if (adapterScene != null && child !== adapterScene) continue
+            // Explicit descendant scenes already select safe subtrees inside
+            // the adapter root; filtering them back to the root defeats that
+            // exclusion and can otherwise replay the glass host itself.
+            if (adapterScene != null && child !== adapterScene &&
+                !(safeSceneViews != null && appNavigationState?.backdropSceneViewsAreDescendants == true)) continue
 
             if (child === opticalSurfaceSurfaceView) continue
 
@@ -7811,7 +8537,7 @@ internal fun hasUsableBackdrop(): Boolean =
 
         val adapterSceneBase = adapterScene?.let {
             appNavigationState?.backdropSceneBaseColor(it, surfaceContainerColor(isDarkGlass()))
-        } ?: Color.TRANSPARENT
+        } ?: liveSceneBackgroundColor(content)
         signature = signature * 31L + adapterSceneBase
 
         signature = signature * 31L + expandedWidth
@@ -7917,11 +8643,31 @@ internal fun hasUsableBackdrop(): Boolean =
 
             val recording = liveBackdropNode.beginRecording(expandedWidth, expandedHeight)
 
-            if (adapterScene != null) recording.drawColor(adapterSceneBase)
+            // Child RenderNodes do not include their parent's background.
+            // Blurring a transparent scene lets the original, sharp page bleed
+            // through the filtered alpha, particularly at image/scene edges.
+            // This is the source page's backing color, not extra glass tint.
+            recording.drawColor(adapterSceneBase)
 
             recording.clipRect(0f, 0f, expandedWidth.toFloat(), expandedHeight.toFloat())
 
-            recording.translate(offsetX.toFloat(), offsetY.toFloat())
+            if (targetAdapter?.liveBackdropTransform(content, this, preciseSceneTransform) == true) {
+                recording.translate(padding.toFloat(), padding.toFloat())
+                recording.concat(preciseSceneTransform)
+            } else {
+                recording.translate(offsetX.toFloat(), offsetY.toFloat())
+            }
+
+            if (adapterScene == null) {
+                // Preserve non-solid backgrounds as well, in the same page
+                // coordinates as the child nodes; do not mutate drawable bounds.
+                content.background?.let { background ->
+                    recording.save()
+                    recording.translate(content.scrollX.toFloat(), content.scrollY.toFloat())
+                    background.draw(recording)
+                    recording.restore()
+                }
+            }
 
             for (index in nodes.indices) {
                 if (safeSceneViews == null) {
@@ -8040,7 +8786,7 @@ internal fun hasUsableBackdrop(): Boolean =
 
     private fun viewRenderNode(view: View): RenderNode? {
 
-        if (targetAdapter?.allowRenderNodeRefresh != true) {
+        if (targetAdapter?.allowRenderNodeRefresh != true || !view.isDirty) {
 
             // JD's 新品 feed is drawn by an obfuscated custom renderer
 
@@ -8082,6 +8828,79 @@ internal fun hasUsableBackdrop(): Boolean =
     private var outerRecordedWidth = 0
     private var outerRecordedHeight = 0
 
+    private val actionGlassNode = RenderNode("OfflineGlassDetachedAction")
+    private var actionGlassShader: RuntimeShader? = null
+    private var actionGlassEffect: RenderEffect? = null
+    private var actionGlassKey: List<Any?>? = null
+    private val mainGlassNode = RenderNode("OfflineGlassDetachedMain")
+    private val mainAmbientOutline = Path()
+    private val actionAmbientOutline = Path()
+    private val hiddenMainOutline = Path()
+    private var mainGlassShader: RuntimeShader? = null
+    private var mainGlassEffect: RenderEffect? = null
+    private var mainGlassKey: List<Any?>? = null
+
+    /** The action's filter is not the whole bar filtered again under a tiny clip.
+     * Its padded local input, lens origin and safe sample rectangle agree. This
+     * prevents displaced rim samples from falling outside the filtered child's
+     * requested region and leaving only an unaffected window in the centre. */
+    private fun drawLocalActionGlass(canvas: Canvas, bounds: RectF, mainPanel: Boolean = false) {
+        if (!canvas.isHardwareAccelerated || !config.liquidGlassEnabled) {
+            drawOuterGlass(canvas)
+            return
+        }
+        val node = if (mainPanel) mainGlassNode else actionGlassNode
+        val shader = (if (mainPanel) mainGlassShader else actionGlassShader)
+            ?: createRuntimeShader(ROUNDED_RECT_REFRACTION_SHADER,
+                if (mainPanel) "detached-main" else "detached-action")?.also {
+                    if (mainPanel) mainGlassShader = it else actionGlassShader = it
+                }
+        if (shader == null) { drawOuterGlass(canvas); return }
+        val padding = backdropPaddingPx().roundToInt()
+        val w = (bounds.width().roundToInt() + padding * 2).coerceAtLeast(1)
+        val h = (bounds.height().roundToInt() + padding * 2).coerceAtLeast(1)
+        // Record the sampled pixels, not sharedOpticalBlurNode. drawSelection
+        // later re-records that mutable node at the MAIN panel's narrower size;
+        // drawRenderNode retains a reference, not a snapshot of those pixels.
+        // The right action must own its padded input and Gaussian blur, while
+        // still reusing the same captured bitmap (no extra PixelCopy/capture).
+        expandedBackdropRect.set(0f, 0f, (width + padding * 2).toFloat(), (height + padding * 2).toFloat())
+        val recording = node.beginRecording(w, h)
+        try {
+            recording.translate(-bounds.left, -bounds.top)
+            drawBackdropContent(recording, expandedBackdropRect)
+        } finally { node.endRecording() }
+        node.setPosition((bounds.left - padding).roundToInt(), (bounds.top - padding).roundToInt(),
+            (bounds.left - padding).roundToInt() + w, (bounds.top - padding).roundToInt() + h)
+        val key = listOf(config, w, h, padding, lastTiltOpticsAt)
+        var effect = if (mainPanel) mainGlassEffect else actionGlassEffect
+        if ((if (mainPanel) mainGlassKey else actionGlassKey) != key || effect == null) {
+            setOuterLensUniforms(shader)
+            shader.setFloatUniform("size", bounds.width(), bounds.height())
+            shader.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
+            shader.setFloatUniform("offset", -padding.toFloat(), -padding.toFloat())
+            val radius = if (mainPanel) outerCornerRadiusPx() else min(bounds.width(), bounds.height()) / 2f
+            shader.setFloatUniform("cornerRadii", radius, radius, radius, radius)
+            shader.setFloatUniform("safeSampleBounds", padding + 0.5f, padding + 0.5f,
+                padding + bounds.width() - 0.5f, padding + bounds.height() - 0.5f)
+            val strength = targetAdapter?.tiltRefractionStrength ?: io.github.offlineglass.rendering.PostureGlass.STRENGTH
+            shader.setFloatUniform("tiltBias",
+                if (tiltRefractionEnabled && lastTiltOpticsX.isFinite()) -lastTiltOpticsX * strength else 0f,
+                if (tiltRefractionEnabled && lastTiltOpticsY.isFinite()) -lastTiltOpticsY * strength else 0f)
+            io.github.offlineglass.rendering.PostureGlass.sync(shader, this, tiltRefractionEnabled)
+            val lens = RenderEffect.createRuntimeShaderEffect(shader, "content")
+            // reuseOpticalBlur describes the mutable main-row blur cache. Its
+            // immutable effect can be shared, but this action's input cannot.
+            effect = sharedOpticalBlurEffect?.let {
+                RenderEffect.createChainEffect(lens, it)
+            } ?: lens
+            if (mainPanel) { mainGlassEffect = effect; mainGlassKey = key }
+            else { actionGlassEffect = effect; actionGlassKey = key }
+        }
+        node.setRenderEffect(effect)
+        canvas.drawRenderNode(node)
+    }
+
 internal fun drawOuterGlass(canvas: Canvas) {
 
         if (!canvas.isHardwareAccelerated || outerGlassEffect == null) {
@@ -8122,6 +8941,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
                 backdrop, expandedWidth, expandedHeight, outerRenderNode.hasDisplayList(),
             )
             val needsRecord = appNavigationState?.forceLiveBackdropFrame(selectedIndex) == true ||
+                (reuseOpticalBlur && config.liquidGlassEnabled && !sharedOpticalBlurPrepared) ||
                 outerRecordedWidth != expandedWidth || outerRecordedHeight != expandedHeight ||
                 (stateNeedsRecord ?: (!reusable || !outerRenderNode.hasDisplayList()))
 
@@ -8214,7 +9034,78 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
 
 
-    private fun drawSelection(canvas: Canvas, dark: Boolean) {
+    private val indicatorMaskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK
+        blendMode = BlendMode.DST_OUT
+    }
+    private val indicatorOutsidePath = Path()
+    private val indicatorMaskBounds = RectF()
+    private val indicatorInteractionLight = io.github.offlineglass.rendering.IndicatorInteractionLight()
+    private fun indicatorSmoothing(): Float = if (targetAdapter?.concentricIndicatorExpansion == true) -1f else io.github.offlineglass.rendering.BottomBarIndicatorStyle.indicatorCurve(
+        visualSlotCount(), pressProgress, targetAdapter?.indicatorCornerSmoothing ?:
+        if (targetAdapter?.continuousIndicatorMask == true)
+            -kotlin.math.abs(config.cornerSmoothing) else config.cornerSmoothing)
+
+    /** During the enlarged gesture lens, keep navigation artwork out of the
+     * refracted sample and paint it once at its stable foreground coordinates. */
+    private fun isIndicatorGestureExpanded(): Boolean =
+        indicatorInteractionPolicy.expandsOnInteraction && (touching || pressProgress > 0.001f)
+
+    private var indicatorLensContourWidth = Float.NaN
+    private var indicatorLensContourHeight = Float.NaN
+    private var indicatorLensContourRadius = Float.NaN
+    private var indicatorLensContourSmoothing = Float.NaN
+    private val indicatorLensContour = FloatArray(128)
+    private var indicatorLensContourOrientation = 1f
+
+    private fun syncIndicatorLensContour(shader: RuntimeShader, w: Float, h: Float, radius: Float) {
+        io.github.offlineglass.rendering.PostureGlass.sync(shader, this, tiltRefractionEnabled)
+        val smoothing = indicatorSmoothing()
+        if (indicatorLensContourWidth != w || indicatorLensContourHeight != h ||
+            indicatorLensContourRadius != radius || indicatorLensContourSmoothing != smoothing) {
+            val path = Path().apply {
+                setBottomBarSquircle(RectF(0f, 0f, w, h), radius, smoothing)
+            }
+            val measure = android.graphics.PathMeasure(path, true)
+            val point = FloatArray(2)
+            for (i in 0 until 64) {
+                measure.getPosTan(measure.length * i / 64f, point, null)
+                indicatorLensContour[i * 2] = point[0]
+                indicatorLensContour[i * 2 + 1] = point[1]
+            }
+            var area = 0f
+            for (i in 0 until 64) {
+                val j = (i + 1) % 64
+                area += indicatorLensContour[i * 2] * indicatorLensContour[j * 2 + 1] -
+                    indicatorLensContour[j * 2] * indicatorLensContour[i * 2 + 1]
+            }
+            indicatorLensContourOrientation = if (area >= 0f) 1f else -1f
+            indicatorLensContourWidth = w
+            indicatorLensContourHeight = h
+            indicatorLensContourRadius = radius
+            indicatorLensContourSmoothing = smoothing
+        }
+        val uniforms = exactBloomWork?.getOrPut(shader) {
+            io.github.offlineglass.rendering.ExactOpticalUniformCache(shader)
+        }
+        if (uniforms != null) {
+            uniforms.floats("continuousShape", 1f)
+            uniforms.floats("shapeOrientation", indicatorLensContourOrientation)
+            uniforms.array("shapePoints", indicatorLensContour)
+        } else {
+            shader.setFloatUniform("continuousShape", 1f)
+            shader.setFloatUniform("shapeOrientation", indicatorLensContourOrientation)
+            shader.setFloatUniform("shapePoints", indicatorLensContour)
+        }
+    }
+
+    private fun drawSelection(canvas: Canvas, dark: Boolean) =
+        traceOpticalWork("LiquidTab.SelectionCPU") { drawSelectionContent(canvas, dark) }
+
+    private fun drawSelectionContent(canvas: Canvas, dark: Boolean) {
+        // Legal stops and the hidden source row use the main panel width.
+        // The enlarged lens itself must overhang either end without a hard clip.
+        updateRestingTint()
 
         // Selection bars (file manager action mode) render the liquid glass
 
@@ -8224,11 +9115,16 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         if (slotCount <= 0 || width <= 0) return
 
-        val slotWidth = tabWidthPx()
+        val horizontalPadding = 4f * density * (targetAdapter?.indicatorInsetScale ?: 1f)
 
-        val horizontalPadding = 4f * density
+        val naturalSlotWidth = (((adapterBarLayout()?.mainWidth ?: width.toFloat()) - 2f * horizontalPadding).coerceAtLeast(1f) /
+            visualSlotCount().coerceAtLeast(1))
 
-        val centerX = horizontalPadding + (indicatorPosition + 0.5f) * slotWidth
+        val position = if (adapterBarLayout() != null) indicatorPosition.coerceIn(0f, (visualSlotCount() - 1).toFloat()) else indicatorPosition
+        val naturalCenter = horizontalPadding + (position + 0.5f) * naturalSlotWidth
+        val indicatorGeometry = appNavigationState?.indicatorHorizontalGeometry(naturalCenter,naturalSlotWidth)
+        val slotWidth = indicatorGeometry?.second ?: naturalSlotWidth
+        val centerX = indicatorGeometry?.first ?: naturalCenter
 
         val navCenterY: Float
 
@@ -8249,15 +9145,30 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         val centerY = navCenterY
 
-        val baseHalfWidth = slotWidth.coerceAtLeast(1f) / 2f
+        var baseHalfWidth = slotWidth.coerceAtLeast(1f) / 2f
 
-        val baseHalfHeight = (navHeight - 8f * density).coerceAtLeast(1f) / 2f
+        var baseHalfHeight = (navHeight - 2f * horizontalPadding).coerceAtLeast(1f) / 2f
 
-        val velocity = indicatorVelocity / 10f
+        val expands = indicatorInteractionPolicy.expandsOnInteraction
+        val velocity = if (expands) indicatorVelocity / 10f else 0f
 
-        val scaleX = indicatorScaleX / (1f - (velocity * 0.75f).coerceIn(-0.2f, 0.2f))
+        var scaleX = if (expands) indicatorScaleX / (1f - (velocity * 0.75f).coerceIn(-0.2f, 0.2f)) else 1f
 
-        val scaleY = indicatorScaleY * (1f - (velocity * 0.25f).coerceIn(-0.2f, 0.2f))
+        var scaleY = if (expands) indicatorScaleY * (1f - (velocity * 0.25f).coerceIn(-0.2f, 0.2f)) else 1f
+        if (expands && targetAdapter?.concentricIndicatorExpansion == true) {
+            // Parallel expansion, not anisotropic scaling of a completed pill:
+            // width, height and radius gain the same radial outset. Corner
+            // centres stay fixed and the optical input remains host-local.
+            val outset = baseHalfHeight * (indicatorScaleY - 1f) *
+                (targetAdapter?.concentricIndicatorExpansionGain ?: 1f)
+            baseHalfWidth += outset
+            baseHalfHeight += outset
+            // Preserve transient velocity-driven stretch after the parallel
+            // expansion. At zero velocity these return to exactly 1, retaining
+            // the concentric steady outline without making the drag rigid.
+            scaleX = io.github.offlineglass.rendering.BottomBarDynamics.stretchX(indicatorVelocity)
+            scaleY = io.github.offlineglass.rendering.BottomBarDynamics.stretchY(indicatorVelocity)
+        }
 
         val visualLeft = centerX - baseHalfWidth * scaleX
 
@@ -8316,14 +9227,33 @@ internal fun drawOuterGlass(canvas: Canvas) {
         val transformedLayer = canvas.save()
 
         canvas.scale(scaleX, scaleY, centerX, centerY)
+        indicatorInteractionLight.outer(canvas, selectionRect, radius, density, dark, pressProgress)
+        val continuousMask = indicatorInteractionPolicy.rendersSelectionLens &&
+            targetAdapter?.continuousIndicatorMask == true
+        val indicatorLayer = if (continuousMask) {
+            indicatorMaskBounds.set(selectionRect)
+            indicatorMaskBounds.inset(-2f, -2f)
+            // saveLayer bounds describe an allocation, not an output clip.
+            // The source now contains the full resting panel. Keep its replay
+            // and the DST_OUT eraser local so neither can replace the already
+            // painted panel/action outside this lens on hardware canvases.
+            // Only output is clipped: sampled-node blur padding stays intact.
+            canvas.clipRect(indicatorMaskBounds)
+            canvas.saveLayer(indicatorMaskBounds, null)
+        } else -1
+
 
 
 
         val runtime = indicatorLensShader
 
-        if (!config.solidBarEnabled && hasUsableBackdrop() && canvas.isHardwareAccelerated &&
+        // Fixed-size top channels use the already rendered panel as their glass.
+        // Skip hidden-row recording, sampled specular, combined scene and extra lens.
+        if (indicatorInteractionPolicy.rendersSelectionLens &&
+            !config.solidBarEnabled && hasUsableBackdrop() && canvas.isHardwareAccelerated &&
 
-            (!usesOpticalSurfaceHybridBackdrop() || targetAdapter?.usesDirectOpticalBackdropMode == true)
+            (!usesOpticalSurfaceHybridBackdrop() || targetAdapter?.usesDirectOpticalBackdropMode == true ||
+                targetAdapter?.samplesPanelHighlightInIndicator == true)
 
         ) {
 
@@ -8333,7 +9263,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                 val scenePaddingInt = scenePadding.roundToInt()
 
-                val sceneWidth = width + scenePaddingInt * 2
+                val sceneWidth = (adapterBarLayout()?.mainWidth?.roundToInt() ?: width) + scenePaddingInt * 2
 
                 val sceneHeight = height + scenePaddingInt * 2
 
@@ -8354,7 +9284,44 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     backdrop, navigationSnapshot, navigationSnapshotSignature, sceneWidth, sceneHeight,
                     dark, indicatorCombinedNode.hasDisplayList(),
                 )
-                val combinedNeedsRecord = if (!reusableScene) true
+                val suppressSampleTint = touching || (pressProgress > 0.001f && !returningRestingTint)
+                val gestureExpandedForScene = isIndicatorGestureExpanded()
+                val continuousReturn = continuousIndicatorReturnEnabled()
+                // The unfiltered underlay stays stable during the handoff; the
+                // retained blurred panel fades in using the existing release clock.
+                val sharpUnderlay = followsBottomBarMaterial && (gestureExpandedForScene || continuousReturn)
+                val trialPanelMix = if (continuousReturn)
+                    io.github.offlineglass.rendering.IndicatorReturnPolicy.mix(
+                        restingTintProgress, touching, returningRestingTint,
+                        outerRenderNode.hasDisplayList())
+                    else 0f
+                val showHiddenTabs = appNavigationState?.drawHiddenTabsInIndicatorScene(
+                    usesOpticalSurfaceHybridBackdrop(),
+                ) ?: !usesOpticalSurfaceHybridBackdrop()
+                val retainReturn = reusableScene && continuousReturn && showHiddenTabs &&
+                    returningRestingTint && !touching && restingTintProgress < 1f &&
+                    tabsBackdropEffect != null && appNavigationState?.retainsIndicatorReturnLayers == true
+                val returnLayers = if (retainReturn) {
+                    indicatorReturnLayers ?: IndicatorReturnLayers().also { indicatorReturnLayers = it }
+                } else null
+                // Keep navigation artwork in the enlarged pill's optical
+                // source. The pill's posture vector is frozen during gestures
+                // below, so sampled icons/labels refract without drifting.
+                val includeNavigationInIndicator = showHiddenTabs &&
+                    (appNavigationState?.includeNavigationInIndicatorScene(
+                        opticalSurfaceSurfacePipelineActive,
+                    ) ?: !opticalSurfaceSurfacePipelineActive)
+                val combinedNeedsRecord = if (!reusableScene || combinedRetainedReturn != retainReturn ||
+                    (continuousReturn &&
+                        combinedIndicatorGestureExpanded != gestureExpandedForScene) ||
+                    (!retainReturn && continuousReturn && combinedIndicatorPanelMix != trialPanelMix) ||
+                    combinedIndicatorTintSuppressed != suppressSampleTint ||
+                    (!retainReturn && combinedIndicatorRestingTint != restingTintProgress) ||
+                    combinedIndicatorNavigationIncluded != includeNavigationInIndicator ||
+                    (targetAdapter?.independentSampledIndicatorHighlight == true &&
+                        combinedIndicatorNavigationMix != navigationOpticalMix()) ||
+                    (targetAdapter?.independentSampledIndicatorHighlight != true &&
+                        targetAdapter?.samplesPanelHighlightInIndicator == true && pressProgress > 0.001f)) true
                     else stateNeedsRecord ?: !indicatorCombinedNode.hasDisplayList()
 
                 if (combinedNeedsRecord) {
@@ -8363,7 +9330,56 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                     val combinedCanvas = indicatorCombinedNode.beginRecording(sceneWidth, sceneHeight)
 
-                    drawBackdropContent(combinedCanvas, expandedBackdropRect)
+                    // A composed panel is a different optical input, not just
+                    // another tint. Blend it during release instead of replacing
+                    // the complete scene on the last spring frame (WeChat).
+                    val panelBackdropMix = if (continuousReturn) {
+                        trialPanelMix
+                    } else if (!touching && returningRestingTint &&
+                        appNavigationState?.indicatorUsesPanelBackdrop() == true &&
+                        outerRenderNode.hasDisplayList()) {
+                        restingTintProgress * (1f - pressProgress.coerceIn(0f, 1f))
+                    } else 0f
+                    // Keep this underneath even at mix=1: the resting panel is
+                    // transparent outside its outline while the lens may still
+                    // be shrinking beyond it. Dropping it exposes a blank rim.
+                    if (continuousReturn || panelBackdropMix < 1f) {
+                        // Leave the lower scene fully covered. Fading BOTH layers
+                        // with SRC_OVER produces only 75% coverage at the midpoint.
+                        val layer = if (continuousReturn) -1 else combinedCanvas.saveLayerAlpha(0f, 0f,
+                            sceneWidth.toFloat(), sceneHeight.toFloat(),
+                            ((1f - panelBackdropMix) * 255f).toInt())
+                        // The hidden glass row is intentionally inset. Its
+                        // surrounding pixels must also be filtered, otherwise
+                        // the pill exposes raw feed strips outside that row.
+                        drawSharedOpticalBackdrop(combinedCanvas, expandedBackdropRect,
+                            forceBlur = config.blurRadius > 0f, skipBlur = sharpUnderlay)
+                        if (layer >= 0) combinedCanvas.restoreToCount(layer)
+                    }
+                    tabsBackdropNode.alpha = 1f
+                    tabsBackdropNode.setUseCompositingLayer(retainReturn, null)
+                    if (returnLayers != null) {
+                        val panel = returnLayers.panel
+                        if (!panel.hasDisplayList() || panel.width != sceneWidth ||
+                            panel.height != sceneHeight || returnLayers.panelPadding != scenePaddingInt) {
+                            returnLayers.panelPadding = scenePaddingInt
+                            panel.setPosition(0, 0, sceneWidth, sceneHeight)
+                            val panelCanvas = panel.beginRecording(sceneWidth, sceneHeight)
+                            panelCanvas.translate(scenePaddingInt.toFloat(), scenePaddingInt.toFloat())
+                            panelCanvas.drawRenderNode(outerRenderNode)
+                            panel.endRecording()
+                        }
+                        combinedCanvas.drawRenderNode(panel)
+                    } else if (panelBackdropMix > 0f) {
+                        val layer = combinedCanvas.saveLayerAlpha(0f, 0f,
+                            sceneWidth.toFloat(), sceneHeight.toFloat(),
+                            (panelBackdropMix * 255f).toInt())
+                        combinedCanvas.save()
+                        combinedCanvas.translate(scenePaddingInt.toFloat(), scenePaddingInt.toFloat())
+                        combinedCanvas.drawRenderNode(outerRenderNode)
+                        combinedCanvas.restore()
+                        combinedCanvas.restoreToCount(layer)
+                    }
 
         // The promotion page already keeps a live, native-blurred navigation row
 
@@ -8371,10 +9387,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         // lens duplicates the static foreground icons (especially while dragging).
 
-        val showHiddenTabs = appNavigationState?.drawHiddenTabsInIndicatorScene(
-            usesOpticalSurfaceHybridBackdrop(),
-        ) ?: !usesOpticalSurfaceHybridBackdrop()
-        if (showHiddenTabs) {
+        if (showHiddenTabs || targetAdapter?.samplesPanelHighlightInIndicator == true) {
 
             drawHiddenTabsBackdrop(
 
@@ -8388,15 +9401,24 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                 sceneHeight,
 
-                includeNavigation = appNavigationState?.includeNavigationInIndicatorScene(
-                    opticalSurfaceSurfacePipelineActive,
-                ) ?: !opticalSurfaceSurfacePipelineActive,
+                includeNavigation = includeNavigationInIndicator,
+                includeBackdrop = showHiddenTabs && (retainReturn || panelBackdropMix < 1f),
+                backdropAlpha = 1f - panelBackdropMix,
+                returnLayers = returnLayers,
+                preserveRestingTint = continuousReturn || appNavigationState?.persistentRestingIndicatorFill == true,
 
             )
 
         }
 
                     indicatorCombinedNode.endRecording()
+                    combinedIndicatorTintSuppressed = suppressSampleTint
+                    combinedIndicatorRestingTint = restingTintProgress
+                    combinedIndicatorNavigationIncluded = includeNavigationInIndicator
+                    combinedIndicatorNavigationMix = navigationOpticalMix()
+                    combinedIndicatorGestureExpanded = gestureExpandedForScene
+                    combinedIndicatorPanelMix = trialPanelMix
+                    combinedRetainedReturn = retainReturn
 
                     if (reusableScene) {
                         appNavigationState?.onCombinedIndicatorSceneRecorded(
@@ -8405,8 +9427,30 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     }
 
                 }
+                if (returnLayers != null) {
+                    // A posture/effect change updates the filter without replaying
+                    // capture or navigation recording just to animate opacity.
+                    returnLayers.updateHiddenEffect(tabsBackdropNode, tabsBackdropEffect)
+                    val mixChanged = returnLayers.applyMix(tabsBackdropNode, trialPanelMix,
+                        io.github.offlineglass.rendering.IndicatorReturnPolicy.mix(
+                            restingTintProgress, touching, returningRestingTint, true))
+                    if (mixChanged && !combinedNeedsRecord) perfRetainedMixOnly++
+                }
 
 
+
+                if (targetAdapter?.independentSampledIndicatorHighlight == true) {
+                    // Same hidden-row coordinates as drawHiddenTabsBackdrop, without its
+                    // sampling bleed. Update specular every frame, not the material/nav.
+                    val inset = 4f * density
+                    val rowHeight = (height - 8f * density).coerceAtLeast(1f)
+                    val rowTop = (height - rowHeight) / 2f
+                    recordSampledIndicatorHighlight(RectF(
+                        scenePadding + inset, scenePadding + rowTop,
+                        scenePadding + (adapterBarLayout()?.mainWidth ?: width.toFloat()) - inset,
+                        scenePadding + rowTop + rowHeight,
+                    ), sceneWidth, sceneHeight, dark)
+                }
 
                 // Apply the lens to a pill-sized layer so the transformed
 
@@ -8474,6 +9518,22 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                 indicatorRenderNode.endRecording()
 
+                val separateSpecular = targetAdapter?.samplesPanelHighlightInIndicator == true &&
+                    config.liquidGlassEnabled && config.outlineEnabled && pressProgress > 0.001f &&
+                    sampledSpecularSource.hasDisplayList()
+                if (separateSpecular) {
+                    sampledSpecularLens.setPosition(nodeLeft, nodeTop, nodeRight, nodeBottom)
+                    val specularCanvas = sampledSpecularLens.beginRecording(nodeWidth, nodeHeight)
+                    try {
+                        specularCanvas.translate(localCenterX, localCenterY)
+                        specularCanvas.scale(1f / scaleX, 1f / scaleY)
+                        specularCanvas.translate(-(centerX + scenePaddingInt), -(centerY + scenePaddingInt))
+                        specularCanvas.drawRenderNode(sampledSpecularSource)
+                    } finally {
+                        sampledSpecularLens.endRecording()
+                    }
+                }
+
                 val hybridBackdrop = usesOpticalSurfaceHybridBackdrop()
 
                 // Outside the hybrid path the reference lens grows only while
@@ -8513,6 +9573,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     runtime.setFloatUniform("offset", -localPaddingX, -localPaddingY)
 
                     runtime.setFloatUniform("cornerRadii", radius, radius, radius, radius)
+                    syncIndicatorLensContour(runtime, selectionRect.width(), selectionRect.height(), radius)
 
                     val refractionHeight = if (hybridBackdrop) {
 
@@ -8538,11 +9599,55 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                     runtime.setFloatUniform("refractionAmount", refractionAmount)
 
-                    runtime.setFloatUniform("depthEffect", 1f)
+                    // The radial centre vector is aspect-ratio dependent. On
+                    // a wide pill it displaces the sampled corner horizontally
+                    // more than vertically, defeating concentric expansion.
+                    // Use the contour normal alone for the parallel-outline trial.
+                    runtime.setFloatUniform("depthEffect",
+                        if (targetAdapter?.concentricIndicatorExpansion == true) 0f else 1f)
 
-                    runtime.setFloatUniform("chromaticAberration", 0.5f)
+                    runtime.setFloatUniform("chromaticAberration",
+                        io.github.offlineglass.rendering.indicatorChromaticAberration(pressProgress,
+                            active = targetAdapter?.activeIndicatorDispersion ?: 0.40f))
+
+                    // Keep the bar's page-content refraction posture-aware,
+                    // while making the enlarged indicator a stable lens.
+                    // This prevents its sampled navigation artwork from
+                    // shifting with the device tilt during press/drag.
+                    val postureX: Float
+                    val postureY: Float
+                    val postureBlend = indicatorPostureBlend()
+                    // The ordinary indicator's extra lens disappears at rest.
+                    // Fade its view-ray offset with that lens as well: restoring
+                    // full posture here would retain a displacement until the
+                    // final frame, then jump when setRenderEffect(null) runs.
+                    // The hidden material's own posture restores independently
+                    // from ACTION_UP via indicatorPostureBlend().
+                    val lensPostureBlend = postureBlend * if (!hybridBackdrop &&
+                        targetAdapter?.restingOpticalMix == null) {
+                        lensProgress.coerceIn(0f, 1f)
+                    } else 1f
+                    if (lensPostureBlend <= 0f || !tiltRefractionEnabled ||
+                        !config.liquidGlassEnabled || config.solidBarEnabled) {
+                        postureX = 0f
+                        postureY = 0f
+                    } else {
+                        var tiltX = BloomTiltTracker.refractionX
+                        var tiltY = BloomTiltTracker.refractionY
+                        when (display?.rotation) {
+                            android.view.Surface.ROTATION_90 -> { val previous = tiltX; tiltX = -tiltY; tiltY = previous }
+                            android.view.Surface.ROTATION_180 -> { tiltX = -tiltX; tiltY = -tiltY }
+                            android.view.Surface.ROTATION_270 -> { val previous = tiltX; tiltX = tiltY; tiltY = -previous }
+                        }
+                        val strength = targetAdapter?.tiltRefractionStrength
+                            ?: io.github.offlineglass.rendering.PostureGlass.STRENGTH
+                        postureX = -tiltX * strength * lensPostureBlend
+                        postureY = -tiltY * strength * lensPostureBlend
+                    }
+                    runtime.setFloatUniform("postureTilt", postureX, postureY)
 
                     val lensEffect = RenderEffect.createRuntimeShaderEffect(runtime, "content")
+                    if (separateSpecular) sampledSpecularLens.setRenderEffect(lensEffect)
 
                     indicatorRenderNode.setRenderEffect(
 
@@ -8552,8 +9657,10 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                                 lensEffect,
 
-                                io.github.offlineglass.rendering.NativeBackdropBlur.effect(
+                                targetAdapter?.backdropBlurEffect(
                                     config.blurRadius * density * (targetAdapter?.secondaryBlurScale ?: 1f),
+                                ) ?: io.github.offlineglass.rendering.NativeBackdropBlur.effect(
+                                    config.blurRadius * density,
                                 ),
 
                             )
@@ -8573,66 +9680,69 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     // omitted when its animated dimensions reach zero.
 
                     indicatorRenderNode.setRenderEffect(null)
+                    sampledSpecularLens.setRenderEffect(null)
 
                 }
 
                 indicatorRenderNode.alpha = if (hybridBackdrop) 0.34f else 1f
 
-                selectionPath.setBottomBarSquircle(selectionRect, radius, config.cornerSmoothing)
+                selectionPath.setBottomBarSquircle(selectionRect, radius, indicatorSmoothing())
 
                 val composed = appNavigationState?.drawSelectionBackdrop(
                     canvas, selectionPath, selectedIndex,
                 ) { canvas.drawRenderNode(indicatorRenderNode) } == true
                 if (!composed) {
                     canvas.save()
-                    canvas.clipPath(selectionPath)
+                    if (!continuousMask) canvas.clipPath(selectionPath)
                     canvas.drawRenderNode(indicatorRenderNode)
                     canvas.restore()
                 }
+                if (separateSpecular) {
+                    // Same displacement/scale, but specular is composited AFTER
+                    // the blurred material. No extra height transform or rim mask.
+                    canvas.save()
+                    if (!continuousMask) canvas.clipPath(selectionPath)
+                    canvas.drawRenderNode(sampledSpecularLens)
+                    canvas.restore()
+                }
 
+            }.onFailure { error ->
+                // A native tab draw can fail while its View tree is being
+                // replaced. Always close recordings so the next touch can
+                // rebuild optics instead of permanently losing the lens.
+                runCatching { indicatorCombinedNode.endRecording() }
+                runCatching { indicatorRenderNode.endRecording() }
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - lastIndicatorOpticsFailureAt > 2_000L) {
+                    lastIndicatorOpticsFailureAt = now
+                    android.util.Log.e("LiquidTabOptics", "Indicator recording failed: ${context.packageName}", error)
+                }
             }
 
         }
 
 
 
-        val idleAlpha = 0.10f * (1f - pressProgress)
-
-        val pressedAlpha = 0.03f * pressProgress
+        // The active lens samples the panel; do not tint it with a thumb fill.
+        val idleAlpha = if (!indicatorInteractionPolicy.expandsOnInteraction) {
+            0.10f
+        } else if (continuousIndicatorReturnEnabled()) {
+            // The same resting lift is faded inside the hidden source below;
+            // never tint the enlarged area outside that source at release.
+            0f
+        } else if (appNavigationState?.persistentRestingIndicatorFill == true) {
+            if (isIndicatorGestureExpanded()) 0f else 0.10f
+        } else if (touching || (pressProgress > 0.001f && !returningRestingTint)) 0f else 0.10f * restingTintProgress
 
         val accent = if (config.customAccentEnabled) config.customAccentColor else Color.WHITE
 
-        fillPaint.color = when {
+        fillPaint.color = io.github.offlineglass.rendering.BottomBarIndicatorStyle.restingFill(
+            dark, config.selectedAccent, accent, idleAlpha * (targetAdapter?.restingIndicatorTintScale(config) ?: 1f).coerceIn(0f, 1f))
 
-            config.selectedAccent -> Color.argb(
-
-                (idleAlpha * 255f).toInt(),
-
-                Color.red(accent),
-
-                Color.green(accent),
-
-                Color.blue(accent),
-
-            )
-
-            dark -> Color.argb((idleAlpha * 255f).toInt(), 255, 255, 255)
-
-            else -> Color.argb((idleAlpha * 255f).toInt(), 0, 0, 0)
-
-        }
-
-        selectionPath.setBottomBarSquircle(selectionRect, radius, config.cornerSmoothing)
+        selectionPath.setBottomBarSquircle(selectionRect, radius, indicatorSmoothing())
 
         canvas.drawPath(selectionPath, fillPaint)
 
-        if (pressedAlpha > 0f) {
-
-            fillPaint.color = Color.argb((pressedAlpha * 255f).toInt(), 0, 0, 0)
-
-            canvas.drawPath(selectionPath, fillPaint)
-
-        }
 
 
 
@@ -8648,7 +9758,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                 // energy in dark mode. The outer panel and light mode are intact.
 
-                val indicatorBloomAlpha = pressProgress * if (dark) 0.48f else 1f
+                val indicatorBloomAlpha = io.github.offlineglass.rendering.indicatorHighlightAlpha(
+                    pressProgress, dark)
 
                 drawBloomStroke(
 
@@ -8668,7 +9779,13 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
             }
 
-            if (context.packageName == QQ_PACKAGE || targetAdapter?.indicatorInnerShadow == true) {
+            val tintLayer = if (restingTintProgress < 1f) canvas.saveLayerAlpha(
+                selectionRect.left - 8f * density, selectionRect.top - 8f * density,
+                selectionRect.right + 8f * density, selectionRect.bottom + 8f * density,
+                (restingTintProgress * 255f).toInt(),
+            ) else -1
+            if (!touching && (pressProgress <= 0.001f || returningRestingTint) &&
+                (context.packageName == QQ_PACKAGE || targetAdapter?.indicatorInnerShadow == true)) {
 
                 drawIndicatorInnerShadow(canvas, radius)
 
@@ -8677,9 +9794,36 @@ internal fun drawOuterGlass(canvas: Canvas) {
                 drawLiquidIndicatorLighting(canvas, dark, radius)
 
             }
+            if (tintLayer >= 0) canvas.restoreToCount(tintLayer)
 
         }
 
+
+        if (dark) {
+            canvas.save()
+            canvas.clipPath(selectionPath)
+            indicatorInteractionLight.inner(canvas, selectionRect, pressProgress)
+            canvas.restore()
+        }
+        if (continuousMask) {
+            // Mask the completed optics once, with AA under the same animation transform.
+            selectionPath.setBottomBarSquircle(selectionRect, radius, indicatorSmoothing())
+            indicatorOutsidePath.reset()
+            indicatorOutsidePath.fillType = Path.FillType.EVEN_ODD
+            // Keep the AA edge of the eraser outside the saved layer. An outer
+            // path coincident with its bounds leaves fractional DST_OUT coverage
+            // along the rectangular FBO edge, visible as a chromatic hairline.
+            indicatorOutsidePath.addRect(
+                indicatorMaskBounds.left - 8f,
+                indicatorMaskBounds.top - 8f,
+                indicatorMaskBounds.right + 8f,
+                indicatorMaskBounds.bottom + 8f,
+                Path.Direction.CW,
+            )
+            indicatorOutsidePath.addPath(selectionPath)
+            canvas.drawPath(indicatorOutsidePath, indicatorMaskPaint)
+            canvas.restoreToCount(indicatorLayer)
+        }
         canvas.restoreToCount(transformedLayer)
 
 
@@ -8708,29 +9852,24 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         includeNavigation: Boolean = true,
 
+        includeBackdrop: Boolean = true,
+        backdropAlpha: Float = 1f,
+        returnLayers: IndicatorReturnLayers? = null,
+        preserveRestingTint: Boolean = false,
+
     ) {
 
-        val effect = tabsBackdropEffect ?: return
-
-        // Keep the captured coordinate space identical to the final indicator
-
-        // pass. The previous row-slice node shifted the effect by one padding
-
-        // radius, which made the lens sample the light edge pixels and turn
-
-        // into an opaque white blob while being dragged.
-
-        tabsBackdropNode.setPosition(0, 0, expandedWidth, expandedHeight)
-
-        perfNodeRecords++
-
-        val tabsCanvas = tabsBackdropNode.beginRecording(expandedWidth, expandedHeight)
-
-        drawSharedOpticalBackdrop(tabsCanvas, expandedBackdropRect)
-
-        tabsBackdropNode.endRecording()
-
-        tabsBackdropNode.setRenderEffect(effect)
+        if (includeBackdrop) {
+            val effect = tabsBackdropEffect ?: return
+            // Record only while the hidden material contributes to the output.
+            // The original padded coordinates and shared blur node are retained.
+            tabsBackdropNode.setPosition(0, 0, expandedWidth, expandedHeight)
+            perfNodeRecords++
+            val tabsCanvas = tabsBackdropNode.beginRecording(expandedWidth, expandedHeight)
+            drawSharedOpticalBackdrop(tabsCanvas, expandedBackdropRect)
+            tabsBackdropNode.endRecording()
+            tabsBackdropNode.setRenderEffect(effect)
+        }
 
 
 
@@ -8756,7 +9895,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
             padding + rowTop,
 
-            padding + width - horizontalInset,
+            padding + (adapterBarLayout()?.mainWidth ?: width.toFloat()) - horizontalInset,
 
             padding + rowTop + rowHeight,
 
@@ -8778,7 +9917,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         rowRect.inset(-samplingBleed, -samplingBleed)
 
-        selectionPath.setBottomBarSquircle(
+        val hiddenOutline = if (adapterBarLayout()?.localMainOptics == true) hiddenMainOutline else selectionPath
+        hiddenOutline.setBottomBarSquircle(
 
             rowRect,
 
@@ -8790,27 +9930,62 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         combinedCanvas.save()
 
-        combinedCanvas.clipPath(selectionPath)
+        combinedCanvas.clipPath(hiddenOutline)
 
-        combinedCanvas.drawRenderNode(tabsBackdropNode)
-
-
-
-        fillPaint.color = surfaceContainerColor(dark)
-
-        combinedCanvas.drawPath(selectionPath, fillPaint)
+        val backdropLayer = if (returnLayers == null && includeBackdrop && backdropAlpha < 1f)
+            combinedCanvas.saveLayerAlpha(rowRect, (backdropAlpha * 255f).toInt()) else -1
+        if (includeBackdrop) combinedCanvas.drawRenderNode(tabsBackdropNode)
 
 
 
-        // InteractiveHighlight is part of the captured hidden row as well.
+        val defaultFill = surfaceContainerColor(dark)
+        fillPaint.color = adapterSurfaceOpacity(
+            targetAdapter?.glassSurfaceFillColor(dark, selectedIndex, defaultFill) ?: defaultFill)
 
+        // Only the resting optical source carries the panel tint. The enlarged
+        // pressed/dragged lens keeps its blurred backdrop and sampled specular,
+        // but must not darken/lighten the feed before refraction. This does not
+        // change the visible panel's independently rendered surface fill.
+        if (!preserveRestingTint && includeBackdrop && !touching && (pressProgress <= 0.001f || returningRestingTint)) {
+            fillPaint.alpha = (fillPaint.alpha * restingTintProgress).toInt()
+            combinedCanvas.drawPath(hiddenOutline, fillPaint)
+        }
+        if (backdropLayer >= 0) combinedCanvas.restoreToCount(backdropLayer)
+        // The panel RenderNode contains the optical background, not its visible
+        // material fill. Keep resting material outside the backdrop crossfade,
+        // or a sampled-scene change can erase it while the thumb is stationary.
+        if ((preserveRestingTint && !isIndicatorGestureExpanded()) ||
+                (isIndicatorGestureExpanded() && appNavigationState?.retainHiddenSourceFillWhileExpanded != false)) {
+            fillPaint.color = adapterSurfaceOpacity(
+                targetAdapter?.glassSurfaceFillColor(dark, selectedIndex, defaultFill) ?: defaultFill)
+            combinedCanvas.drawPath(hiddenOutline, fillPaint)
+        }
+        if (returnLayers != null) {
+            val lift = returnLayers.lift
+            lift.setPosition(0, 0, expandedWidth, expandedHeight)
+            val liftCanvas = lift.beginRecording(expandedWidth, expandedHeight)
+            fillPaint.color = io.github.offlineglass.rendering.BottomBarIndicatorStyle.restingFill(
+                dark, config.selectedAccent,
+                if (config.customAccentEnabled) config.customAccentColor else Color.WHITE, 1f)
+            liftCanvas.drawPath(hiddenOutline, fillPaint)
+            lift.endRecording()
+            combinedCanvas.drawRenderNode(lift)
+        } else if (continuousIndicatorReturnEnabled() && !touching) {
+            val lift = io.github.offlineglass.rendering.IndicatorReturnPolicy.mix(
+                restingTintProgress, touching, returningRestingTint, true)
+            if (lift > 0f) {
+                fillPaint.color = io.github.offlineglass.rendering.BottomBarIndicatorStyle.restingFill(
+                    dark, config.selectedAccent,
+                    if (config.customAccentEnabled) config.customAccentColor else Color.WHITE, 0.10f * lift)
+                combinedCanvas.drawPath(hiddenOutline, fillPaint)
+            }
+        }
+
+        // Navigation optics use host-local coordinates inside the padded
+        // sampling canvas. Preserve this transform even without a spotlight;
+        // its paired restore is required for the optical recording to finish.
         combinedCanvas.save()
-
         combinedCanvas.translate(padding, padding)
-
-        drawInteractiveHighlight(combinedCanvas)
-
-
 
         if (includeNavigation) {
 
@@ -8837,11 +10012,11 @@ internal fun drawOuterGlass(canvas: Canvas) {
                             0f, 0f, width.toFloat(), height.toFloat(),
                             (opticalMix * 255f).roundToInt().coerceIn(0, 255),
                         )
-                        drawScaledNavigationSource(combinedCanvas, 1f + 0.2f * pressProgress)
+                        drawScaledNavigationSource(combinedCanvas, 1f)
                         combinedCanvas.restoreToCount(layer)
                     }
                 } else {
-                    drawScaledNavigationSource(combinedCanvas, 1f + 0.2f * pressProgress)
+                    drawScaledNavigationSource(combinedCanvas, 1f)
                 }
 
             } else {
@@ -8868,7 +10043,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                 )
 
-                drawScaledNavigationSource(combinedCanvas, 1f + 0.2f * pressProgress)
+                drawScaledNavigationSource(combinedCanvas, 1f)
 
                 combinedCanvas.restoreToCount(tintLayer)
 
@@ -8886,7 +10061,44 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         combinedCanvas.restore()
 
+        // Material and navigation first, sampled specular last. This only
+        // changes the hidden optical source, never the visible outer outline.
+        if (targetAdapter?.independentSampledIndicatorHighlight != true) {
+            val opticalRow = RectF(rowRect)
+            opticalRow.inset(samplingBleed, samplingBleed)
+            recordSampledIndicatorHighlight(opticalRow, expandedWidth, expandedHeight, dark)
+        }
+
         combinedCanvas.restore()
+
+    }
+
+    private fun recordSampledIndicatorHighlight(opticalRow: RectF,
+        expandedWidth: Int, expandedHeight: Int, dark: Boolean) {
+        if (targetAdapter?.samplesPanelHighlightInIndicator == true &&
+            config.liquidGlassEnabled && config.outlineEnabled && !config.solidBarEnabled) {
+            val samplingScaleY = indicatorScaleY *
+                (1f - (indicatorVelocity / 10f * 0.25f).coerceIn(-0.2f, 0.2f))
+            val highlightInset = targetAdapter?.indicatorSampleHighlightInset(
+                opticalRow.height(), density, pressProgress, samplingScaleY,
+            ) ?: 0f
+            opticalRow.inset(0f, highlightInset)
+            val highlightAlpha = ((if (dark) 0.58f else 0.75f) *
+                if (dark || targetAdapter?.panelHighlightFollowsAllThemes == true)
+                    config.darkBarHighlightStrength else 1f)
+                .coerceAtLeast(targetAdapter?.sampledPanelHighlightMinimumAlpha ?: 0f)
+                .coerceAtMost(1f)
+            sampledSpecularSource.setPosition(0, 0, expandedWidth, expandedHeight)
+            val specularCanvas = sampledSpecularSource.beginRecording(expandedWidth, expandedHeight)
+            try {
+                drawBloomStroke(specularCanvas, opticalRow,
+                    opticalRow.height() * config.cornerRadiusPercent / 100f,
+                    highlightAlpha * pressProgress, -45f, sampledPanelBloomShader,
+                    targetAdapter?.sampledPanelHighlightWidthDp ?: 1f)
+            } finally {
+                sampledSpecularSource.endRecording()
+            }
+        }
 
     }
 
@@ -8925,7 +10137,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         // (slider length unchanged) and simply shortens, staying centred.
 
-        val wantedWidth = symmetricGlassHostWidthPx(
+        val baseWidth = symmetricGlassHostWidthPx(
 
             content,
 
@@ -8937,6 +10149,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         )
 
+        val wantedWidth = appNavigationState?.hostPanelWidth(baseWidth) ?: baseWidth
         if (params.bottomMargin != wanted || params.width != wantedWidth) {
 
             params.bottomMargin = wanted
@@ -9003,19 +10216,28 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
 
 
-    private fun drawSharedOpticalBackdrop(canvas: Canvas, destination: RectF) {
+    private fun drawSharedOpticalBackdrop(canvas: Canvas, destination: RectF, forceBlur: Boolean = false, skipBlur: Boolean = false) {
+        // A detached main panel is a crop of the full captured host, not a
+        // horizontally compressed copy of the host including its action.
+        // Keep the shared node in capture coordinates for both panel and lens;
+        // callers' RenderNode bounds/paths perform the actual left-panel crop.
+        val sampledDestination = if (adapterBarLayout() != null) RectF(
+            destination.left, destination.top,
+            destination.left + width + (destination.height() - height).coerceAtLeast(0f),
+            destination.bottom,
+        ) else destination
 
         val effect = sharedOpticalBlurEffect
 
-        if (!reuseOpticalBlur || !config.liquidGlassEnabled || effect == null || !canvas.isHardwareAccelerated) {
+        if (skipBlur || (!reuseOpticalBlur && !forceBlur) || !config.liquidGlassEnabled || effect == null || !canvas.isHardwareAccelerated) {
 
-            drawBackdropContent(canvas, destination)
+            drawBackdropContent(canvas, sampledDestination)
 
             return
 
         }
 
-        val w = destination.width().roundToInt().coerceAtLeast(1)
+        val w = sampledDestination.width().roundToInt().coerceAtLeast(1)
 
         val h = destination.height().roundToInt().coerceAtLeast(1)
 
@@ -9029,7 +10251,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
             val recording = sharedOpticalBlurNode.beginRecording(w, h)
 
-            drawBackdropContent(recording, destination)
+            drawBackdropContent(recording, sampledDestination)
 
             sharedOpticalBlurNode.endRecording()
 
@@ -9162,7 +10384,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
             val pushed = GlassConfig.fromBundle(extras)
 
-            HookConfigReader.acceptPushedConfig(packageName, pushed)
+            if (!HookConfigReader.acceptPushedConfig(packageName, pushed,
+                revision = extras.getLong(io.github.offlineglass.config.ConfigContract.KEY_REVISION, -1L))) return
 
             val updated = packageConfig(pushed)
 
@@ -9199,6 +10422,15 @@ internal fun drawOuterGlass(canvas: Canvas) {
             )
 
             configSyncBroadcastRegistered = true
+
+            val hostRef = WeakReference(this)
+            HookConfigReader.requestConfigSync(context, context.packageName) { snapshot ->
+                val host = hostRef.get()
+                if (host != null && host.isAttachedToWindow && snapshot != null) {
+                    val updated = host.packageConfig(snapshot)
+                    if (updated != host.config) host.applyLiveConfig(updated)
+                }
+            }
 
             context.sendBroadcast(
 
@@ -9264,236 +10496,6 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
      */
     /** Keep Weibo's independent reward envelope above the floating bar. */
-    private fun suppressNativeMeituanTakeoutBottomBar(source: ViewGroup?) {
-
-        if (context.packageName != MEITUAN_TAKEOUT_PACKAGE || source == null) return
-
-        // The app's native scroll-show can fade the TitleIndicator back in on
-
-        // the order/profile pages; install-time alpha=0 is never re-asserted
-
-        // elsewhere, so enforce it every pass like the other adapters.
-
-        if (source.alpha != 0f) source.alpha = 0f
-
-        // Hierarchy (from uiautomator dump):
-
-        //   content
-
-        //   ├── pager_container                       [full width, stops above the bar]
-
-        //   ├── navigation_bar_margin_layout_container [opaque native strip]
-
-        //   ├── indicator_bg_container                [TitleIndicator + tab_line]
-
-        //   └── GlassHostLayout (this host)
-
-        // 1) Make every wrapper between TitleIndicator and the activity content
-
-        //    transparent. These strips only span the bottom band, so clearing
-
-        //    them never touches page content.
-
-        var node: ViewGroup? = source.parent as? ViewGroup
-
-        var guard = 0
-
-        while (node != null && guard++ < 6 && node.id != android.R.id.content) {
-
-            if (node.background != null) {
-
-                meituanTakeoutChainRestoreCount++
-
-                node.background = null
-
-            }
-
-            if (node.backgroundTintList != null) node.backgroundTintList = null
-
-            if (node.foreground != null) node.foreground = null
-
-            // Sibling decoration layers (tab_line, home indicator paints) that
-
-            // live inside the same strip container.
-
-            for (index in 0 until node.childCount) {
-
-                val layer = node.getChildAt(index)
-
-                if (layer === source || layer === this) continue
-
-                if (layer.background != null) layer.background = null
-
-                if (layer.foreground != null) layer.foreground = null
-
-            }
-
-            node = node.parent as? ViewGroup
-
-        }
-
-        // 2) Extend the page pager to the window bottom. Meituan Takeout
-
-        //    reserves the native bar's height inside pager_container, so once
-
-        //    the native strip is transparent the reserved band exposes the
-
-        //    window background ("white residual bar" over the feed). Restore
-
-        //    full-bleed like the Meituan main app's id="main" treatment.
-
-        val content = node as? ViewGroup ?: (source.rootView.findViewById<ViewGroup>(android.R.id.content))
-
-        if (content != null) {
-
-            for (index in 0 until content.childCount) {
-
-                val child = content.getChildAt(index)
-
-                if (child === this || child === source) continue
-
-                val idName = runCatching {
-
-                    if (child.id == View.NO_ID) null else child.resources.getResourceEntryName(child.id)
-
-                }.getOrNull() ?: continue
-
-                if (idName != "pager_container") continue
-
-                val params = child.layoutParams as? ViewGroup.MarginLayoutParams ?: continue
-
-                var changed = false
-
-                if (params.height != ViewGroup.LayoutParams.MATCH_PARENT) {
-
-                    params.height = ViewGroup.LayoutParams.MATCH_PARENT
-
-                    changed = true
-
-                    meituanTakeoutPagerRestoreCount++
-
-                }
-
-                if (params.bottomMargin != 0) {
-
-                    params.bottomMargin = 0
-
-                    changed = true
-
-                }
-
-                if (changed) {
-
-                    child.layoutParams = params
-
-                    child.requestLayout()
-
-                    content.requestLayout()
-
-                }
-
-                break
-
-            }
-
-        }
-
-        // 3) The white residual band is painted by indicator_bg_container, a
-
-        //    sibling branch under content (it hosts the tab_line hairline; the
-
-        //    TitleIndicator itself lives under navigation_bar_margin_layout_
-
-        //    container). The parent-chain walk above never reaches it.
-
-        //    On the promotion tabs (神券/活动) the app re-applies the strip's
-
-        //    background every few frames, so per-frame clearing raced with the
-
-        //    re-apply and produced a flickering white band. Make the container
-
-        //    INVISIBLE instead: an invisible view never paints, no matter how
-
-        //    often the app swaps its background. Clicks are unaffected - the
-
-        //    glass host sits above it and forwards synthesized touches to the
-
-        //    TitleIndicator itself.
-
-        if (content != null) {
-
-            for (index in 0 until content.childCount) {
-
-                val sibling = content.getChildAt(index)
-
-                if (sibling === this || sibling === source) continue
-
-                if (meituanTakeoutIdName(sibling) != "indicator_bg_container") continue
-
-                meituanTakeoutIndicatorBg = sibling
-
-                if (sibling.visibility == View.VISIBLE) {
-
-                    meituanTakeoutBgRestoreCount++
-
-                    sibling.visibility = View.INVISIBLE
-
-                }
-
-                if (sibling is ViewGroup) {
-
-                    for (childIndex in 0 until sibling.childCount) {
-
-                        val inner = sibling.getChildAt(childIndex)
-
-                        if (inner !== source && meituanTakeoutIdName(inner) == "tab_line" &&
-
-                            inner.visibility == View.VISIBLE
-
-                        ) {
-
-                            meituanTakeoutTabLineRestoreCount++
-
-                            inner.visibility = View.INVISIBLE
-
-                        }
-
-                    }
-
-                }
-
-            }
-
-        }
-
-        val now = SystemClock.uptimeMillis()
-
-        if (now - meituanTakeoutSuppressDiagAt > 10_000L) {
-
-            meituanTakeoutSuppressDiagAt = now
-
-            logMeituanTakeoutSuppressDiag(source)
-
-        }
-
-    }
-
-
-
-    private var meituanTakeoutSuppressDiagAt = 0L
-
-
-
-    private var meituanTakeoutBgRestoreCount = 0
-
-    private var meituanTakeoutTabLineRestoreCount = 0
-
-    private var meituanTakeoutChainRestoreCount = 0
-
-    private var meituanTakeoutPagerRestoreCount = 0
-
-    private var meituanTakeoutIndicatorBg: View? = null
-
     private var compositorSurfaceProbeScheduled = false
 
     private var compositorSurfaceProbeRunning = false
@@ -9509,6 +10511,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
     private var compositorSurfacePerfLogAt = 0L
 
     private var lastSurfaceRenderDark: Boolean? = null
+
+    private var lastSurfaceRenderConfig: GlassConfig? = null
 
 
 
@@ -9550,6 +10554,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
     private fun scheduleCompositorSurfaceProbe() {
 
+        if (!isAttachedToWindow || !isShown || !hasWindowFocus() || windowVisibility != View.VISIBLE) return
+
         if (compositorSurfaceProbeScheduled) return
 
         compositorSurfaceProbeScheduled = true
@@ -9571,6 +10577,14 @@ internal fun drawOuterGlass(canvas: Canvas) {
         postOnAnimation {
 
             compositorSurfaceProbeScheduled = false
+            if (!isAttachedToWindow || !isShown || !hasWindowFocus() || windowVisibility != View.VISIBLE) {
+                compositorSurfaceProbeRunning = false
+                return@postOnAnimation
+            }
+            if (appNavigationState?.pauseOpticalSurfaceProbe() == true) {
+                compositorSurfaceProbeRunning = false
+                return@postOnAnimation
+            }
 
             if (!opticalSurfaceSurfacePipelineActive &&
                 appNavigationState?.maintainsCompositorSamplingWithoutSurface() != true
@@ -9644,269 +10658,10 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
      *  paints the white residual strip when background clearing is not enough. */
 
-    private fun logMeituanTakeoutSuppressDiag(source: ViewGroup) {
-
-        val sb = StringBuilder("suppressDiag source=").append(source.javaClass.simpleName)
-
-        var node: ViewGroup? = source.parent as? ViewGroup
-
-        var guard = 0
-
-        while (node != null && guard++ < 6 && node.id != android.R.id.content) {
-
-            sb.append(" up").append(guard)
-
-                .append("=").append(node.javaClass.simpleName)
-
-                .append("/id=").append(meituanTakeoutIdName(node))
-
-                .append("/").append(node.width).append("x").append(node.height)
-
-                .append("@y").append(node.top)
-
-                .append("/bg=").append(node.background?.javaClass?.simpleName ?: "null")
-
-                .append("/fg=").append(node.foreground?.javaClass?.simpleName ?: "null")
-
-                .append("/alpha=").append(node.alpha)
-
-            node = node.parent as? ViewGroup
-
-        }
-
-        val content = source.rootView.findViewById<ViewGroup>(android.R.id.content)
-
-        if (content != null) {
-
-            sb.append(" contentChildren=").append(content.childCount)
-
-            for (index in 0 until content.childCount) {
-
-                val child = content.getChildAt(index)
-
-                sb.append(" c").append(index)
-
-                    .append("=").append(child.javaClass.simpleName)
-
-                    .append("/id=").append(meituanTakeoutIdName(child))
-
-                    .append("/").append(child.width).append("x").append(child.height)
-
-                    .append("@y").append(child.top)
-
-                    .append("/bg=").append(child.background?.javaClass?.simpleName ?: "null")
-
-                    .append("/vis=").append(child.visibility)
-
-                    .append("/alpha=").append(child.alpha)
-
-            }
-
-        }
-
-        sb.append(" restoreCounters bg=").append(meituanTakeoutBgRestoreCount)
-
-            .append(" tabLine=").append(meituanTakeoutTabLineRestoreCount)
-
-            .append(" chain=").append(meituanTakeoutChainRestoreCount)
-
-            .append(" pager=").append(meituanTakeoutPagerRestoreCount)
-
-            .append(" indicatorBgVis=").append(meituanTakeoutIndicatorBg?.visibility ?: -1)
-
-        android.util.Log.i("WmGlassDiag", sb.toString())
-
-    }
-
-
-
-    private fun meituanTakeoutIdName(view: View): String = runCatching {
-
-        if (view.id == View.NO_ID) "none" else view.resources.getResourceEntryName(view.id)
-
-    }.getOrDefault("err")
-
-    /** Adapter entry point for the shared optical surface renderer. */
     internal fun updateOpticalSurfacePipeline(enabled: Boolean) {
         val renderBackdrop = enabled && !config.solidBarEnabled && config.backdropCapture
         updateOpticalSurfaceSurfaceRenderer(renderBackdrop)
         updateOpticalSurfaceNativeBlur(renderBackdrop && !opticalSurfaceSurfacePipelineActive)
-    }
-
-
-
-    private fun adjustMeituanTakeoutScrollSafety() {
-
-        if (context.packageName != MEITUAN_TAKEOUT_PACKAGE || width <= 0 || height <= 0) return
-
-        val onProfile = selectedIndex == MEITUAN_TAKEOUT_PROFILE_INDEX
-
-        val now = SystemClock.uptimeMillis()
-
-        if (onProfile && now - lastMeituanTakeoutScrollProbe < MEITUAN_TAKEOUT_SCROLL_PROBE_INTERVAL_MS) return
-
-        lastMeituanTakeoutScrollProbe = now
-
-
-
-        if (!onProfile) {
-
-            for ((view, base) in meituanTakeoutScrollBasePaddings) {
-
-                if (!view.isAttachedToWindow) continue
-
-                if (view.paddingLeft != base[0] || view.paddingTop != base[1] ||
-
-                    view.paddingRight != base[2] || view.paddingBottom != base[3]
-
-                ) {
-
-                    view.setPadding(base[0], base[1], base[2], base[3])
-
-                    view.requestLayout()
-
-                }
-
-            }
-
-            return
-
-        }
-
-
-
-        // While the bar is scroll-hidden on this page, keep the last applied
-
-        // padding so the layout does not jump when the bar reappears.
-
-        val hostRect = Rect()
-
-        if (!getGlobalVisibleRect(hostRect)) return
-
-        val gap = globalGlassBottomGapPx(this)
-
-        val wantedItemBottom = hostRect.top - gap
-
-
-
-        val candidates = ArrayList<ViewGroup>()
-
-        val stack = ArrayDeque<Pair<View, Int>>()
-
-        stack += (rootView as? ViewGroup ?: return) to 0
-
-        while (stack.isNotEmpty()) {
-
-            val (view, depth) = stack.removeLast()
-
-            if (view === this || view === navigationSource) continue
-
-            if (view is ViewGroup) {
-
-                val className = view.javaClass.name
-
-                val scrollLike = className.contains("ScrollView") ||
-
-                    className.contains("RecyclerView") ||
-
-                    className.contains("NestedScroll")
-
-                if (scrollLike && view.visibility == View.VISIBLE) {
-
-                    val rect = Rect()
-
-                    if (view.getGlobalVisibleRect(rect) && rect.top < hostRect.top &&
-
-                        rect.bottom > hostRect.top
-
-                    ) {
-
-                        if (candidates.none { isDescendantOf(view, it) }) {
-
-                            candidates += view
-
-                        }
-
-                    }
-
-                }
-
-                if (depth < 28) {
-
-                    for (index in view.childCount - 1 downTo 0) {
-
-                        stack += view.getChildAt(index) to depth + 1
-
-                    }
-
-                }
-
-            }
-
-        }
-
-
-
-        val active = HashSet<View>(candidates)
-
-        for ((view, base) in meituanTakeoutScrollBasePaddings) {
-
-            if (!view.isAttachedToWindow || view in active) continue
-
-            if (view.paddingLeft != base[0] || view.paddingTop != base[1] ||
-
-                view.paddingRight != base[2] || view.paddingBottom != base[3]
-
-            ) {
-
-                view.setPadding(base[0], base[1], base[2], base[3])
-
-                view.requestLayout()
-
-            }
-
-        }
-
-        for (view in candidates) {
-
-            val rect = Rect()
-
-            if (!view.getGlobalVisibleRect(rect)) continue
-
-            val base = meituanTakeoutScrollBasePaddings.getOrPut(view) {
-
-                intArrayOf(
-
-                    view.paddingLeft,
-
-                    view.paddingTop,
-
-                    view.paddingRight,
-
-                    view.paddingBottom,
-
-                )
-
-            }
-
-            val required = (rect.bottom - wantedItemBottom).coerceAtLeast(base[3])
-
-            if (view.paddingLeft != base[0] || view.paddingTop != base[1] ||
-
-                view.paddingRight != base[2] || view.paddingBottom != required
-
-            ) {
-
-                view.setPadding(base[0], base[1], base[2], required)
-
-                view.clipToPadding = false
-
-                view.requestLayout()
-
-            }
-
-        }
-
     }
 
 
@@ -9994,6 +10749,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
         ) return
 
         val compositorEnabled = enabled && !config.solidBarEnabled && config.backdropCapture &&
+            appNavigationState?.allowsOpticalSurfacePipeline() != false &&
             (targetAdapter?.keepsOpticalSurfaceDuringBarAnimation == true || !barVisibilityAnimating)
 
         val content = parent as? FrameLayout ?: return
@@ -10025,6 +10781,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
                         opticalSurfaceSurfaceReady = true
 
                         if (wantsRootSurfaceOpticalPipeline() &&
+                            appNavigationState?.allowsOpticalSurfacePipeline() != false &&
                             (targetAdapter?.keepsOpticalSurfaceDuringBarAnimation == true || !barVisibilityAnimating) &&
                             appNavigationState?.directOpticalBackdropActive() != true
 
@@ -10142,6 +10899,10 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     ) != true) return
                 opticalSurfaceSurfacePipelineActive = false
                 opticalSurfaceRootCopyInFlight = false
+                // onDraw/dispatchDraw may have recorded an empty display list
+                // while the independent Surface owned the pixels. Closing it
+                // must dirty the host, not leave that empty list retained.
+                invalidate()
                 return
 
             }
@@ -10249,13 +11010,16 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
     private fun opticalSurfaceSurfaceOverflowPx(): Int =
 
-        (32f * density).roundToInt()
+        ((targetAdapter?.opticalSurfaceOverflowDp ?: 32f) * density).roundToInt()
 
 
 
     private fun requestOpticalSurfaceRootSurfaceFrame(afterFrameCommit: Boolean = false) {
+        if (!isAttachedToWindow || !isShown || !hasWindowFocus() || windowVisibility != View.VISIBLE) return
+        if (appNavigationState?.pauseOpticalSurfaceProbe() == true) return
         if (config.solidBarEnabled || !config.backdropCapture) return
-        if (SystemClock.uptimeMillis() < barAnimationPriorityUntil) return
+        if (SystemClock.uptimeMillis() < barAnimationPriorityUntil &&
+            targetAdapter?.keepsBackdropDuringTapTransition != true) return
         if (appNavigationState?.requiresSampledBackdrop() == false) return
         // A ready adapter-owned Surface frame already supplies the glass pixels.
         // Root PixelCopy cannot include that layer and would compete for no gain.
@@ -10281,7 +11045,10 @@ internal fun drawOuterGlass(canvas: Canvas) {
         val hostLocation = IntArray(2).also(::getLocationInWindow)
         val localLeft = hostLocation[0] - rootLocation[0]
         val localTop = hostLocation[1] - rootLocation[1]
-        val desiredPadding = 24f * density
+        val desiredPadding = io.github.offlineglass.rendering.NativeBackdropBlur.padding(
+            config.blurRadius * density * (targetAdapter?.secondaryBlurScale ?: 1f),
+            24f * density,
+        )
         val availablePadding = minOf(
             desiredPadding,
             localLeft.toFloat(),
@@ -10322,6 +11089,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
         )
         if (reusable != null) opticalSurfaceRootCopyScratch = null
         opticalSurfaceRootCopyInFlight = true
+        val requestedCopySerial = ++opticalSurfaceRootCopySerial
+        val requestedCaptureEpoch = appNavigationState?.opticalCaptureEpoch() ?: 0L
         // Adapter-selected pages deliver their copy
         // callbacks on a dedicated thread: the strip compare and the full
         // glass render used to run on the UI thread every vsync, competing
@@ -10345,7 +11114,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     var copySlotReleased = false
                     try {
                         glassPerfLogTick()
-                        if (result == PixelCopy.SUCCESS && opticalSurfaceSurfacePipelineActive) {
+                        if (result == PixelCopy.SUCCESS && opticalSurfaceSurfacePipelineActive &&
+                            requestedCaptureEpoch == (appNavigationState?.opticalCaptureEpoch() ?: 0L)) {
                             val previous = backdrop
                             appNavigationState?.onOpticalBackdropCaptured(requestedBarSource)
                             backdrop = target
@@ -10378,8 +11148,10 @@ internal fun drawOuterGlass(canvas: Canvas) {
                                 }
                             }
                             val barAnimating = isBarVisualStateAnimating()
-                            if (stripChanged || barAnimating || isDarkGlass() != lastSurfaceRenderDark) {
-                                if (targetAdapter?.deferOpticalRenderDuringBarAnimation == true && barAnimating) {
+                            if (stripChanged || barAnimating || isDarkGlass() != lastSurfaceRenderDark ||
+                                config != lastSurfaceRenderConfig) {
+                                if (appNavigationState?.deferOpticalCopyRenderToUi() == true ||
+                                    (targetAdapter?.deferOpticalRenderDuringBarAnimation == true && barAnimating)) {
                                     // During a bar gesture/transition the UI frame
                                     // pump owns Surface submission. The copy thread
                                     // only publishes the newest backdrop, avoiding
@@ -10398,8 +11170,10 @@ internal fun drawOuterGlass(canvas: Canvas) {
                     } finally {
                         // An overlapped request may already own the slot. Do not
                         // clear its guard when the preceding render completes.
-                        if (!copySlotReleased) opticalSurfaceRootCopyInFlight = false
-                        if (!copySlotReleased && result == PixelCopy.SUCCESS && opticalSurfaceSurfacePipelineActive) {
+                        val sameScene = requestedCaptureEpoch == (appNavigationState?.opticalCaptureEpoch() ?: 0L)
+                        if (!copySlotReleased && requestedCopySerial == opticalSurfaceRootCopySerial)
+                            opticalSurfaceRootCopyInFlight = false
+                        if (!copySlotReleased && sameScene && result == PixelCopy.SUCCESS && opticalSurfaceSurfacePipelineActive) {
                             appNavigationState?.onOpticalSurfaceCopyCompleted(root) {
                                 requestOpticalSurfaceRootSurfaceFrame(afterFrameCommit = true)
                             }
@@ -10453,7 +11227,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
     private fun isBarVisualStateAnimating(): Boolean =
 
-        touching || pressProgress > 0.001f || interactiveHighlightProgress > 0.001f ||
+        touching || pressProgress > 0.001f || restingTintAnimator?.isRunning == true ||
 
             barVisibilityAnimating || abs(panelDragOffset) > 0.001f ||
 
@@ -10495,6 +11269,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
         // The shared RenderNodes must never be recorded concurrently.
 
         synchronized(surfaceRenderLock) {
+
+            val renderedConfig = config
 
             // JD's backdrop bitmap is immutable between PixelCopy deliveries.
 
@@ -10611,6 +11387,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                 surface.holder.unlockCanvasAndPost(canvas)
 
+                lastSurfaceRenderConfig = renderedConfig
+
                 if (appNavigationState?.onOpticalSurfaceFrameRendered() == true) postInvalidateOnAnimation()
 
             }
@@ -10676,7 +11454,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                     radius = { outerCornerRadiusPx() },
 
-                    smoothing = { config.cornerSmoothing },
+                    smoothing = { indicatorSmoothing() },
 
                 )
 
@@ -10836,6 +11614,13 @@ internal fun drawOuterGlass(canvas: Canvas) {
     ) {
 
         val indicator = opticalSurfaceNativeIndicatorView ?: return
+        // A live capture lets the shared lens own material and sampled specular;
+        // never double-paint the native fallback underneath the shared lens.
+        if (!indicatorInteractionPolicy.rendersSelectionLens ||
+            (targetAdapter?.samplesPanelHighlightInIndicator == true && hasUsableBackdrop())) {
+            indicator.visibility = View.INVISIBLE
+            return
+        }
 
         if (!usesOpticalSurfaceHybridBackdrop() || !opticalSurfaceNativeIndicatorActive) {
 
@@ -10900,6 +11685,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
         }
 
         val shader = opticalSurfaceNativeIndicatorShader ?: return
+        syncIndicatorLensContour(shader, baseWidth.toFloat(), baseHeight.toFloat(), radius)
 
         val effectSignature =
 
@@ -10922,7 +11708,6 @@ internal fun drawOuterGlass(canvas: Canvas) {
         shader.setFloatUniform("offset", 0f, 0f)
 
         shader.setFloatUniform("cornerRadii", radius, radius, radius, radius)
-
         shader.setFloatUniform(
 
             "refractionHeight",
@@ -10941,7 +11726,8 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
         shader.setFloatUniform("depthEffect", 1f)
 
-        shader.setFloatUniform("chromaticAberration", 0.42f)
+        shader.setFloatUniform("chromaticAberration",
+            io.github.offlineglass.rendering.indicatorChromaticAberration(pressProgress, 0.42f))
 
         indicator.setRenderEffect(RenderEffect.createRuntimeShaderEffect(shader, "content"))
 
@@ -11236,7 +12022,7 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         val blurRadius = 8f * density * progress
 
-        selectionPath.setBottomBarSquircle(selectionRect, radius, config.cornerSmoothing)
+        selectionPath.setBottomBarSquircle(selectionRect, radius, indicatorSmoothing())
 
         runCatching {
 
@@ -11317,10 +12103,15 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
      */
 
     private fun drawLiquidIndicatorLighting(canvas: Canvas, dark: Boolean, radius: Float) {
+        // These are synthetic full-pill white/black/coloured fills, not the
+        // sampled optical refraction or dispersion. They must not tint an active
+        // lens in either theme, including the release-to-rest animation.
+        if (indicatorInteractionPolicy.expandsOnInteraction &&
+            (touching || (pressProgress > 0.001f && !returningRestingTint))) return
 
-        val progress = pressProgress.coerceIn(0f, 1f)
+        val progress = if (returningRestingTint) 0f else pressProgress.coerceIn(0f, 1f)
 
-        selectionPath.setBottomBarSquircle(selectionRect, radius, config.cornerSmoothing)
+        selectionPath.setBottomBarSquircle(selectionRect, radius, indicatorSmoothing())
 
         canvas.save()
 
@@ -11334,11 +12125,11 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         val liftAlpha = if (dark) {
 
-            0.012f + 0.024f * progress
+            io.github.offlineglass.rendering.BottomBarIndicatorStyle.idleLiftAlpha(true) + 0.024f * progress
 
         } else {
 
-            0.008f + 0.022f * progress
+            io.github.offlineglass.rendering.BottomBarIndicatorStyle.idleLiftAlpha(false) + 0.022f * progress
 
         }
 
@@ -11354,11 +12145,11 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         val blackAlpha = if (dark) {
 
-            0.13f + 0.14f * progress
+            io.github.offlineglass.rendering.BottomBarIndicatorStyle.idleShadeAlpha(true) + 0.14f * progress
 
         } else {
 
-            0.04f + 0.08f * progress
+            io.github.offlineglass.rendering.BottomBarIndicatorStyle.idleShadeAlpha(false) + 0.08f * progress
 
         }
 
@@ -11371,9 +12162,7 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
         if (canvas.isHardwareAccelerated) {
 
             indicatorShadowNode.setPosition(0, 0, width, height)
-
             perfNodeRecords++
-
             val shadowCanvas = indicatorShadowNode.beginRecording(width, height)
 
             shadowCanvas.drawPath(selectionPath, lightingPaint)
@@ -11394,8 +12183,6 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         }
 
-
-
         val colorBlur = lerp(0.3f, 0.6f, progress) * density
 
         val offset = lerp(0.25f, 1.1f, progress) * density
@@ -11407,9 +12194,7 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
         val causticsCanvas = if (canvas.isHardwareAccelerated) {
 
             indicatorCausticsNode.setPosition(0, 0, width, height)
-
             perfNodeRecords++
-
             indicatorCausticsNode.beginRecording(width, height)
 
         } else {
@@ -11418,7 +12203,7 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         }
 
-        val blueAlpha = 0.035f * progress + if (dark) 0.025f else 0.018f
+        val blueAlpha = 0.035f * progress + io.github.offlineglass.rendering.BottomBarIndicatorStyle.idleBlueAlpha(dark)
 
         lightingPaint.color = Color.argb((blueAlpha * 255f).toInt(), 0x64, 0xC8, 0xFF)
 
@@ -11426,13 +12211,13 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         lightingRect.offset(-offset, negativeOffset)
 
-        lightingPath.setBottomBarSquircle(lightingRect, radius, config.cornerSmoothing)
+        lightingPath.setBottomBarSquircle(lightingRect, radius, indicatorSmoothing())
 
         causticsCanvas.drawPath(lightingPath, lightingPaint)
 
 
 
-        val pinkAlpha = 0.03f * progress + if (dark) 0.020f else 0.016f
+        val pinkAlpha = 0.03f * progress + io.github.offlineglass.rendering.BottomBarIndicatorStyle.idlePinkAlpha(dark)
 
         lightingPaint.color = Color.argb((pinkAlpha * 255f).toInt(), 0xFF, 0xA0, 0xD8)
 
@@ -11440,7 +12225,7 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         lightingRect.offset(offset * 0.9f, negativeOffset * 0.5f)
 
-        lightingPath.setBottomBarSquircle(lightingRect, radius, config.cornerSmoothing)
+        lightingPath.setBottomBarSquircle(lightingRect, radius, indicatorSmoothing())
 
         causticsCanvas.drawPath(lightingPath, lightingPaint)
 
@@ -11488,47 +12273,13 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
 
 
-    private fun drawInteractiveHighlight(canvas: Canvas) {
-
-        val progress = interactiveHighlightProgress
-
-        if (progress <= 0.001f) return
-
-        fillPaint.shader = null
-
-        fillPaint.blendMode = BlendMode.PLUS
-
-        fillPaint.color = Color.argb((0.06f * progress * 255f).toInt(), 255, 255, 255)
-
-        canvas.drawRect(outerRect, fillPaint)
-
-        fillPaint.shader = RadialGradient(
-
-            (4f * density + (indicatorPosition + 0.5f) * tabWidthPx() + translationX)
-
-                .coerceIn(0f, width.toFloat()),
-
-            height / 2f,
-
-            height * 1.2f,
-
-            Color.argb((0.12f * progress * 255f).toInt(), 255, 255, 255),
-
-            Color.TRANSPARENT,
-
-            Shader.TileMode.CLAMP,
-
-        )
-
-        canvas.drawRect(outerRect, fillPaint)
-
-        fillPaint.shader = null
-
-        fillPaint.blendMode = null
-
+    /** Native accessory surfaces share the panel's settings and device-tilt light. */
+    internal fun drawAccessoryPanelHighlight(canvas: Canvas, target: RectF, radius: Float) {
+        if (!config.liquidGlassEnabled || !config.outlineEnabled) return
+        drawBloomStroke(canvas, target, radius,
+            (0.58f * config.darkBarHighlightStrength).coerceAtMost(1f),
+            -45f, outerBloomShader)
     }
-
-
 
     private fun drawBloomStroke(
 
@@ -11544,7 +12295,14 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         shader: RuntimeShader?,
 
+        strokeWidthDp: Float = 1f,
+
     ) {
+        if (target === outerRect && adapterBarLayout() != null) {
+            drawBloomStroke(canvas, compoundMainRect, radius, alpha, rotation, shader, strokeWidthDp)
+            drawBloomStroke(canvas, compoundActionRect, height / 2f, alpha, rotation, shader, strokeWidthDp)
+            return
+        }
 
         if (alpha <= 0f || target.isEmpty || shader == null || !canvas.isHardwareAccelerated) return
 
@@ -11558,17 +12316,24 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
             val halfHeight = height / 2f
 
-            shader.setFloatUniform("halfView", halfWidth, halfHeight)
-
-            shader.setFloatUniform("highlightAlpha", alpha)
-
-            shader.setColorUniform("strokeColor", Color.WHITE)
-
-            shader.setFloatUniform("strokeAlphaMul", 0.12f)
-
-            setBloomLight(shader, "1", rotation, primary = true)
-
-            setBloomLight(shader, "2", rotation, primary = false)
+            val uniformCache = exactBloomWork?.let { caches ->
+                synchronized(caches) { caches.getOrPut(shader) {
+                    io.github.offlineglass.rendering.ExactOpticalUniformCache(shader)
+                } }
+            }
+            if (uniformCache == null) {
+                shader.setFloatUniform("halfView", halfWidth, halfHeight)
+                shader.setFloatUniform("highlightAlpha", alpha)
+                shader.setColorUniform("strokeColor", Color.WHITE)
+                shader.setFloatUniform("strokeAlphaMul", 0.12f)
+            } else {
+                uniformCache.floats("halfView", halfWidth, halfHeight)
+                uniformCache.floats("highlightAlpha", alpha)
+                uniformCache.color("strokeColor", Color.WHITE)
+                uniformCache.floats("strokeAlphaMul", 0.12f)
+            }
+            setBloomLight(shader, "1", rotation, primary = true, uniformCache)
+            setBloomLight(shader, "2", rotation, primary = false, uniformCache)
 
 
 
@@ -11576,11 +12341,11 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
             bloomPaint.style = Paint.Style.STROKE
 
-            bloomPaint.strokeWidth = density
+            bloomPaint.strokeWidth = density * strokeWidthDp
 
             lightingRect.set(0f, 0f, width, height)
 
-            lightingPath.setBottomBarSquircle(lightingRect, radius, config.cornerSmoothing)
+            lightingPath.setBottomBarSquircle(lightingRect, radius, if (shader === indicatorBloomShader) indicatorSmoothing() else config.cornerSmoothing)
 
             canvas.save()
 
@@ -11600,7 +12365,8 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
 
 
-    private fun setBloomLight(shader: RuntimeShader, suffix: String, rotation: Float, primary: Boolean) {
+    private fun setBloomLight(shader: RuntimeShader, suffix: String, rotation: Float, primary: Boolean,
+        cache: io.github.offlineglass.rendering.ExactOpticalUniformCache? = null) {
 
         val dx: Float
 
@@ -11622,9 +12388,9 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
             // the panel, +90 for the pill).
 
-            var gx = BloomTiltTracker.gravityX
+            var gx = if (config.postureEffectsEnabled) BloomTiltTracker.gravityX else 0f
 
-            var gy = BloomTiltTracker.gravityY
+            var gy = if (config.postureEffectsEnabled) BloomTiltTracker.gravityY else 0f
 
             when (displayRotationCompat()) {
 
@@ -11686,11 +12452,15 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
         val length = sqrt(dx * dx + dy * dy + dz * dz).coerceAtLeast(0.000001f)
 
-        shader.setFloatUniform("lightDir$suffix", dx / length, dy / length, dz / length)
-
-        shader.setColorUniform("lightColor$suffix", Color.WHITE)
-
-        shader.setFloatUniform("lightIntensity$suffix", intensity)
+        if (cache == null) {
+            shader.setFloatUniform("lightDir$suffix", dx / length, dy / length, dz / length)
+            shader.setColorUniform("lightColor$suffix", Color.WHITE)
+            shader.setFloatUniform("lightIntensity$suffix", intensity)
+        } else {
+            cache.floats("lightDir$suffix", dx / length, dy / length, dz / length)
+            cache.color("lightColor$suffix", Color.WHITE)
+            cache.floats("lightIntensity$suffix", intensity)
+        }
 
     }
 
@@ -11704,11 +12474,7 @@ internal fun disableOpticalSurfaceNativeBlur(view: View) {
 
 internal fun surfaceContainerColor(dark: Boolean): Int {
 
-        val alpha = ((if (dark) config.darkAlpha else config.lightAlpha) * 255f)
-
-            .toInt().coerceIn(0, 255)
-
-        return if (dark) Color.argb(alpha, 33, 31, 38) else Color.argb(alpha, 255, 255, 255)
+        return config.surfaceTintColor(dark)
 
     }
 
@@ -12012,10 +12778,20 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
             val now = SystemClock.uptimeMillis()
 
-            // During a tap-driven page switch, let the native page transition
-            // own the frame budget. Keep the already-rendered glass untouched;
-            // only defer per-frame probing/capture preparation briefly.
-            if (now < barAnimationPriorityUntil) return@OnPreDrawListener true
+            // Defer expensive capture/probing, not the live scene handoff.
+            // On a page replacement (most visible returning to an image feed),
+            // retaining the old scene for 240 ms exposes the new sharp page
+            // through the old scene's holes until the wrapper finally refreshes.
+            // Refresh only GPU references here: no bitmap capture or new pump.
+            if (now < barAnimationPriorityUntil &&
+                targetAdapter?.keepsBackdropDuringTapTransition != true) {
+                if (isShown && hasWindowFocus() && windowVisibility == View.VISIBLE &&
+                    !compositorBlurBehind && targetAdapter?.usesDirectOpticalBackdropMode != true &&
+                    !isOpticalSurfaceSelected() && appNavigationState?.pauseBackdropWork(this) != true) {
+                    prepareLiveBackdropScene()
+                }
+                return@OnPreDrawListener true
+            }
 
             if (targetAdapter?.usesDirectOpticalBackdropMode == true) {
 
@@ -12051,6 +12827,11 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
                 abs(indicatorPosition - dragTarget) > 0.001f
 
+            // Visibility tracking belongs to the source listener and remains
+            // active. Sampling an entirely hidden panel can be paused by its
+            // adapter without interrupting an exit/entry animation.
+            if (appNavigationState?.pauseBackdropWork(this) == true) return@OnPreDrawListener true
+
             if (context.packageName != QQ_PACKAGE &&
 
                 appNavigationState?.deferThemeDetection(now) != true
@@ -12061,6 +12842,7 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
             // Keep that listener alive in solid mode, but never walk the
             // backdrop scene or request a frame that cannot be displayed.
             appNavigationState?.onHostFrame(this)
+            if (!isShown || !hasWindowFocus() || windowVisibility != View.VISIBLE) return@OnPreDrawListener true
             if (config.solidBarEnabled) {
                 return@OnPreDrawListener true
             }
@@ -12173,7 +12955,10 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
             if (opticalSurfaceSurfacePipelineActive) return@OnPreDrawListener true
 
+            val freshSoftwareInput = appNavigationState?.needsFreshSoftwareBackdrop() == true
             val interval = when {
+
+                freshSoftwareInput -> 0L
 
                 backdrop == null -> 0L
 
@@ -12185,7 +12970,7 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
             }
 
-            if (!animating && !capturing && isShown &&
+            if ((!animating || freshSoftwareInput) && !capturing && isShown &&
 
                 width > 0 && height > 0 && now - lastCapture >= interval
 
@@ -12193,7 +12978,8 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
                 lastCapture = now
 
-                val captureSource = parent as? View
+                val captureSource = (if (freshSoftwareInput) appNavigationState?.resolveBackdropScene(this) else null)
+                    ?: parent as? View
 
                 captureBackdrop(captureSource ?: root)
 
@@ -12472,6 +13258,7 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
             bitmapCanvas.translate(-x.toFloat() + padding, -y.toFloat() + padding)
 
             root.draw(bitmapCanvas)
+            appNavigationState?.onSoftwareBackdropRecorded()
 
         } finally {
 
@@ -12520,6 +13307,33 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
         liveBackdropSignature = Long.MIN_VALUE
         sharedOpticalBlurPrepared = false
     }
+    /** A page-source handoff invalidates all derived optical scenes together. */
+    internal fun invalidateOpticalSceneForAdapter() {
+        liveBackdropNodeForAdapter.discardDisplayList()
+        outerRenderNode.discardDisplayList()
+        tabsBackdropNode.discardDisplayList()
+        indicatorCombinedNode.discardDisplayList()
+        indicatorRenderNode.discardDisplayList()
+        sharedOpticalBlurNode.discardDisplayList()
+        clearLiveBackdropForAdapter()
+        invalidateProjectionCache()
+    }
+    /** Lifecycle repair, requested by an adapter once after its window returns. */
+    internal fun restoreOpticalSceneForAdapter() {
+        invalidateOpticalSceneForAdapter()
+        actionGlassNode.setRenderEffect(null)
+        actionGlassNode.discardDisplayList()
+        actionGlassShader = null
+        actionGlassEffect = null
+        actionGlassKey = null
+        mainGlassNode.setRenderEffect(null)
+        mainGlassNode.discardDisplayList()
+        mainGlassShader = null
+        mainGlassEffect = null
+        mainGlassKey = null
+        configureGlassEffects()
+        postInvalidateOnAnimation()
+    }
     /** Discard an adapter's previous optical frame after its page changes. */
     internal fun invalidateOpticalBackdropForAdapter() {
         backdrop?.takeUnless(Bitmap::isRecycled)?.recycle()
@@ -12560,6 +13374,22 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
             (isOpticalSurfaceSelected() || targetAdapter?.usesDirectOpticalBackdropMode == true)
 
 
+
+    private fun liveSceneBackgroundColor(content: View): Int {
+        var current: View? = content
+        while (current != null) {
+            val color = (current.background as? ColorDrawable)?.color
+            if (color != null && Color.alpha(color) == 255) return color
+            current = current.parent as? View
+        }
+        val value = android.util.TypedValue()
+        if (context.theme.resolveAttribute(android.R.attr.colorBackground, value, true) &&
+            value.type in android.util.TypedValue.TYPE_FIRST_COLOR_INT..android.util.TypedValue.TYPE_LAST_COLOR_INT &&
+            Color.alpha(value.data) == 255) return value.data
+        // Android's window backing is opaque even when individual content
+        // containers have no background. Never use the translucent glass fill.
+        return if (isDarkGlass()) Color.BLACK else Color.WHITE
+    }
 
     private fun backdropPaddingPx(): Float {
         // Blur needs real neighbouring pixels, not repeated CLAMP edge pixels.
@@ -12966,7 +13796,9 @@ internal fun isDarkGlass(): Boolean {
 
         }
 
-        if (context.packageName != QQ_PACKAGE && targetAdapter?.hasTransientPageVisibility != true) return true
+        if (context.packageName != QQ_PACKAGE && targetAdapter?.hasTransientPageVisibility != true &&
+            targetAdapter?.homeOnlyNavigation != true
+        ) return true
 
         val now = SystemClock.uptimeMillis()
 
@@ -12980,7 +13812,25 @@ internal fun isDarkGlass(): Boolean {
 
             QQ_PACKAGE -> !containsActiveQqChatFragment(activity) && !hasQqForegroundPageLayer(activity)
 
-            else -> appNavigationState?.transientPageAllowsNavigation(activity) ?: true
+            else -> if (targetAdapter?.homeOnlyNavigation == true) {
+                activity?.let { current ->
+                    val activityContent = current.findViewById<ViewGroup>(android.R.id.content)
+                    activityContent?.let { content ->
+                        var found = false
+                        val stack = ArrayDeque<View>()
+                        stack += content
+                        while (stack.isNotEmpty() && !found) {
+                            val view = stack.removeLast()
+                            if (targetAdapter?.acceptsNavigationSource(view as? ViewGroup ?: continue) == true) {
+                                found = view.isAttachedToWindow && view.isShown && view.width > 0 && view.height > 0
+                                break
+                            }
+                            if (view is ViewGroup) for (index in 0 until view.childCount) stack += view.getChildAt(index)
+                        }
+                        found
+                    } ?: false
+                } ?: false
+            } else appNavigationState?.transientPageAllowsNavigation(activity) ?: true
 
         }
 
@@ -13416,6 +14266,11 @@ internal fun isDarkGlass(): Boolean {
 
         )
 
+        // Switch to B to restore the archived original adapter exit motion.
+        const val APP_BAR_EXIT_ANIMATION_SCHEME = "A"
+        const val OPTICAL_BAR_SCHEME_A_EXIT_MS = 220L
+        val OPTICAL_BAR_SCHEME_A_EXIT_INTERPOLATOR = PathInterpolator(0.4f, 0f, 1f, 1f)
+
         const val OPTICAL_BAR_VISIBILITY_DURATION_MS = 300L
 
         const val OPTICAL_BAR_SHOW_EXPAND_MS = 300L
@@ -13495,7 +14350,6 @@ internal fun isDarkGlass(): Boolean {
 
         // Icon pulled down and label pulled up symmetrically to tighten the gap.
 
-        const val MEITUAN_TAKEOUT_SCROLL_PROBE_INTERVAL_MS = 160L
 
         const val QQ_DEFAULT_ACCENT_COLOR = 0xFF0099FF.toInt()
 
@@ -13528,6 +14382,39 @@ internal fun isDarkGlass(): Boolean {
 
 
         const val ROUNDED_RECT_SDF = """
+
+            uniform float continuousShape;
+            uniform float shapeOrientation;
+            uniform float2 shapePoints[64];
+
+            // Distance and normal from the very same continuous-corner path
+            // used by the Canvas mask, rather than a circular-corner proxy.
+            float3 continuousContour(float2 p) {
+                float best = 1.0e20;
+                float2 delta = float2(0.0);
+                float2 winningEdge = float2(-1.0, 0.0);
+                for (int i = 0; i < 64; i++) {
+                    float2 a = shapePoints[i];
+                    float2 b = shapePoints[i == 63 ? 0 : i + 1];
+                    float2 edge = b - a;
+                    float t = clamp(dot(p - a, edge) / max(dot(edge, edge), 0.0001), 0.0, 1.0);
+                    float2 v = p - (a + edge * t);
+                    float d2 = dot(v, v);
+                    if (d2 < best) {
+                        best = d2;
+                        delta = v;
+                        winningEdge = edge;
+                    }
+                }
+                // Only the nearest edge's normal is observable. Normalizing
+                // every provisional winner repeats reciprocal square roots
+                // per pixel throughout the 64-edge search without affecting it.
+                float2 outward = shapeOrientation * normalize(float2(winningEdge.y, -winningEdge.x));
+                float distance = sqrt(best);
+                float side = dot(delta, outward) >= 0.0 ? 1.0 : -1.0;
+                float2 normal = distance > 0.001 ? delta * side / distance : outward;
+                return float3(distance * side, normal);
+            }
 
             float radiusAt(float2 coord, float4 radii) {
 
@@ -13588,10 +14475,29 @@ internal fun isDarkGlass(): Boolean {
         const val ROUNDED_RECT_REFRACTION_SHADER = """
 
             uniform shader content;
+            uniform float4 safeSampleBounds;
+
+            half4 sampleScene(float2 p) {
+                // The filter evaluator can restrict a blurred child to its
+                // requested output despite the source node's larger recording.
+                // Match raw-image CLAMP behaviour explicitly after filtering.
+                if (safeSampleBounds.z > safeSampleBounds.x &&
+                    safeSampleBounds.w > safeSampleBounds.y) {
+                    p = clamp(p, safeSampleBounds.xy, safeSampleBounds.zw);
+                }
+                return content.eval(p);
+            }
 
             uniform float2 size;
 
             uniform float2 offset;
+            uniform float3 detachedGeometry;
+            uniform float2 tiltBias;
+            uniform float flowingLiquidEnabled;
+            uniform float fullSurfaceWeight;
+            uniform float unifiedDropletPilot;
+            uniform float directionalRimPilot;
+            uniform float monotoneFlowPilot;
 
             uniform float4 cornerRadii;
 
@@ -13604,6 +14510,8 @@ internal fun isDarkGlass(): Boolean {
 
 
             $ROUNDED_RECT_SDF
+            ${io.github.offlineglass.rendering.FlowingLiquid.FIELD}
+            ${io.github.offlineglass.rendering.LiquidMotion.RIPPLE_FIELD}
 
 
 
@@ -13619,29 +14527,89 @@ internal fun isDarkGlass(): Boolean {
 
                 float2 halfSize = size * 0.5;
 
-                float2 centeredCoord = (coord + offset) - halfSize;
+                float2 origin = halfSize;
+                if (detachedGeometry.z > 0.0) {
+                    if (coord.x + offset.x <= detachedGeometry.x) {
+                        halfSize.x = detachedGeometry.x * 0.5;
+                        origin = halfSize;
+                    } else {
+                        halfSize.x = detachedGeometry.z;
+                        origin = float2(detachedGeometry.y, halfSize.y);
+                    }
+                }
+                float2 centeredCoord = (coord + offset) - origin;
 
-                float radius = radiusAt(coord, cornerRadii);
+                float radius = radiusAt(centeredCoord, cornerRadii);
 
                 float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+                float3 contour = float3(sd, 0.0, 0.0);
+                if (continuousShape > 0.5) {
+                    contour = continuousContour(coord + offset);
+                    sd = contour.x;
+                }
 
-                if (-sd >= refractionHeight) return content.eval(coord);
+                // A tilted water lens changes the view through its interior as
+                // well as the rim. Keep the existing texture and sampling count.
+                float2 normalizedPosition = centeredCoord / max(halfSize, float2(1.0));
+                float lensDepth = clamp(1.0 - 0.3 * dot(normalizedPosition, normalizedPosition), 0.4, 1.0);
+                // Continuous oblique incidence through a convex water surface.
+                // Snell's law for air -> water; subtract the front-on ray so
+                // the existing zero-tilt appearance is exactly preserved.
+                float2 angularShift = float2(0.0);
+                if (dot(tiltBias, tiltBias) > 0.000001) {
+                float3 waterNormal = normalize(float3(normalizedPosition * 0.55, 1.0));
+                float3 incident = normalize(float3(tiltBias, -1.0));
+                float eta = 0.75;
+                float cosIncident = dot(waterNormal, incident);
+                float cosFront = -waterNormal.z;
+                float3 transmitted = eta * incident -
+                    (eta * cosIncident + sqrt(max(1.0 - eta * eta *
+                    (1.0 - cosIncident * cosIncident), 0.0))) * waterNormal;
+                float3 frontRay = float3(0.0, 0.0, -eta) -
+                    (eta * cosFront + sqrt(max(1.0 - eta * eta *
+                    (1.0 - cosFront * cosFront), 0.0))) * waterNormal;
+                angularShift = transmitted.xy / max(-transmitted.z, 0.15) -
+                    frontRay.xy / max(-frontRay.z, 0.15);
+                }
+                float2 viewShift = angularShift * min(halfSize.x, halfSize.y) * 0.95 * lensDepth;
+                if (flowingLiquidEnabled > 0.5) {
+                    // The downhill side of the fixed glass outline gains a
+                    // thicker, non-linear optical slope. Scene/artwork bounds
+                    // never move; only their sampled pixels are displaced.
+                    viewShift = angularShift * min(halfSize.x, halfSize.y) * 0.25 * lensDepth +
+                        flowingLiquidOffset(normalizedPosition, tiltBias, halfSize);
+                    viewShift += flowingReboundOffset(normalizedPosition, halfSize);
+                }
+                float flowGain = flowingLiquidEnabled > 0.5 ?
+                    flowingRimGain(normalizedPosition, tiltBias, halfSize) : 1.0;
+                if (flowingLiquidEnabled > 0.5) flowGain = flowingRippleGain(flowGain, normalizedPosition);
+                float localRefractionHeight = flowingLiquidEnabled > 0.5 ?
+                    min(refractionHeight * (flowMotionEnabled > 0.5 ? max(sqrt(flowGain), 0.70) : sqrt(flowGain)),
+                        min(halfSize.x, halfSize.y) * 0.92) :
+                    refractionHeight;
+                float2 interiorShift = flowingInteriorRefraction(normalizedPosition,
+                    refractionAmount, flowGain) * fullSurfaceWeight;
+                if (-sd >= localRefractionHeight) return sampleScene(coord + viewShift + interiorShift);
 
                 sd = min(sd, 0.0);
 
-                float d = circleMap(1.0 - -sd / refractionHeight) * refractionAmount;
+                float lensT = clamp(1.0 - -sd / max(localRefractionHeight, 0.001), 0.0, 1.0);
+                float d = (flowMotionEnabled > 0.5 ? flowingMotionCurve(lensT) : circleMap(lensT)) * refractionAmount;
 
                 float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
 
                 float2 grad = normalize(
+                    (continuousShape > 0.5 ? contour.yz : gradSdRoundedRect(centeredCoord, halfSize, gradRadius)) +
+                    depthEffect * normalize(centeredCoord));
 
-                    gradSdRoundedRect(centeredCoord, halfSize, gradRadius) +
-
-                    depthEffect * normalize(centeredCoord)
-
-                );
-
-                return content.eval(coord + d * grad);
+                float2 tiltedGrad = grad + angularShift * 1.3;
+                float tiltedAmount = d * (1.0 + dot(grad, tiltBias));
+                if (flowingLiquidEnabled > 0.5) {
+                    tiltedAmount *= flowGain;
+                }
+                float rimWeight = smoothstep(0.0, 1.0, lensT);
+                return sampleScene(coord + viewShift + tiltedAmount * tiltedGrad +
+                    interiorShift * (1.0 - rimWeight));
 
             }
 
@@ -13649,7 +14617,9 @@ internal fun isDarkGlass(): Boolean {
 
 
 
-        const val ROUNDED_RECT_DISPERSION_SHADER = """
+        val ROUNDED_RECT_DISPERSION_SHADER =
+            io.github.offlineglass.rendering.PostureGlass.wrap(ROUNDED_RECT_DISPERSION_BASE, flowing = false)
+        private const val ROUNDED_RECT_DISPERSION_BASE = """
 
             uniform shader content;
 
@@ -13687,9 +14657,14 @@ internal fun isDarkGlass(): Boolean {
 
                 float2 centeredCoord = (coord + offset) - halfSize;
 
-                float radius = radiusAt(coord, cornerRadii);
+                float radius = radiusAt(centeredCoord, cornerRadii);
 
                 float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+                float3 contour = float3(sd, 0.0, 0.0);
+                if (continuousShape > 0.5) {
+                    contour = continuousContour(coord + offset);
+                    sd = contour.x;
+                }
 
                 if (-sd >= refractionHeight) return content.eval(coord);
 
@@ -13703,7 +14678,7 @@ internal fun isDarkGlass(): Boolean {
 
                 float2 grad = normalize(
 
-                    gradSdRoundedRect(centeredCoord, halfSize, gradRadius) +
+                    (continuousShape > 0.5 ? contour.yz : gradSdRoundedRect(centeredCoord, halfSize, gradRadius)) +
 
                     depthEffect * normalize(centeredCoord)
 
@@ -13848,7 +14823,7 @@ internal fun isDarkGlass(): Boolean {
 
 /** Main-thread spring integrator for navigation gestures and visibility transitions. */
 
-private class SpringFloat(
+internal class SpringFloat(
 
     initialValue: Float,
 
@@ -13873,6 +14848,8 @@ private class SpringFloat(
     private var lastFrameNanos = 0L
 
     private var running = false
+
+    internal val isRunning: Boolean get() = running
 
     var velocity = 0f
 
@@ -14018,10 +14995,17 @@ internal class BottomBarSquircleOutlineProvider(
 
         rect.set(0f, 0f, view.width.toFloat(), view.height.toFloat())
 
-        path.setBottomBarSquircle(rect, radius(), smoothing())
+        path.buildCanonicalSquircle(rect, radius(), smoothing())
 
         if (!path.isEmpty) outline.setPath(path)
 
     }
 
 }
+
+
+
+
+
+
+

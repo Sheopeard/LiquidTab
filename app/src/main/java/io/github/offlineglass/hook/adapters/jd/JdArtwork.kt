@@ -66,11 +66,22 @@ internal class JdArtwork {
     private val darkIconFilter = BlendModeColorFilter(Color.WHITE, BlendMode.SRC_IN)
     var jdStaticIconsPopulated = false
         private set
+    var artworkRefreshPending = false
+        private set
 
     fun prepare(source: ViewGroup?, count: Int) {
-        if (jdStaticIconsPopulated && (source !== navigationSource || count != slotCount ||
-                source?.width != jdNativeFrameWidth || source.height != jdNativeFrameHeight)) {
-            jdStaticIconsPopulated = false
+        // NavigationGroup identity changes during ordinary JD tab commits. Its
+        // five icons are stable within this process, so keep the last complete
+        // artwork until a real geometry/count change supplies a replacement.
+        // Invalidating on identity alone creates a frame with only the panel
+        // shadow while the new source is still binding labels and drawables.
+        if (jdStaticIconsPopulated && (count != slotCount ||
+                source?.width?.takeIf { it > 0 }?.let { it != jdNativeFrameWidth } == true ||
+                source?.height?.takeIf { it > 0 }?.let { it != jdNativeFrameHeight } == true)) {
+            // Keep the complete last frame drawable while a resized native
+            // row asynchronously supplies its replacement. readyForDrawing
+            // must not go false with valid artwork still in memory.
+            artworkRefreshPending = true
             jdHomeDefaultIcon = null
             jdHomeDefaultIconRect = null
         }
@@ -80,6 +91,7 @@ internal class JdArtwork {
 
     fun accept(candidate: Bitmap, populate: Boolean): Boolean {
         if (!jdStaticIconsPopulated && (!populate || !populateJdStaticIcons(candidate))) return false
+        if (artworkRefreshPending && populate && populateJdStaticIcons(candidate)) artworkRefreshPending = false
         captureJdBadgeOverlays(candidate)
         return true
     }
@@ -606,6 +618,7 @@ internal class JdArtwork {
         jdHomeDefaultIcon = null
         jdHomeDefaultIconRect = null
         jdStaticIconsPopulated = false
+        artworkRefreshPending = false
         jdNativeFrameWidth = 0
         jdNativeFrameHeight = 0
         jdLastBadgeCaptureAt = 0L

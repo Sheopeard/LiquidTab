@@ -9,7 +9,7 @@ import android.os.*
 import android.view.*
 import android.widget.*
 import androidx.core.graphics.drawable.toBitmap
-import de.robv.android.xposed.*
+import io.github.offlineglass.hook.compat.*
 import io.github.offlineglass.hook.*
 import io.github.offlineglass.hook.GlassHostLayout.Companion.ROUNDED_RECT_REFRACTION_SHADER
 import io.github.offlineglass.hook.GlassHostLayout.Companion.BLOOM_STROKE_DUAL_SHADER
@@ -528,9 +528,13 @@ internal fun GlassHostLayout.adjustNeteaseMiniPlayer() {
 
         // Match the navigation panel's configured color and alpha exactly.
         // The optical backdrop still uses the same live blur radius above.
-        val playerFill = if (config.solidBarEnabled) Color.argb(
+        val configuredPlayerFill = if (config.solidBarEnabled) Color.argb(
             255, Color.red(basePlayerFill), Color.green(basePlayerFill), Color.blue(basePlayerFill),
         ) else basePlayerFill
+        val playerFill = Color.argb(
+            (Color.alpha(configuredPlayerFill) * config.spotifyBarOpacity.coerceIn(0f, 1f)).roundToInt(),
+            Color.red(configuredPlayerFill), Color.green(configuredPlayerFill), Color.blue(configuredPlayerFill),
+        )
 
         neteaseRuntime.miniPlayerGlassDrawable?.update(
 

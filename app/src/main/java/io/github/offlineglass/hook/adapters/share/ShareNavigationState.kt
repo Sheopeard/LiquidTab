@@ -18,7 +18,7 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.config.ConfigContract
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame

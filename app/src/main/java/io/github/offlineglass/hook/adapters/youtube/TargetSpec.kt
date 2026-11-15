@@ -20,9 +20,10 @@ internal val targetSpec: TargetSpec = TargetSpec("youtube", "com.google.android.
             classHints = setOf("BottomNavigationView", "NavigationBarView", "WatchWhileActivity", "PivotBar"),
             textHints = setOf("首页", "Home", "Shorts", "发布", "Create", "订阅内容", "Subscriptions", "通知", "Notifications", "你", "You", "我"),
             // 21.x moved creation to the top toolbar; the bottom row is five
-            // regular tabs (Home/Shorts/Subscriptions/Notifications/You), so no
-            // entry may be marked non-selectable.
-            preferredSlots = 5..5, supportsPostButton = false,
-            defaultAccentColor = 0xFFFF0000.toInt(), glassAccentColor = 0xFFFF0000.toInt(),
+            // regular tabs (Home/Shorts/Subscriptions/Notifications/You). The
+            // native center action is projected as the independent publish key.
+            preferredSlots = 5..5, supportsPostButton = true,
+            defaultAccentColor = 0xFFFF0033.toInt(), glassAccentColor = 0xFFFF0033.toInt(),
             sceneVisibilityAnimation = true,
+            defaultDetachedPublish = true,
             entryLabels = listOf("首页", "Shorts", "订阅内容", "通知", "你"))

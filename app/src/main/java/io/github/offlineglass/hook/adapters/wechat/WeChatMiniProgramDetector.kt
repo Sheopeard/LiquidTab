@@ -1,15 +1,16 @@
 package io.github.offlineglass.hook.adapters.wechat
 
 import android.app.Activity
-import android.graphics.Rect
-import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XposedBridge
 
 internal class WeChatMiniProgramDetector {
-    private var lastWeChatPanelSignature = ""
+    private var titleAnchor = java.lang.ref.WeakReference<TextView>(null)
+    private var contentAnchor = java.lang.ref.WeakReference<TextView>(null)
+    private val titleBounds = android.graphics.Rect()
+    private val contentBounds = android.graphics.Rect()
+
     private companion object {
         const val WECHAT_BOUNCE_VIEW_CLASS = "com.tencent.mm.ui.widget.pulldown.MMWeUIBounceView"
         const val WECHAT_MINI_PANEL_RECENT_LABEL = "\u6700\u8fd1"
@@ -29,13 +30,25 @@ internal class WeChatMiniProgramDetector {
 
         }
 
+        val cachedTitle = titleAnchor.get()
+        val cachedContent = contentAnchor.get()
+        // Only positive bindings are reused. A negative scan is never cached,
+        // so a newly-created mini-app page is detected in its first frame.
+        if (cachedTitle != null && cachedContent != null &&
+            cachedTitle.rootView === content.rootView && cachedContent.rootView === content.rootView &&
+            cachedTitle.isShown && cachedContent.isShown && cachedTitle.alpha > .01f && cachedContent.alpha > .01f &&
+            cachedTitle.text.toString().trim() == WECHAT_MINI_PANEL_RECENT_LABEL &&
+            WECHAT_MINI_PANEL_CONTENT_LABELS.any { cachedContent.text.contains(it) } &&
+            cachedTitle.getGlobalVisibleRect(titleBounds) && cachedContent.getGlobalVisibleRect(contentBounds)) return true
+        var foundTitle: TextView? = null
+        var foundContent: TextView? = null
         var hasRecentTitle = false
 
         var hasMiniProgramContent = false
 
-        val bounceStates = ArrayList<String>()
 
-        val panelClasses = linkedSetOf<String>()
+
+
 
         var visited = 0
 
@@ -49,50 +62,22 @@ internal class WeChatMiniProgramDetector {
 
             if (candidate.visibility != View.VISIBLE || candidate.alpha <= 0.01f) continue
 
-            if (candidate.javaClass.name == WECHAT_BOUNCE_VIEW_CLASS) {
-
-                val rect = Rect()
-
-                candidate.getGlobalVisibleRect(rect)
-
-                bounceStates += "y=${candidate.y.toInt()},ty=${candidate.translationY.toInt()}," +
-
-                    "sy=${candidate.scrollY},h=${candidate.height},r=${rect.top}:${rect.bottom}," +
-
-                    "c=${(candidate as? ViewGroup)?.childCount ?: -1}"
-
-            }
-
-            val className = candidate.javaClass.name
-
-            if (className.contains("appbrand", ignoreCase = true) ||
-
-                className.contains("pulldown", ignoreCase = true) ||
-
-                className.contains("bounce", ignoreCase = true) ||
-
-                className.contains("recent", ignoreCase = true)
-
-            ) {
-
-                panelClasses += className
-
-            }
-
             if (candidate is TextView) {
 
                 val label = candidate.text?.toString()?.trim().orEmpty()
 
-                if (label == WECHAT_MINI_PANEL_RECENT_LABEL) hasRecentTitle = true
+                if (label == WECHAT_MINI_PANEL_RECENT_LABEL) { hasRecentTitle = true; foundTitle = candidate }
 
                 if (WECHAT_MINI_PANEL_CONTENT_LABELS.any { marker -> label.contains(marker) }) {
 
                     hasMiniProgramContent = true
+                    foundContent = candidate
 
                 }
 
                 if (hasRecentTitle && hasMiniProgramContent) {
-
+                    titleAnchor = java.lang.ref.WeakReference(foundTitle)
+                    contentAnchor = java.lang.ref.WeakReference(foundContent)
                     return true
 
                 }
@@ -108,18 +93,6 @@ internal class WeChatMiniProgramDetector {
                 }
 
             }
-
-        }
-
-        val signature = bounceStates.joinToString("|") + ";classes=" + panelClasses.joinToString(",")
-
-        if (signature != lastWeChatPanelSignature) {
-
-            lastWeChatPanelSignature = signature
-
-            Log.i(DIAGNOSTIC_TAG, "wechat-bounce=$signature")
-
-            XposedBridge.log("[$DIAGNOSTIC_TAG] wechat-bounce=$signature")
 
         }
 

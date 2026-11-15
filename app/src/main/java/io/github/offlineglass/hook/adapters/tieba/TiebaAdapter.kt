@@ -3,10 +3,10 @@ package io.github.offlineglass.hook.adapters.tieba
 import android.app.Activity
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import android.content.Context
@@ -47,6 +47,7 @@ internal object TiebaAdapter : TargetAdapter {
         }
     }
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
+        TiebaSplashAds.install(lpparam.classLoader)
         installTiebaNavigationBarBgSuppression(lpparam)
         installTiebaFeedPromptSuppression(lpparam)
     }

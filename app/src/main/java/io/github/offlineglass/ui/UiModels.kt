@@ -14,26 +14,39 @@ import io.github.offlineglass.config.UiMode
 import io.github.offlineglass.targets.TargetSpecRegistry
 
 enum class ManagerPage(
-    val title: String,
-    val selectedIcon: ImageVector,
-    val unselectedIcon: ImageVector,
+    private val baseTitle: String,
+    private val baseSelectedIcon: ImageVector,
+    private val baseUnselectedIcon: ImageVector,
 ) {
     HOME("主页", Icons.Filled.Home, Icons.Outlined.Home),
     APPS("应用", Icons.Filled.Apps, Icons.Outlined.Apps),
     SETTINGS("设置", Icons.Filled.Settings, Icons.Outlined.Settings),
+    ;
+
+    val title: String get() = baseTitle
+    val selectedIcon: ImageVector get() = baseSelectedIcon
+    val unselectedIcon: ImageVector get() = baseUnselectedIcon
+
+    companion object {
+        val available: List<ManagerPage> get() = entries
+    }
 }
 
 internal enum class ManagerHomeSubpage(val title: String) {
     NONE("主页"),
-    DONATION("打赏作者"),
+    DONATION("赞助本项目"),
     ACKNOWLEDGEMENTS("致谢"),
+    AUTHOR("作者"),
+    LANGUAGE("语言/Language"),
 }
 
 data class UiActions(
+    val setLanguage: (io.github.offlineglass.config.ManagerLanguage) -> Unit,
     val setUiMode: (UiMode) -> Unit,
     val setColorMode: (ColorMode) -> Unit,
     val setDynamicColor: (Boolean) -> Unit,
     val setLiquidGlassEnabled: (Boolean) -> Unit,
+    val setFrostedGlassEnabled: (Boolean) -> Unit,
 
     val setSolidBarEnabled: (Boolean) -> Unit,
     val setOutlineEnabled: (Boolean) -> Unit,

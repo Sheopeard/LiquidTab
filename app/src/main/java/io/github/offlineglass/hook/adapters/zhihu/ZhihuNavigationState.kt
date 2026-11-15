@@ -8,7 +8,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
@@ -16,7 +16,11 @@ import io.github.offlineglass.hook.adapters.AppNavigationState
 /** Projects only named native artwork into independent fixed glass slots. */
 internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavigationState {
     private data class Item(val custom: View, val icon: View?, val animation: View?, val avatar: View?,
-        val label: TextView?, val badges: List<View>)
+        val label: TextView?, val badges: List<View>,
+        val idleArtwork: android.graphics.drawable.Drawable?, val selectedArtwork: android.graphics.drawable.Drawable?)
+    private val actionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeCap = Paint.Cap.ROUND }
+    private val selectedState = intArrayOf(android.R.attr.state_enabled, android.R.attr.state_selected)
+    private val idleState = intArrayOf(android.R.attr.state_enabled, -android.R.attr.state_selected)
     private var source: ViewGroup? = null
     private var items = emptyList<Item?>()
     private var refreshAt = 0L
@@ -122,10 +126,21 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
         items = (0 until count).map { index ->
             val tab = source?.let { call(it, "getTabAt", index) } ?: return@map null
             val custom = call(tab, "getCustomView") as? View ?: return@map null
+            // The native ImageView already owns the themed state-list and tint.
+            // Clone that public drawable rather than reaching into its model.
+            val nativeIcon = find(custom, "tab_icon") as? android.widget.ImageView
+            val artwork = nativeIcon?.drawable
+            val tint = nativeIcon?.imageTintList
+            fun copyArtwork(selected: Boolean): android.graphics.drawable.Drawable? =
+                artwork?.constantState?.newDrawable(custom.resources)?.mutate()?.apply {
+                    if (tint != null) setTintList(tint)
+                    state = if (selected) selectedState else idleState
+                    jumpToCurrentState()
+                }
             Item(custom, find(custom, "tab_icon"), find(custom, "tab_icon_lav"), find(custom, "avatar"),
                 find(custom, "tab_title") as? TextView,
                 listOfNotNull(find(custom, "tab_badge_with_count"), find(custom, "tab_badge_with_text"),
-                    find(custom, "tab_badge_without_count")))
+                    find(custom, "tab_badge_without_count")), copyArtwork(false), copyArtwork(true))
         }
     }
 
@@ -154,12 +169,55 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
     private fun call(target: Any, name: String, vararg args: Any): Any? =
         runCatching { XposedHelpers.callMethod(target, name, *args) }.getOrNull()
 
+
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
+        if (!frame.hideSelectedForOptics) drawDetachedPublish(canvas, frame)
         for ((visual, index) in frame.enabledIndices.withIndex()) {
-            if (frame.hideSelectedForOptics && index == frame.selectedIndex) continue
+            // The lens samples every native slot, including the selected one.
+            // Foreground clipping, rather than index omission, prevents duplicates.
             drawSlot(canvas, index, 4f * frame.density + (visual + 0.5f) * frame.slotWidth,
                 frame.height / 2f, frame, frame.extraScale)
         }
+    }
+
+    private fun drawDetachedPublish(canvas: Canvas, frame: AdapterNavigationFrame) {
+        val layout = frame.barLayout?.takeIf { it.actionIndex == 2 } ?: return
+        val cx = layout.actionLeft + layout.actionSize / 2f
+        val cy = frame.height / 2f
+        val half = minOf(10f * frame.density * frame.iconScale, layout.actionSize * 0.22f)
+        actionPaint.color = android.graphics.Color.WHITE
+        actionPaint.strokeWidth = 3f * frame.density
+        actionPaint.style = Paint.Style.STROKE
+        canvas.drawLine(cx - half, cy, cx + half, cy, actionPaint)
+        canvas.drawLine(cx, cy - half, cx, cy + half, actionPaint)
+    }
+
+    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = true
+
+    override fun drawForeground(canvas: Canvas, frame: AdapterNavigationFrame,
+        selectionPath: android.graphics.Path, drawSource: () -> Unit): Boolean {
+        val mix = frame.navigationOpticalMix.coerceIn(0f, 1f)
+        if (mix <= 0f || selectionPath.isEmpty) {
+            drawSource()
+            return true
+        }
+        // Clip by the moving lens geometry, including partially crossed slots.
+        // Its inside copy already carries press scale and shader refraction.
+        val outside = canvas.save()
+        try {
+            canvas.clipOutPath(selectionPath)
+            drawSource()
+        } finally { canvas.restoreToCount(outside) }
+        if (mix < 1f) {
+            val inside = canvas.save()
+            try {
+                canvas.clipPath(selectionPath)
+                canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+                    ((1f - mix) * 255f).toInt())
+                drawSource()
+            } finally { canvas.restoreToCount(inside) }
+        }
+        return true
     }
 
     override fun drawFixedNavigationSlot(canvas: Canvas, index: Int, selectedIndex: Int,
@@ -203,7 +261,19 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
                 val scale = iconSize / maxOf(it.width, it.height).coerceAtLeast(1)
                 val x = centerX - it.width * scale / 2f
                 val y = top + (iconSize - it.height * scale) / 2f
-                drawLeaf(canvas, it, x, y, scale)
+                val artwork = if (frame.hideSelectedForOptics) item.selectedArtwork else item.idleArtwork
+                if (it !== item.avatar && artwork != null) {
+                    val leaf = canvas.save()
+                    try {
+                        canvas.translate(x, y)
+                        canvas.scale(scale, scale)
+                        artwork.setBounds(0, 0, it.width, it.height)
+                        artwork.draw(canvas)
+                    } finally { canvas.restoreToCount(leaf) }
+                } else {
+                    // Avatars remain live Fresco content; do not flatten/tint them.
+                    drawLeaf(canvas, it, x, y, scale)
+                }
                 it.getLocationInWindow(iconPosition)
                 for (badge in item.badges) {
                     if (badge.visibility != View.VISIBLE || badge.width <= 0 || badge.height <= 0) continue
@@ -213,7 +283,8 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
                 }
             }
             label?.let {
-                labelPaint.color = it.currentTextColor
+                labelPaint.color = it.textColors.getColorForState(
+                    if (frame.hideSelectedForOptics) selectedState else idleState, it.textColors.defaultColor)
                 canvas.drawText(it.text.toString(), centerX, labelBaseline, labelPaint)
             }
         } finally { canvas.restoreToCount(save) }

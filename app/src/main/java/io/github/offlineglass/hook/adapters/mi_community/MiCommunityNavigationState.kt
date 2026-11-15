@@ -3,7 +3,7 @@ package io.github.offlineglass.hook.adapters.mi_community
 import android.content.Context
 import android.os.SystemClock
 import android.webkit.WebView
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import kotlin.math.abs
 import android.graphics.BlendMode
 import android.graphics.BlendModeColorFilter
@@ -15,7 +15,7 @@ import android.graphics.RectF
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import kotlin.math.roundToInt

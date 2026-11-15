@@ -1,5 +1,6 @@
 package io.github.offlineglass.hook.adapters.netease
 
+
 import android.graphics.*
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
@@ -9,8 +10,8 @@ import android.view.View
 import android.graphics.RenderEffect
 import android.graphics.RenderNode
 import android.graphics.RuntimeShader
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.BloomTiltTracker
 import io.github.offlineglass.hook.setBottomBarSquircle
 import java.lang.ref.WeakReference
@@ -188,12 +189,14 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
     private val opticalNode = RenderNode("NeteasePlayerOptics")
 
-    private val lens = runCatching { RuntimeShader(shaderSource) }.getOrNull()
+    private val lens = runCatching { io.github.offlineglass.rendering.PostureGlass.shader(shaderSource) }.getOrNull()
 
     private val sourceLocation = IntArray(2)
 
     private val targetLocation = IntArray(2)
 
+    private var postureEnabled = true
+    private var liquidViscosity = 25f
     private var opticalSignature = ""
 
     private var opticalSceneSignature = ""
@@ -289,6 +292,11 @@ internal class NeteaseMiniPlayerGlassDrawable(
         this.scene = scene
 
         this.blurTarget = target
+        val opticalConfig = io.github.offlineglass.hook.HookConfigReader.read(target.context, target.context.packageName)
+        postureEnabled = opticalConfig.postureEffectsEnabled
+        liquidViscosity = opticalConfig.liquidViscosity
+        io.github.offlineglass.rendering.LiquidMotion.configure(target,
+            opticalConfig.flowHorizontalStrength, opticalConfig.flowVerticalStrength)
 
         this.blurRadius = blurRadius
 
@@ -378,9 +386,12 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
         val sourceIdentity = System.identityHashCode(sourceNode)
 
+        io.github.offlineglass.rendering.PostureGlass.track(target, postureEnabled && liquidGlassEnabled)
+        lens?.let { io.github.offlineglass.rendering.PostureGlass.sync(it, target, postureEnabled && liquidGlassEnabled, liquidViscosity) }
         val signature = "$w/$h/$pad/$blurRadius/$radiusPercent/$liquidGlassEnabled"
 
-        if (signature != opticalSignature) {
+        val postureChanged = lens?.let { io.github.offlineglass.rendering.PostureGlass.effectChanged(it) } == true
+        if (signature != opticalSignature || postureChanged) {
 
             var effect: RenderEffect? = io.github.offlineglass.rendering.NativeBackdropBlur.effect(blurRadius)
 
@@ -389,6 +400,8 @@ internal class NeteaseMiniPlayerGlassDrawable(
                 shader.setFloatUniform("size", w.toFloat(), h.toFloat())
 
                 shader.setFloatUniform("offset", -pad.toFloat(), -pad.toFloat())
+                shader.setFloatUniform("safeSampleBounds", pad + 0.5f, pad + 0.5f,
+                    pad + w - 0.5f, pad + h - 0.5f)
 
                 val corner = min(w, h) * radiusPercent / 100f
 
@@ -399,7 +412,6 @@ internal class NeteaseMiniPlayerGlassDrawable(
                 shader.setFloatUniform("refractionAmount", -24f * displayDensity)
 
                 shader.setFloatUniform("depthEffect", 0f)
-
                 val refraction = RenderEffect.createRuntimeShaderEffect(shader, "content")
 
                 effect = effect?.let { RenderEffect.createChainEffect(refraction, it) } ?: refraction
@@ -590,7 +602,12 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
             canvas.clipOutPath(path)
 
-            canvas.drawPath(path, shadowPaint)
+            val poseView = blurTarget
+            if (poseView != null && postureEnabled && liquidGlassEnabled)
+                io.github.offlineglass.rendering.PostureGlass.shadow(canvas, poseView, rect) {
+                    canvas.drawPath(path, shadowPaint)
+                }
+            else canvas.drawPath(path, shadowPaint)
 
             canvas.restore()
 
@@ -774,9 +791,9 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
         if (primary) {
 
-            var gx = BloomTiltTracker.gravityX
+            var gx = if (postureEnabled) BloomTiltTracker.gravityX else 0f
 
-            var gy = BloomTiltTracker.gravityY
+            var gy = if (postureEnabled) BloomTiltTracker.gravityY else 0f
 
             val displayRotation = blurTarget?.display?.rotation ?: Surface.ROTATION_0
 

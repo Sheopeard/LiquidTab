@@ -7,7 +7,19 @@ import android.view.Gravity
 
 /** JD-specific policy flags live here; shared rendering remains package-agnostic. */
 internal object JdAdapter : TargetAdapter {
+    override val flowingLiquidEnabled = false
     override val key = "jd"
+    override fun onConfigurationReady(context: android.content.Context,
+        param: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam) {
+        if (param.processName == param.packageName) {
+            JdNavigationClickGate.prepare(context, param.classLoader)
+            JdHomeColdBatch.configure(context)
+        }
+    }
+    // Keep native slot identities: hiding Browse must not renumber cart/messages.
+    // No native click or preview capture is requested for this disabled entry.
+    override fun isNavigationEntryDisabled(index: Int, slots: Int): Boolean =
+        slots == 5 && index == 1
     override val honorsBackdropCaptureSetting = true
     override val ownsNavigationDrawing = true
     override val navigationBehindIndicator = true
@@ -16,7 +28,13 @@ internal object JdAdapter : TargetAdapter {
     override val supportsScheduledNavigationSnapshotRefresh = true
     override val navigationSnapshotStableFrames = 1
     override val navigationSignatureMaxDepth = 12
-    override val usesCommittedSelection = true
+    override val usesCommittedSelection = false
+    override val nativeSelectionReliable = true
+    // JD rebuilds NavigationGroup while committing a destination page. Keep
+    // the already-rendered host alive across that bounded detach/rebind gap.
+    override val sourceSwapGraceMs = 1_200L
+    override val ownsNavigationTap = true
+    override val commitSelectionAfterTap = false
     override val usesContentDarkMode = true
     override val ownsOpticalSurfaceLayout = true
     override val redrawSurfaceAfterNavigationCapture = true
@@ -25,11 +43,28 @@ internal object JdAdapter : TargetAdapter {
         context: Context, host: io.github.offlineglass.hook.GlassHostLayout,
     ): AppNavigationState = JdNavigationState(host)
     override fun installHooks(
-        lpparam: de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam,
+        lpparam: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam,
         spec: io.github.offlineglass.targets.TargetSpec,
-    ) = JdScrollSignals.install(lpparam.classLoader)
+    ) {
+        JdScrollSignals.install(lpparam.classLoader)
+        JdStartupAds.install(lpparam.classLoader)
+        JdClassicLayout.install(lpparam.classLoader)
+        JdNavigationBootstrap.install(lpparam.classLoader, spec)
+        JdNativePageTransitions.install(lpparam.classLoader)
+        JdFragmentProbeReuse.install(lpparam.classLoader)
+        // Message staging was measured on-device: only ~12ms moved while
+        // adding ~358ms content wait. Keep that pilot/trace hooks inactive.
+        JdMessageClassLookup.install(lpparam.classLoader)
+        JdHomeColdBatch.install(lpparam.classLoader)
+        // The earlier global stack-deferral experiment regressed on-device.
+        // Keep JdClassProbeStacks inactive: no Throwable/bootstrap interception.
+        // Message lookup above is separate, scoped to its verified own DEX.
+        JdHiddenPageWork.install(lpparam.classLoader)
+    }
 
     override val reuseOpticalBlur = true
+    override val retainsLiveOpticalBlur = true
+    override val keepsBackdropDuringTapTransition = true
     override val allowsSystemBackgroundBlur = false
     override val countsOpticalCompositorCopies = true
     override val deferOpticalRenderDuringBarAnimation = true
@@ -40,7 +75,8 @@ internal object JdAdapter : TargetAdapter {
     override val retainsOpticalSurfaceWhenBarHidden = true
     override val opticalSurfaceFollowsBarTransform = false
     override val usesDirectOpticalBackdropMode = true
-    // JD always uses compositor pixels and the shared GPU blur. Native window
+    // JD uses live GPU nodes for verified native pages and compositor pixels
+    // for independently composed pages. Native window
     // blur is disabled here: even its invisible helper Views cause layout and
     // RenderEffect invalidations when configured on each host pre-draw.
     override val usesNativeOpticalBlur = false

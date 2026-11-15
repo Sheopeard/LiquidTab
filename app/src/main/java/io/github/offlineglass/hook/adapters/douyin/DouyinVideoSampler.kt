@@ -95,6 +95,15 @@ internal class DouyinVideoSampler(
         // probe slot when its surface is still usable, otherwise walk forward.
         if (now - lastDouyinVideoScanAt < DOUYIN_VIDEO_FIND_INTERVAL_MS) {
             selectDouyinVideoProbe()?.let { return it }
+            // A list page has no player: cache that negative result too.
+            // Previously an empty candidate list forced a full scan every frame.
+            // Native textures are checked before this method; holder callbacks
+            // still invalidate the interval immediately when a player changes.
+            val texture = douyinVideoTextureView
+            if (douyinVideoCandidates.isEmpty() && (texture == null ||
+                    texture.isAttachedToWindow && texture.isShown && texture.isAvailable)) {
+                return null
+            }
             // A swipe can detach the old SurfaceView before the one for the
             // next item is attached. Do not wait out the one-second scan window.
             lastDouyinVideoScanAt = 0L
@@ -321,7 +330,8 @@ internal class DouyinVideoSampler(
 
         // Registered native player textures are part of the ordinary live GPU
         // scene. Capturing them would reintroduce the readback latency.
-        if (DouyinPlayerTextureHooks.activeTexture(host) != null) {
+        if (DouyinPlayerTextureHooks.activeTexture(host) != null ||
+            DouyinPlayerTextureHooks.nativeSceneVisible(host)) {
             if (!nativeTextureActive) {
                 nativeTextureActive = true
                 captureGeneration++

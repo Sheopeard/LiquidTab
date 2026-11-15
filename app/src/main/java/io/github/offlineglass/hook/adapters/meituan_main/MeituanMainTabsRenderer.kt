@@ -8,9 +8,9 @@ import android.graphics.RectF
 import android.os.SystemClock
 import android.view.ViewGroup
 
-/** Meituan paints its tabs in custom c1 Views, including the text. */
+/** Native semantic glyph snapshots; independent of obfuscated implementation names. */
 internal class MeituanMainTabsRenderer {
-    private data class Parts(val icon: Rect, val label: Rect?, val slotCenter: Float)
+    private data class Parts(val icon: Rect, val label: Rect?, val iconCenter: Float, val labelCenter: Float?)
     private var bitmap: Bitmap? = null
     private var parts = emptyList<Parts?>()
     private var nextMeasure = 0L
@@ -71,30 +71,49 @@ internal class MeituanMainTabsRenderer {
             // complete artwork and notification badges. Never crop the centre icon.
             val labelBand = bands.last().takeIf { bands.size >= 2 && it.first > height * .5f }
             val iconEnd = if (labelBand != null) bands[bands.lastIndex - 1].last + 1 else rows.last() + 1
-            val icon = Rect(left, rows.first(), right, iconEnd)
-            val label = labelBand?.let { Rect(left, it.first, right, it.last + 1) }
-            Parts(icon, if (index == 2) null else label, (left + right) / 2f)
+            fun visibleBounds(top: Int, bottom: Int): Rect? {
+                var minX = right
+                var maxX = left - 1
+                var minY = bottom
+                var maxY = top - 1
+                for (y in top until bottom) for (x in left until right) {
+                    if ((pixels[y * width + x] ushr 24) > 32) {
+                        minX = minOf(minX, x); maxX = maxOf(maxX, x)
+                        minY = minOf(minY, y); maxY = maxOf(maxY, y)
+                    }
+                }
+                return if (maxX >= minX) Rect(minX, minY, maxX + 1, maxY + 1) else null
+            }
+            val icon = visibleBounds(rows.first(), iconEnd) ?: return@map null
+            val label = labelBand?.let { visibleBounds(it.first, it.last + 1) }
+            // Preserve the native slot axis. Asymmetric badges must not drag
+            // the icon sideways, independently in selected/unselected images.
+            val axis = (left + right) / 2f
+            Parts(icon, if (index == 2) null else label,
+                if (index == 2) icon.exactCenterX() else axis, label?.let { axis })
         }
     }
 
     fun draw(canvas: Canvas, index: Int, centerX: Float, centerY: Float,
-        projectedScale: Float): Boolean {
+        projectedScale: Float, maxIconSize: Float = Float.POSITIVE_INFINITY): Boolean {
         val snapshot = bitmap?.takeUnless { it.isRecycled } ?: return false
         val tab = parts.getOrNull(index) ?: return false
         if (projectedScale <= 0f) return false
         val textScale = projectedScale * 1.2f
-        val iconScale = textScale * if (index == 2) 1.12f else 1.15f
+        val iconScale = minOf(textScale * if (index == 2) 1.12f else 1.15f,
+            maxIconSize / tab.icon.width(), maxIconSize / tab.icon.height())
         // Keep the previous projected icon/text gap; enlarge only the artwork.
         val gap = tab.label?.let { (it.top - tab.icon.bottom).coerceAtLeast(0) * projectedScale } ?: 0f
         val total = tab.icon.height() * iconScale + (tab.label?.height() ?: 0) * textScale + gap
         val top = centerY - total / 2f
-        fun drawPart(rect: Rect, y: Float, scale: Float) {
-            destination.set(centerX + (rect.left - tab.slotCenter) * scale, y,
-                centerX + (rect.right - tab.slotCenter) * scale, y + rect.height() * scale)
+        fun drawPart(rect: Rect, sourceCenter: Float, y: Float, scale: Float) {
+            destination.set(centerX + (rect.left - sourceCenter) * scale, y,
+                centerX + (rect.right - sourceCenter) * scale, y + rect.height() * scale)
             canvas.drawBitmap(snapshot, rect, destination, paint)
         }
-        drawPart(tab.icon, top, iconScale)
-        tab.label?.let { drawPart(it, top + tab.icon.height() * iconScale + gap, textScale) }
+        drawPart(tab.icon, tab.iconCenter, top, iconScale)
+        tab.label?.let { drawPart(it, tab.labelCenter ?: tab.iconCenter,
+            top + tab.icon.height() * iconScale + gap, textScale) }
         return true
     }
 

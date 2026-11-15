@@ -34,6 +34,33 @@ internal class JdChromeFinder(private val host: GlassHostLayout) {
             val view = stack.removeLast()
             if (view === host || view is GlassHostLayout || view is AdapterOwnedOverlay) continue
             if (view.visibility != View.VISIBLE || view.alpha <= 0.05f) continue
+            // Taro adds/removes a loading sibling around its footer. Its last
+            // child order is not a readiness signal; use the verified TDTextView
+            // labels to recognize the footer on the first mounted frame.
+            if (view.javaClass.name == "com.taro.core.react.views.text.TDTextView" &&
+                runCatching { view.javaClass.getMethod("getText").invoke(view)?.toString()?.contains("结算") == true }.getOrDefault(false)) {
+                var row = view.parent as? ViewGroup
+                var footer: ViewGroup? = null
+                repeat(6) {
+                    val candidate = row ?: return@repeat
+                    if (candidate.width >= rootWidth * .98f && candidate.height in 80..320 && !isInsideScrollContainer(candidate)) {
+                        val children = ArrayDeque<View>(); children += candidate
+                        var count = 0
+                        while (children.isNotEmpty() && count++ < 80) {
+                            val child = children.removeLast()
+                            val text = if (child is android.widget.TextView) child.text?.toString() else
+                                if (child.javaClass.name == "com.taro.core.react.views.text.TDTextView")
+                                    runCatching { child.javaClass.getMethod("getText").invoke(child)?.toString() }.getOrNull() else null
+                            if (text?.contains("全选") == true) { footer = candidate; break }
+                            if (child is ViewGroup) for (i in 0 until child.childCount) children += child.getChildAt(i)
+                        }
+                    }
+                    row = candidate.parent as? ViewGroup
+                }
+                // Hide the entire native footer shell, including its opaque
+                // parent background, rather than only its inner button row.
+                footer?.let { return it }
+            }
             if (view is ViewGroup && view.width >= rootWidth * 0.98f && view.height in 80..320) {
                 val location = IntArray(2).also(view::getLocationInWindow)
                 val bottom = location[1] + view.height
@@ -252,75 +279,35 @@ internal class JdChromeFinder(private val host: GlassHostLayout) {
 
      */
 
-    fun findBackToTopButton(root: ViewGroup, rootWidth: Int, rootHeight: Int): View? {
-
+    fun findBackToTopButtons(root: ViewGroup, rootWidth: Int, rootHeight: Int): List<View> {
         val stack = ArrayDeque<View>()
-
         stack += root
-
+        val candidates = ArrayList<View>()
+        val location = IntArray(2)
         var visited = 0
-
-        var best: View? = null
-
-        var bestBottom = -1
-
         while (stack.isNotEmpty() && visited++ < 900) {
-
             val view = stack.removeLast()
-
-            if (view === host || view is GlassHostLayout ||
-
-                view is AdapterOwnedOverlay
-
-            ) continue
-
-            if (view.visibility != View.VISIBLE || view.alpha <= 0.05f) continue
-
-            // Same cheap-first ordering: geometry only for near-square
-
-            // candidates that already pass the size checks.
-
-            val squareish = view is ViewGroup && view.width in 90..180 &&
-
-                view.height in 90..180 &&
-
-                kotlin.math.abs(view.width - view.height) <= 24
-
-            if (squareish) {
-
-                val location = IntArray(2).also(view::getLocationInWindow)
-
-                val right = location[0] + view.width
-
-                val bottom = location[1] + view.height
-
-                if (right >= rootWidth - 80 && bottom >= rootHeight * 0.5f &&
-
-                    !isInsideScrollContainer(view) && bottom > bestBottom
-
-                ) {
-
-                    best = view
-
-                    bestBottom = bottom
-
+            if (view === host || view is GlassHostLayout || view is AdapterOwnedOverlay ||
+                view.visibility != View.VISIBLE || view.alpha <= .05f) continue
+            if (view is ViewGroup) {
+                val name = view.javaClass.simpleName
+                if (name.contains("Scroll") || name.contains("Refresh") || name.contains("Recycler")) continue
+                if (view.width in 90..180 && view.height in 90..180 &&
+                    kotlin.math.abs(view.width - view.height) <= 24) {
+                    view.getLocationInWindow(location)
+                    if (location[0] + view.width >= rootWidth - 80 &&
+                        location[1] + view.height >= rootHeight * .5f && !isInsideScrollContainer(view)) {
+                        candidates += view
+                        // A nested wrapper is the same button, not another slot.
+                        continue
+                    }
                 }
-
-                for (index in view.childCount - 1 downTo 0) stack += view.getChildAt(index)
-
-            } else if (view is ViewGroup) {
-
-                for (index in view.childCount - 1 downTo 0) stack += view.getChildAt(index)
-
+                for (i in view.childCount - 1 downTo 0) stack += view.getChildAt(i)
             }
-
         }
-
-        return best
-
+        return candidates.sortedBy { it.getLocationInWindow(location); location[1] }
+            .takeLast(2)
     }
-
-
 
     private fun isInsideScrollContainer(view: View): Boolean {
         var node = view

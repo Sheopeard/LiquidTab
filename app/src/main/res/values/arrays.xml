@@ -15,6 +15,7 @@
         <item>com.xunmeng.pinduoduo</item>
         <item>com.taobao.taobao</item>
         <item>com.ss.android.ugc.aweme</item>
+        <item>com.zhiliaoapp.musically</item>
         <item>com.google.android.youtube</item>
         <item>com.android.mms</item>
         <item>com.tencent.mm</item>
@@ -27,6 +28,9 @@
         <item>com.autonavi.minimap</item>
         <item>com.supwisdom.xjtu</item>
         <item>com.zhihu.android</item>
+        <item>com.openai.chatgpt</item>
+        <item>com.instagram.android</item>
+        <item>com.quora.android</item>
         <item>com.eusoft.eudic</item>
         <item>com.hengye.share</item>
     </array>
