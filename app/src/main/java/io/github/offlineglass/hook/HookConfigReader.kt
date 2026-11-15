@@ -171,7 +171,7 @@ object HookConfigReader {
         runCatching {
             app.sendOrderedBroadcast(android.content.Intent(ConfigContract.ACTION_CONFIG_REQUEST)
                 .setComponent(android.content.ComponentName(MODULE_PACKAGE,
-                    "$MODULE_PACKAGE.config.ConfigRequestReceiver"))
+                    ConfigContract.CONFIG_REQUEST_RECEIVER))
                 .addFlags(android.content.Intent.FLAG_RECEIVER_FOREGROUND or
                     android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 .putExtra(ConfigContract.EXTRA_REQUEST_PACKAGE, packageName), null,
@@ -405,7 +405,7 @@ object HookConfigReader {
         outlineEnabled = defaults.outlineEnabled,
     ).normalized()
 
-    private const val MODULE_PACKAGE = "io.github.offlineglass"
+    private const val MODULE_PACKAGE = ConfigContract.MODULE_PACKAGE
     private const val QQ_PACKAGE = "com.tencent.mobileqq"
     private const val PREF_FILE = "offline_glass"
     private const val GLOBAL = "glass_"

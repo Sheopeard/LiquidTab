@@ -8,7 +8,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.offlineglass"
+        applicationId = "com.sheopeard.liquidtab"
         minSdk = 35
         targetSdk = 37
         versionCode = 223

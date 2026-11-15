@@ -1,9 +1,11 @@
 package io.github.offlineglass.config
 
 import android.net.Uri
+import io.github.offlineglass.BuildConfig
 
 object ConfigContract {
-    const val AUTHORITY = "io.github.offlineglass.settings"
+    const val MODULE_PACKAGE = BuildConfig.APPLICATION_ID
+    const val AUTHORITY = "$MODULE_PACKAGE.settings"
     val URI: Uri = Uri.parse("content://$AUTHORITY/config")
 
     const val METHOD_GET = "get"
@@ -14,10 +16,12 @@ object ConfigContract {
     const val METHOD_MI_MARKET_TAB_GET = "mi_market_tab_get"
     const val METHOD_MI_MARKET_TAB_SET = "mi_market_tab_set"
 
-    const val ACTION_CONFIG_REQUEST = "io.github.offlineglass.action.CONFIG_REQUEST"
-    const val ACTION_CONFIG_RESPONSE = "io.github.offlineglass.action.CONFIG_RESPONSE"
+    const val ACTION_CONFIG_REQUEST = "$MODULE_PACKAGE.action.CONFIG_REQUEST"
+    const val ACTION_CONFIG_RESPONSE = "$MODULE_PACKAGE.action.CONFIG_RESPONSE"
+    const val ACTION_DISABLE_TARGET_APP = "$MODULE_PACKAGE.action.DISABLE_TARGET_APP"
     const val EXTRA_REQUEST_PACKAGE = "request_package"
-    const val CONFIG_SYNC_PERMISSION = "io.github.offlineglass.permission.CONFIG_SYNC"
+    const val CONFIG_SYNC_PERMISSION = "$MODULE_PACKAGE.permission.CONFIG_SYNC"
+    const val CONFIG_REQUEST_RECEIVER = "io.github.offlineglass.config.ConfigRequestReceiver"
 
     const val KEY_PACKAGE = "package"
     const val KEY_REVISION = "config_revision"

@@ -6,12 +6,13 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.os.Process
+import io.github.offlineglass.config.ConfigContract
 
 /** Lets an already-hooked target process terminate itself after either master-switch transition. */
 object AppMasterSwitchReceiver {
-    const val ACTION_DISABLE_APP = "io.github.offlineglass.action.DISABLE_TARGET_APP"
+    const val ACTION_DISABLE_APP = ConfigContract.ACTION_DISABLE_TARGET_APP
     const val EXTRA_PACKAGE = "package"
-    const val SENDER_PERMISSION = "io.github.offlineglass.permission.CONFIG_SYNC"
+    const val SENDER_PERMISSION = ConfigContract.CONFIG_SYNC_PERMISSION
 
     @Volatile private var registered = false
 

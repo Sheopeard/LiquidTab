@@ -218,7 +218,7 @@ internal class TikTokNavigationState(private val host: io.github.offlineglass.ho
                 icons[i] = copyArtwork(drawable, icon?.colorFilter)
                 // Publish has a dedicated coloured asset shared with the Douyin solution.
                 if (i == 2 && icons[i] == null) icons[i] = runCatching {
-                    host.context.createPackageContext("io.github.offlineglass", android.content.Context.CONTEXT_IGNORE_SECURITY)
+                    host.context.createPackageContext(io.github.offlineglass.config.ConfigContract.MODULE_PACKAGE, android.content.Context.CONTEXT_IGNORE_SECURITY)
                         .assets.open("tiktok/publish.png").use(BitmapFactory::decodeStream)
                 }.getOrNull()
                 if (i == 2) updatePublishCenter(icons[i])

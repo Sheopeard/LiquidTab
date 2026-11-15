@@ -1,6 +1,6 @@
 # LiquidTab
 
-LiquidTab 是适用于 LSPosed 的 Android 液态底栏模块。2.1.0 包含模块管理界面、共享玻璃渲染和按应用组织的适配代码。应用 ID 保持为 `io.github.offlineglass`，以兼容既有安装和本地设置。
+LiquidTab 是适用于 LSPosed 的 Android 液态底栏模块。2.1.0 包含模块管理界面、共享玻璃渲染和按应用组织的适配代码。此分支版本应用 ID 修改为 `com.sheopeard.liquidtab`，并补充适配了欧陆词典与 Share。
 
 ## 特别致谢：kyant0 / AndroidLiquidGlass
 

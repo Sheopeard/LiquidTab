@@ -10446,7 +10446,7 @@ internal fun drawOuterGlass(canvas: Canvas) {
 
                             MODULE_PACKAGE,
 
-                            "$MODULE_PACKAGE.config.ConfigRequestReceiver",
+                            io.github.offlineglass.config.ConfigContract.CONFIG_REQUEST_RECEIVER,
 
                         ),
 
@@ -14251,7 +14251,7 @@ internal fun isDarkGlass(): Boolean {
 
         const val FILE_MANAGER_BOTTOM_NAV_ID = "bottom_navigation_container"
 
-        const val MODULE_PACKAGE = "io.github.offlineglass"
+        const val MODULE_PACKAGE = io.github.offlineglass.config.ConfigContract.MODULE_PACKAGE
 
         const val MEITUAN_TAKEOUT_PACKAGE = "com.sankuai.meituan.takeoutnew"
 

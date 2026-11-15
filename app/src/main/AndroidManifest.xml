@@ -2,9 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <permission
-        android:name="io.github.offlineglass.permission.CONFIG_SYNC"
+        android:name="${applicationId}.permission.CONFIG_SYNC"
         android:protectionLevel="signature" />
-    <uses-permission android:name="io.github.offlineglass.permission.CONFIG_SYNC" />
+    <uses-permission android:name="${applicationId}.permission.CONFIG_SYNC" />
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
@@ -46,7 +46,7 @@
 
         <provider
             android:name=".config.SettingsProvider"
-            android:authorities="io.github.offlineglass.settings"
+            android:authorities="${applicationId}.settings"
             android:directBootAware="true"
             android:exported="true"
             android:grantUriPermissions="false" />

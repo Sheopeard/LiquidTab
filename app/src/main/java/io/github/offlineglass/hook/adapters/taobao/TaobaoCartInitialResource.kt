@@ -141,7 +141,7 @@ internal object TaobaoCartInitialResource {
             val density=root.resources.displayMetrics.density
             val options=JSONObject().put("id",binding.id).put("viewportWidth",root.width).put("viewportHeight",root.height)
                 .put("buttonTop",hostLocation[1]-rootLocation[1]-io.github.offlineglass.hook.globalGlassBottomGapPx(host)/2f-48f*density).put("gap",8f*density)
-            val source=controllerSource ?: host.context.createPackageContext("io.github.offlineglass", 0).assets
+            val source=controllerSource ?: host.context.createPackageContext(io.github.offlineglass.config.ConfigContract.MODULE_PACKAGE, 0).assets
                 .open("taobao/cart-controller.js").bufferedReader().use{it.readText()}.also { controllerSource=it }
             val script=source.replace("__LIQUIDTAB_OPTIONS__",options.toString())
             binding.active=true

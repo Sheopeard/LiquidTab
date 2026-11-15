@@ -262,7 +262,7 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
     }
 
     private companion object {
-        const val MODULE_PACKAGE = "io.github.offlineglass"
+        const val MODULE_PACKAGE = io.github.offlineglass.config.ConfigContract.MODULE_PACKAGE
         const val TAB_CHANGED_ACTION = "com.sina.weibo.action.MAIN_TAB_CHANGED"
         const val ACCENT_COLOR = 0xFFFF8200.toInt(); const val DARK_LABEL_COLOR = 0xFF282828.toInt()
         const val BADGE_COLOR = 0xFFF04438.toInt(); const val ICON_SIZE_DP = 32.4f

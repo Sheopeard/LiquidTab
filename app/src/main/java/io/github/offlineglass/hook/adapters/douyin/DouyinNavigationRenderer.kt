@@ -238,7 +238,7 @@ internal class DouyinNavigationRenderer(private val context: Context) {
 
     private fun parsePath(data: String): Path = PathParser.createPathFromPathData(data) ?: Path()
 
-    private companion object { const val MODULE_PACKAGE = "io.github.offlineglass" }
+    private companion object { const val MODULE_PACKAGE = io.github.offlineglass.config.ConfigContract.MODULE_PACKAGE }
 }
 
 
