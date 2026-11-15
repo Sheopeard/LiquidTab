@@ -469,6 +469,8 @@ internal object TargetAdapterRegistry {
         CainiaoAdapter,
         XjtuAdapter,
         io.github.offlineglass.hook.adapters.zhihu.ZhihuAdapter,
+        io.github.offlineglass.hook.adapters.eudic.EudicAdapter,
+        io.github.offlineglass.hook.adapters.share.ShareAdapter,
     ).associateBy(TargetAdapter::key)
 
     private val byKey: Map<String, TargetAdapter> = TargetSpecRegistry.all.associate { spec ->
