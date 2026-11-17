@@ -19,6 +19,7 @@ internal class CainiaoNavigationState(private val glassHost: GlassHostLayout) : 
     private var surfaceRedrawPending = true
     private var outerBackdropDirty = true
     private var lastBackdropTab = -1
+    private var settleRetryCount = 0
 
     override fun outerBackdropNeedsRecord(
         backdrop: Bitmap?, width: Int, height: Int, hasDisplayList: Boolean,
@@ -111,6 +112,27 @@ internal class CainiaoNavigationState(private val glassHost: GlassHostLayout) : 
         }
     }
 
+    override fun onNavigationSelectionRequested(index: Int, slotCount: Int, now: Long): Boolean {
+        settleRetryCount = 0
+        return false
+    }
+
+    override fun inspectNavigationCaptureLabels(
+        source: ViewGroup,
+        hasSnapshot: Boolean,
+    ): io.github.offlineglass.hook.adapters.NavigationCaptureLabels? {
+        val tabs = CainiaoArtworkCapture.findVisibleTabs(source)
+        if (tabs.isEmpty() || CainiaoArtworkCapture.needsCaptureSettling(tabs)) {
+            if (settleRetryCount < 15) {
+                settleRetryCount++
+                return io.github.offlineglass.hook.adapters.NavigationCaptureLabels(emptyList(), retryDelayMs = 48L)
+            }
+        } else {
+            settleRetryCount = 0
+        }
+        return null
+    }
+
     override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
         val root = source ?: return null
         val tabs = CainiaoArtworkCapture.findVisibleTabs(root)
@@ -123,8 +145,8 @@ internal class CainiaoNavigationState(private val glassHost: GlassHostLayout) : 
             if (tab.slot.isActivated) score += 1
             if (tab.icon.isSelected) score += 3
             if (tab.icon.isActivated) score += 1
-            if (tab.label.isSelected) score += 2
-            if (tab.label.isActivated) score += 1
+            if (tab.label?.isSelected == true) score += 2
+            if (tab.label?.isActivated == true) score += 1
             if (score == 0) {
                 val stack = ArrayDeque<View>()
                 stack += tab.slot
@@ -186,5 +208,6 @@ internal class CainiaoNavigationState(private val glassHost: GlassHostLayout) : 
         surfaceRedrawPending = true
         outerBackdropDirty = true
         lastBackdropTab = -1
+        settleRetryCount = 0
     }
 }

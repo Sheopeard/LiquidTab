@@ -28,6 +28,8 @@ internal object CainiaoAdapter : TargetAdapter {
     override val forceCompositorFrames = true
     override val stagedNavigationSnapshot = true
     override val redrawSurfaceAfterNavigationCapture = true
+    override val projectedNavigationScale = 0.88f
+    override val selectionSettleMs = 280L
     override val observeWindowTouches = true
     override fun onWindowTouch(host: View, event: android.view.MotionEvent) {
         ((host as? GlassHostLayout)?.appNavigationState as? CainiaoNavigationState)?.onWindowTouch(event)

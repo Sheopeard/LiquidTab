@@ -13,19 +13,32 @@ internal object CainiaoArtworkCapture {
     private const val ENLARGEMENT = 1.2f
     private val labelIds = setOf("home_page_nav_tv_name", "tv_name")
     // Home's selected artwork is a 52dp two-state sprite clipped by a 25dp
-    // container with a separate blue background. Capture that container,
-    // including the native child's translation, rather than scaling the sprite.
-    private val iconIds = listOf("tabbar_container", "nav_tab_icon_static", "home_page_nav_nav_tab_icon_biz",
-        "home_page_nav_nav_tab_icon_animation_v81012", "home_page_nav_nav_tab_icon_animation",
-        "home_page_nav_nav_tab_icon", "nav_tab_icon")
+    // container with a separate blue background, or a 38dp rocket DraweeView
+    // inside tabbar_container_biz (while home_page_nav_tv_name is hidden).
+    private val iconIds = listOf(
+        "home_page_nav_nav_tab_icon_biz",
+        "tabbar_container_biz",
+        "tabbar_container",
+        "nav_tab_icon_static",
+        "home_page_nav_nav_tab_icon_animation_v81012",
+        "home_page_nav_nav_tab_icon_animation",
+        "home_page_nav_nav_tab_icon",
+        "nav_tab_icon",
+    )
     private val badgeIds = setOf("number_red_dots_textView", "redpoint_imageView")
 
-    internal data class Tab(val slot: ViewGroup, val icon: View, val label: TextView, val badges: List<View>)
+    internal data class Tab(
+        val slot: ViewGroup,
+        val icon: View,
+        val label: TextView?,
+        val semanticName: String,
+        val badges: List<View>,
+    )
 
-    private fun descendants(root: View): List<View> {
+    private fun descendants(root: View, includeInvisible: Boolean = false): List<View> {
         val result = ArrayList<View>()
         fun visit(view: View) {
-            if (view.visibility != View.VISIBLE) return
+            if (!includeInvisible && view.visibility != View.VISIBLE) return
             result += view
             if (view is ViewGroup) for (i in 0 until view.childCount) visit(view.getChildAt(i))
         }
@@ -33,43 +46,74 @@ internal object CainiaoArtworkCapture {
         return result
     }
 
-    /** Visible bottom tabs sorted left-to-right (tolerates FuckCainiao hiding middle tabs). */
+    /** Visible bottom tabs sorted left-to-right (tolerates FuckCainiao hiding tabs and Home hiding its label). */
     fun findVisibleTabs(source: ViewGroup): List<Tab> {
-        val all = descendants(source)
-        val labels = all.filterIsInstance<TextView>().filter { it.resourceName() in labelIds }
-        if (labels.size !in 2..7) return emptyList()
-        val tabs = labels.map { label ->
-            var parent = label.parent as? ViewGroup
-            var slotRoot: ViewGroup? = null
-            var iconView: View? = null
-            var badges: List<View> = emptyList()
-            while (parent != null && parent !== source) {
-                val children = descendants(parent)
-                if (children.count { it is TextView && it.resourceName() in labelIds } != 1) break
-                slotRoot = parent
-                if (iconView == null) {
-                    val found = iconIds.firstNotNullOfOrNull { id ->
-                        children.firstOrNull { it.resourceName() == id && it.width > 0 && it.height > 0 }
-                    }
-                    if (found != null) {
-                        iconView = found
-                        badges = children.filter { it.resourceName() in badgeIds }
-                    }
-                }
-                parent = parent.parent as? ViewGroup
+        val tabRow = (source.findNamedView("ll_navigation_tab_layout") as? ViewGroup) ?: source
+        val directSlots = (0 until tabRow.childCount)
+            .mapNotNull { tabRow.getChildAt(it) as? ViewGroup }
+            .filter { it.visibility == View.VISIBLE && it.width > 0 && it.height > 0 }
+        val tabs = ArrayList<Tab>(directSlots.size)
+        for (slot in directSlots) {
+            val visible = descendants(slot)
+            val icon = iconIds.firstNotNullOfOrNull { id ->
+                visible.firstOrNull { it.resourceName() == id && it.width > 0 && it.height > 0 }
+            } ?: continue
+            val visibleLabel = visible.filterIsInstance<TextView>()
+                .firstOrNull { it.resourceName() in labelIds && it.width > 0 && it.height > 0 && it.text.isNotBlank() }
+            val semanticName = visibleLabel?.text?.toString()
+                ?: descendants(slot, includeInvisible = true)
+                    .filterIsInstance<TextView>()
+                    .firstOrNull { it.resourceName() in labelIds && !it.text.isNullOrBlank() }
+                    ?.text?.toString()
+                ?: ""
+            tabs += Tab(slot, icon, visibleLabel, semanticName, visible.filter { it.resourceName() in badgeIds })
+        }
+        if (tabs.size !in 2..7) return emptyList()
+        val sorted = tabs.sortedBy { it.slot.screenPosition()[0] }
+        CainiaoAdapter.updateVisibleLabels(sorted.map { it.semanticName })
+        return sorted
+    }
+
+    /** Rejects snapshots mid 3D-flip or before Fresco/icon drawables finish populating. */
+    fun needsCaptureSettling(tabs: List<Tab>): Boolean {
+        for (tab in tabs) {
+            if (isViewUnstable(tab.slot) || isViewUnstable(tab.icon) || (tab.label != null && isViewUnstable(tab.label))) {
+                return true
             }
-            val slot = slotRoot ?: return emptyList()
-            val icon = iconView ?: return emptyList()
-            Tab(slot, icon, label, badges)
-        }.sortedBy { it.label.screenPosition()[0] }
-        CainiaoAdapter.updateVisibleLabels(tabs.map { it.label.text?.toString().orEmpty() })
-        return tabs
+            val visibleChildren = descendants(tab.icon)
+            if (visibleChildren.any(::isViewUnstable)) return true
+            if (tab.icon is android.widget.ImageView && tab.icon.drawable == null) return true
+            val imageLeaves = visibleChildren.filterIsInstance<android.widget.ImageView>()
+            if (imageLeaves.isNotEmpty() && imageLeaves.none { it.drawable != null }) return true
+        }
+        return false
+    }
+
+    private fun isViewUnstable(view: View): Boolean =
+        view.alpha < 0.85f ||
+            view.scaleX < 0.85f ||
+            view.scaleY < 0.85f ||
+            kotlin.math.abs(view.rotationY) > 5f ||
+            kotlin.math.abs(view.rotationX) > 5f
+
+    private fun sliceHasVisiblePixels(bitmap: Bitmap, leftPx: Int, rightPx: Int): Boolean {
+        val x0 = leftPx.coerceIn(0, bitmap.width)
+        val x1 = rightPx.coerceIn(x0, bitmap.width)
+        if (x1 <= x0 || bitmap.height <= 0) return false
+        val row = IntArray(x1 - x0)
+        val stepY = (bitmap.height / 24).coerceAtLeast(1)
+        var y = 0
+        while (y < bitmap.height) {
+            bitmap.getPixels(row, 0, x1 - x0, x0, y, x1 - x0, 1)
+            for (pixel in row) if ((pixel ushr 24) > 12) return true
+            y += stepY
+        }
+        return false
     }
 
     fun capture(source: ViewGroup, target: Bitmap, managerEnglishLabels: Boolean = false): Boolean {
         val tabs = findVisibleTabs(source)
-        if (tabs.size !in 2..7) return false
-        if (tabs.any { it.label.width <= 0 || it.label.height <= 0 }) return false
+        if (tabs.size !in 2..7 || needsCaptureSettling(tabs)) return false
         val canvas = Canvas(target)
         canvas.drawColor(android.graphics.Color.TRANSPARENT, BlendMode.CLEAR)
         val slotWidth = target.width / tabs.size.toFloat()
@@ -79,22 +123,34 @@ internal object CainiaoArtworkCapture {
             val icon = tab.icon
             val label = tab.label
             val oldIcon = icon.screenPosition()
-            val oldLabel = label.screenPosition()
+            val iconScale = if (label == null) {
+                val maxFit = (target.height * 0.72f) / (icon.height * icon.scaleY).coerceAtLeast(1f)
+                maxFit.coerceIn(0.85f, ENLARGEMENT)
+            } else {
+                ENLARGEMENT
+            }
             val baseIconHeight = icon.height * icon.scaleY
-            val baseLabelHeight = label.height * label.scaleY
-            val gap = (oldLabel[1] - oldIcon[1] - baseIconHeight).coerceAtLeast(0f)
-            val iconHeight = baseIconHeight * ENLARGEMENT
-            val labelHeight = baseLabelHeight * ENLARGEMENT
+            val baseLabelHeight = if (label != null) label.height * label.scaleY else 0f
+            val oldLabel = label?.screenPosition()
+            val gap = if (label != null && oldLabel != null) {
+                (oldLabel[1] - oldIcon[1] - baseIconHeight).coerceAtLeast(0f) * iconScale
+            } else 0f
+            val iconHeight = baseIconHeight * iconScale
+            val labelHeight = baseLabelHeight * iconScale
             val center = (index + 0.5f) * slotWidth
             val top = (target.height - iconHeight - gap - labelHeight) / 2f
             canvas.save()
+            val clipLeft = (index * slotWidth).toInt()
+            val clipRight = ((index + 1) * slotWidth).toInt()
             canvas.clipRect(index * slotWidth, 0f, (index + 1) * slotWidth, target.height.toFloat())
-            drawLeaf(canvas, icon, center, top, ENLARGEMENT)
-            drawLabel(canvas, label, center, top + iconHeight + gap, ENLARGEMENT,
-                if (managerEnglishLabels) NavigationLabelLocalization.toEnglish("cainiao", label.text.toString())
-                else label.text.toString())
+            drawLeaf(canvas, icon, center, top, iconScale)
+            if (label != null && label.width > 0 && label.height > 0 && label.text.isNotEmpty()) {
+                drawLabel(canvas, label, center, top + iconHeight + gap, iconScale,
+                    if (managerEnglishLabels) NavigationLabelLocalization.toEnglish("cainiao", label.text.toString())
+                    else label.text.toString())
+            }
             // Badge size and colour stay native; anchor follows the enlarged icon's top/right.
-            val newIconRight = center + icon.width * icon.scaleX * ENLARGEMENT / 2f
+            val newIconRight = center + icon.width * icon.scaleX * iconScale / 2f
             val dx = newIconRight - (oldIcon[0] - origin[0] + icon.width * icon.scaleX)
             val dy = top - (oldIcon[1] - sourceTop)
             tab.badges.forEach { badge ->
@@ -103,6 +159,7 @@ internal object CainiaoArtworkCapture {
                     pos[1] - sourceTop + dy, 1f)
             }
             canvas.restore()
+            if (!sliceHasVisiblePixels(target, clipLeft, clipRight)) return false
         }
         return true
     }
