@@ -20,7 +20,7 @@ internal object CainiaoArtworkCapture {
         "home_page_nav_nav_tab_icon", "nav_tab_icon")
     private val badgeIds = setOf("number_red_dots_textView", "redpoint_imageView")
 
-    private data class Tab(val icon: View, val label: TextView, val badges: List<View>)
+    internal data class Tab(val slot: ViewGroup, val icon: View, val label: TextView, val badges: List<View>)
 
     private fun descendants(root: View): List<View> {
         val result = ArrayList<View>()
@@ -33,31 +33,46 @@ internal object CainiaoArtworkCapture {
         return result
     }
 
-    fun capture(source: ViewGroup, target: Bitmap, managerEnglishLabels: Boolean = false): Boolean {
+    /** Visible bottom tabs sorted left-to-right (tolerates FuckCainiao hiding middle tabs). */
+    fun findVisibleTabs(source: ViewGroup): List<Tab> {
         val all = descendants(source)
         val labels = all.filterIsInstance<TextView>().filter { it.resourceName() in labelIds }
-        if (labels.size != 5) return false
+        if (labels.size !in 2..7) return emptyList()
         val tabs = labels.map { label ->
             var parent = label.parent as? ViewGroup
-            var tab: Tab? = null
+            var slotRoot: ViewGroup? = null
+            var iconView: View? = null
+            var badges: List<View> = emptyList()
             while (parent != null && parent !== source) {
                 val children = descendants(parent)
                 if (children.count { it is TextView && it.resourceName() in labelIds } != 1) break
-                val icon = iconIds.firstNotNullOfOrNull { id -> children.firstOrNull {
-                    it.resourceName() == id && it.width > 0 && it.height > 0
-                } }
-                if (icon != null) {
-                    tab = Tab(icon, label, children.filter { it.resourceName() in badgeIds })
-                    break
+                slotRoot = parent
+                if (iconView == null) {
+                    val found = iconIds.firstNotNullOfOrNull { id ->
+                        children.firstOrNull { it.resourceName() == id && it.width > 0 && it.height > 0 }
+                    }
+                    if (found != null) {
+                        iconView = found
+                        badges = children.filter { it.resourceName() in badgeIds }
+                    }
                 }
                 parent = parent.parent as? ViewGroup
             }
-            tab ?: return false
+            val slot = slotRoot ?: return emptyList()
+            val icon = iconView ?: return emptyList()
+            Tab(slot, icon, label, badges)
         }.sortedBy { it.label.screenPosition()[0] }
+        CainiaoAdapter.updateVisibleLabels(tabs.map { it.label.text?.toString().orEmpty() })
+        return tabs
+    }
+
+    fun capture(source: ViewGroup, target: Bitmap, managerEnglishLabels: Boolean = false): Boolean {
+        val tabs = findVisibleTabs(source)
+        if (tabs.size !in 2..7) return false
         if (tabs.any { it.label.width <= 0 || it.label.height <= 0 }) return false
         val canvas = Canvas(target)
         canvas.drawColor(android.graphics.Color.TRANSPARENT, BlendMode.CLEAR)
-        val slotWidth = target.width / 5f
+        val slotWidth = target.width / tabs.size.toFloat()
         val origin = source.screenPosition()
         val sourceTop = origin[1]
         tabs.forEachIndexed { index, tab ->

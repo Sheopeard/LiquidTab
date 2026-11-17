@@ -12,6 +12,6 @@ internal val targetSpec: TargetSpec = TargetSpec("cainiao", "com.cainiao.wireles
             idHints = setOf("navigation_bar_layout", "navigation_tab_view", "ll_navigation_tab_layout"),
             classHints = setOf("HomePageActivity", "LinearLayout", "FrameLayout"),
             textHints = setOf("首页", "发现", "购物券", "消息", "我的"),
-            preferredSlots = 5..5, supportsPostButton = false,
+            preferredSlots = 2..5, supportsPostButton = false,
             entryLabels = listOf("首页", "发现", "购物券", "消息", "我的"),
             defaultAccentColor = 0xFFFF6A00.toInt(), drawsNavigationInOptics = true)

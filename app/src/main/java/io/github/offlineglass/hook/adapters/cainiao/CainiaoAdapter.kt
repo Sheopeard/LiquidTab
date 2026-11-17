@@ -12,6 +12,13 @@ import io.github.offlineglass.hook.adapters.TargetAdapter
 
 internal object CainiaoAdapter : TargetAdapter {
     override val key = "cainiao"
+    private val OPTICAL_SURFACE_LABELS = setOf("发现", "购物券", "我的")
+    @Volatile private var visibleTabLabels: List<String> = emptyList()
+
+    fun updateVisibleLabels(labels: List<String>) {
+        if (labels.isNotEmpty()) visibleTabLabels = labels
+    }
+
     override val allowsSystemBackgroundBlur = false
     override val usesOpticalSurfacePipeline = true
     override val keepsOpticalSurfaceDuringBarAnimation = true
@@ -25,8 +32,11 @@ internal object CainiaoAdapter : TargetAdapter {
     override fun onWindowTouch(host: View, event: android.view.MotionEvent) {
         ((host as? GlassHostLayout)?.appNavigationState as? CainiaoNavigationState)?.onWindowTouch(event)
     }
-    override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean =
-        selectedIndex == 1 || selectedIndex == 2 || selectedIndex == 4
+    override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean {
+        val label = visibleTabLabels.getOrNull(selectedIndex)
+        if (label != null) return label in OPTICAL_SURFACE_LABELS
+        return selectedIndex == 1 || selectedIndex == 2 || selectedIndex == 4
+    }
     override fun needsContinuousOpticalSurfaceFrames(selectedIndex: Int): Boolean =
         isOpticalSurfaceTab(selectedIndex)
 

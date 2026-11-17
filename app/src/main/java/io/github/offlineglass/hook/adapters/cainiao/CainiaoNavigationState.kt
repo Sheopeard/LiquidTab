@@ -111,6 +111,64 @@ internal class CainiaoNavigationState(private val glassHost: GlassHostLayout) : 
         }
     }
 
+    override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
+        val root = source ?: return null
+        val tabs = CainiaoArtworkCapture.findVisibleTabs(root)
+        if (tabs.isEmpty()) return null
+        var bestIndex = -1
+        var bestScore = 0
+        tabs.forEachIndexed { index, tab ->
+            var score = 0
+            if (tab.slot.isSelected) score += 2
+            if (tab.slot.isActivated) score += 1
+            if (tab.icon.isSelected) score += 3
+            if (tab.icon.isActivated) score += 1
+            if (tab.label.isSelected) score += 2
+            if (tab.label.isActivated) score += 1
+            if (score == 0) {
+                val stack = ArrayDeque<View>()
+                stack += tab.slot
+                while (stack.isNotEmpty()) {
+                    val view = stack.removeLast()
+                    if (view.visibility != View.VISIBLE) continue
+                    if (view.isSelected) score += 2
+                    if (view.isActivated) score += 1
+                    if (view is ViewGroup) {
+                        for (i in 0 until view.childCount) stack += view.getChildAt(i)
+                    }
+                }
+            }
+            if (score > bestScore) {
+                bestScore = score
+                bestIndex = index
+            }
+        }
+        return bestIndex.takeIf { it >= 0 }
+    }
+
+    override fun dispatchNativeNavigationTap(
+        host: GlassHostLayout,
+        source: ViewGroup?,
+        index: Int,
+        slotCount: Int,
+    ): Boolean {
+        val root = source ?: return false
+        val tabs = CainiaoArtworkCapture.findVisibleTabs(root)
+        val tab = tabs.getOrNull(index) ?: return false
+        if (tab.slot.isClickable && tab.slot.performClick()) return true
+        val stack = ArrayDeque<View>()
+        stack += tab.slot
+        while (stack.isNotEmpty()) {
+            val view = stack.removeLast()
+            if (view.visibility != View.VISIBLE) continue
+            if (view !== tab.slot && view.isClickable && view.performClick()) return true
+            if (view is ViewGroup) {
+                for (i in view.childCount - 1 downTo 0) stack += view.getChildAt(i)
+            }
+        }
+        return false
+    }
+
     override fun captureNavigation(source: ViewGroup, target: Bitmap): Boolean =
         CainiaoArtworkCapture.capture(source, target, glassHost.config.managerEnglishNavigationLabels)
 
