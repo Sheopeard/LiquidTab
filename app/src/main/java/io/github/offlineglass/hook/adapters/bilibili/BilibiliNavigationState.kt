@@ -1,6 +1,7 @@
 package io.github.offlineglass.hook.adapters.bilibili
 
 import android.graphics.Rect
+import android.graphics.RectF
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
@@ -9,6 +10,10 @@ import android.view.ViewGroup
 import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import java.lang.ref.WeakReference
+import java.lang.reflect.Field
+import java.lang.reflect.Method
+import java.lang.reflect.Modifier
+import java.util.IdentityHashMap
 
 /** Native navigation owns page changes; glass only owns the gesture. */
 internal class BilibiliNavigationState : AppNavigationState {
@@ -93,10 +98,14 @@ internal class BilibiliNavigationState : AppNavigationState {
             selectionGetter = runCatching { current.javaClass.getMethod("getCurrentItem") }
                 .getOrNull()?.takeIf { it.returnType == Int::class.javaPrimitiveType }
         }
-        val method = selectionGetter ?: return null
-        cachedSelection = runCatching {
-            (method.invoke(current) as? Int)?.takeIf { it in 0 until slotCount && it != 2 }
-        }.getOrNull()
+        val method = selectionGetter
+        cachedSelection = if (method != null) {
+            runCatching {
+                (method.invoke(current) as? Int)?.takeIf { it in 0 until slotCount && it != 2 }
+            }.getOrNull()
+        } else {
+            resolveComposeSelectedIndex(current, slotCount)
+        }
         return cachedSelection
     }
 
@@ -205,9 +214,205 @@ internal class BilibiliNavigationState : AppNavigationState {
         return null
     }
 
+    private data class ComposeTabTarget(val bounds: RectF, val selected: Boolean)
+
+    private val composeMethods = HashMap<Pair<Class<*>, String>, Method?>()
+    private val composeConfigFields = HashMap<Class<*>, Field?>()
+    private val composeKeyNames = IdentityHashMap<Any, String?>()
+    private val composePropertyNames = setOf("OnClick", "Selected")
+    @Volatile private var pagerRef: WeakReference<View>? = null
+    @Volatile private var pagerClass: Class<*>? = null
+    @Volatile private var pagerCurrentItemMethod: Method? = null
+    @Volatile private var pagerAdapterMethod: Method? = null
+
+    private fun composeCall(value: Any, name: String): Any? {
+        val key = value.javaClass to name
+        if (!composeMethods.containsKey(key)) {
+            composeMethods[key] = value.javaClass.methods
+                .firstOrNull { it.name == name && it.parameterCount == 0 }
+                ?.apply { isAccessible = true }
+        }
+        return composeMethods[key]?.invoke(value)
+    }
+
+    private fun composeStructural(value: Any, role: String, accept: (Method) -> Boolean): Method? {
+        val key = value.javaClass to role
+        if (!composeMethods.containsKey(key)) {
+            composeMethods[key] = value.javaClass.methods
+                .filter { !Modifier.isStatic(it.modifiers) && accept(it) }
+                .singleOrNull()?.apply { isAccessible = true }
+        }
+        return composeMethods[key]
+    }
+
+    private fun composeConfigField(type: Class<*>): Field? {
+        if (!composeConfigFields.containsKey(type)) {
+            composeConfigFields[type] = type.fields.singleOrNull {
+                !Modifier.isStatic(it.modifiers) && Iterable::class.java.isAssignableFrom(it.type)
+            }
+        }
+        return composeConfigFields[type]
+    }
+
+    private fun composeTabTargets(source: ViewGroup, count: Int): List<ComposeTabTarget>? {
+        fun findComposeHost(view: View): View? {
+            if (view.javaClass.methods.any { it.name == "getSemanticsOwner" && it.parameterCount == 0 }) return view
+            if (view is ViewGroup) {
+                for (i in 0 until view.childCount) findComposeHost(view.getChildAt(i))?.let { return it }
+            }
+            return null
+        }
+        val host = findComposeHost(source) ?: return null
+        val owner = composeCall(host, "getSemanticsOwner") ?: return null
+        val root = composeCall(owner, "getUnmergedRootSemanticsNode")
+            ?: composeCall(owner, "getRootSemanticsNode")
+            ?: composeStructural(owner, "root") { it.parameterCount == 0 && composeConfigField(it.returnType) != null }
+                ?.invoke(owner)
+            ?: return null
+        val loader = source.javaClass.classLoader
+        val coordinatesApi = runCatching {
+            loader?.loadClass("androidx.compose.ui.layout.LayoutCoordinates")
+        }.getOrNull()
+        val boundsInRootMethod = coordinatesApi?.let { api ->
+            runCatching {
+                loader?.loadClass("androidx.compose.ui.layout.LayoutCoordinatesKt")?.getMethod("boundsInRoot", api)
+            }.getOrNull()
+        }
+        val sourceScreen = IntArray(2).also(source::getLocationOnScreen)
+        val hostScreen = IntArray(2).also(host::getLocationOnScreen)
+        val dx = (hostScreen[0] - sourceScreen[0]).toFloat()
+        val dy = (hostScreen[1] - sourceScreen[1]).toFloat()
+        val density = source.resources.displayMetrics.density
+        val minWidthPx = 20f * density
+        val minHeightPx = source.height * 0.35f
+        val found = ArrayList<ComposeTabTarget>(count)
+
+        fun readBounds(raw: Any): RectF? {
+            val rawBounds = composeCall(raw, "getBoundsInRoot") ?: coordinatesApi?.let { api ->
+                composeStructural(raw, "coordinates") { it.parameterCount == 0 && api.isAssignableFrom(it.returnType) }
+                    ?.invoke(raw)?.let { coords -> boundsInRootMethod?.invoke(null, coords) }
+            }
+            if (rawBounds != null) {
+                fun edge(name: String) = (composeCall(rawBounds, name) as? Number)?.toFloat() ?: 0f
+                return RectF(edge("getLeft") + dx, edge("getTop") + dy, edge("getRight") + dx, edge("getBottom") + dy)
+            }
+            val id = (composeCall(raw, "getId") as? Int) ?: raw.javaClass.fields.singleOrNull {
+                !Modifier.isStatic(it.modifiers) && it.type == Int::class.javaPrimitiveType
+            }?.let { runCatching { it.getInt(raw) }.getOrNull() } ?: return null
+            val info = host.accessibilityNodeProvider?.createAccessibilityNodeInfo(id) ?: return null
+            val rect = Rect()
+            info.getBoundsInScreen(rect)
+            info.recycle()
+            rect.offset(-sourceScreen[0], -sourceScreen[1])
+            return RectF(rect)
+        }
+
+        fun visit(raw: Any, depth: Int) {
+            if (depth > 24 || found.size > count * 4) return
+            val config = composeCall(raw, "getConfig") ?: composeConfigField(raw.javaClass)?.get(raw) ?: return
+            val iterator = composeCall(config, "iterator") as? Iterator<*> ?: return
+            var hasClick = false
+            var selected = false
+            while (iterator.hasNext()) {
+                val entry = iterator.next() as? Map.Entry<*, *> ?: continue
+                val key = entry.key ?: continue
+                if (!composeKeyNames.containsKey(key)) {
+                    composeKeyNames[key] = composeCall(key, "getName") as? String
+                        ?: key.javaClass.declaredFields.asSequence()
+                            .filter { !Modifier.isStatic(it.modifiers) && it.type == String::class.java }
+                            .mapNotNull { f -> runCatching { f.isAccessible = true; f.get(key) as? String }.getOrNull() }
+                            .firstOrNull { it in composePropertyNames }
+                        ?: composePropertyNames.firstOrNull { key.toString().endsWith(": $it") }
+                }
+                when (composeKeyNames[key]) {
+                    "OnClick" -> hasClick = true
+                    "Selected" -> if (entry.value == true) selected = true
+                }
+            }
+            if (hasClick) {
+                val bounds = readBounds(raw)
+                if (bounds != null && !bounds.isEmpty &&
+                    bounds.width() >= minWidthPx &&
+                    bounds.width() < source.width * 0.7f &&
+                    bounds.height() >= minHeightPx &&
+                    bounds.left >= -2f && bounds.right <= source.width + 2f
+                ) {
+                    found += ComposeTabTarget(bounds, selected)
+                    return
+                }
+            }
+            val children = composeCall(raw, "getReplacedChildren") ?: composeCall(raw, "getChildren")
+                ?: composeStructural(raw, "children") {
+                    List::class.java.isAssignableFrom(it.returnType) && it.parameterCount in 2..3 &&
+                        it.parameterTypes.all { type -> type == Boolean::class.javaPrimitiveType }
+                }?.let { m -> m.invoke(raw, *Array<Any>(m.parameterCount) { false }) }
+                ?: composeStructural(raw, "replacedChildren") {
+                    List::class.java.isAssignableFrom(it.returnType) && it.parameterCount == 0
+                }?.invoke(raw)
+            (children as? List<*>)?.forEach { child -> if (child != null) visit(child, depth + 1) }
+        }
+
+        visit(root, 0)
+        if (found.size != count) return null
+        val sorted = found.sortedBy { it.bounds.left }
+        for (i in 0 until sorted.lastIndex) {
+            if (sorted[i].bounds.centerX() >= sorted[i + 1].bounds.left) return null
+        }
+        return sorted
+    }
+
+    private fun resolveComposeSelectedIndex(source: ViewGroup, slotCount: Int): Int? {
+        composeTabTargets(source, slotCount)?.let { tabs ->
+            tabs.forEachIndexed { index, tab ->
+                if (tab.selected && index != BilibiliAdapter.PUBLISH_INDEX) return index
+            }
+        }
+        if (slotCount != 5) return null
+        val root = source.rootView ?: return null
+        val pager = pagerRef?.get()?.takeIf { it.isAttachedToWindow && it.rootView === root }
+            ?: root.resources.getIdentifier("pager", "id", root.context.packageName)
+                .takeIf { it != 0 }
+                ?.let { id -> root.findViewById<View>(id) }
+                ?.also { pagerRef = WeakReference(it) }
+            ?: return null
+        if (pagerClass !== pager.javaClass) {
+            pagerClass = pager.javaClass
+            pagerCurrentItemMethod = runCatching { pager.javaClass.getMethod("getCurrentItem") }.getOrNull()
+            pagerAdapterMethod = runCatching { pager.javaClass.getMethod("getAdapter") }.getOrNull()
+        }
+        val adapter = runCatching { pagerAdapterMethod?.invoke(pager) }.getOrNull() ?: return null
+        val itemCount = runCatching { adapter.javaClass.getMethod("getItemCount").invoke(adapter) as? Int }.getOrNull()
+        if (itemCount != 4) return null
+        val page = runCatching { pagerCurrentItemMethod?.invoke(pager) as? Int }.getOrNull() ?: return null
+        return when (page) {
+            0, 1 -> page
+            2, 3 -> page + 1
+            else -> null
+        }
+    }
+
     private fun dispatchNativeTouch(source: ViewGroup, index: Int, count: Int): Boolean {
-        val x = source.width * (index + 0.5f) / count
-        val y = source.height / 2f
+        val target = composeTabTargets(source, count)?.getOrNull(index)
+        val (x, y) = if (target != null) {
+            target.bounds.centerX() to target.bounds.centerY()
+        } else {
+            // Bilibili 9.13+ HomeBottomTabContainer switches to centered 76.8dp slots
+            // spaced 24dp apart when WindowSizeClass is expanded (e.g. Bili Tablet Unlock).
+            val density = source.resources.displayMetrics.density
+            val itemWidthPx = 76.8f * density
+            val spacingPx = 24f * density
+            val groupWidthPx = count * itemWidthPx + (count - 1).coerceAtLeast(0) * spacingPx
+            val root = source.rootView
+            val winWidthDp = (root?.width?.takeIf { it > 0 } ?: source.width) / density
+            val winHeightDp = (root?.height?.takeIf { it > 0 } ?: source.resources.displayMetrics.heightPixels) / density
+            val centeredX = if (minOf(winWidthDp, winHeightDp) >= 600f && source.width >= groupWidthPx) {
+                val groupLeft = (source.width - groupWidthPx) / 2f
+                groupLeft + index * (itemWidthPx + spacingPx) + itemWidthPx / 2f
+            } else {
+                source.width * (index + 0.5f) / count
+            }
+            centeredX to (source.height / 2f)
+        }
         val now = SystemClock.uptimeMillis()
         fun send(action: Int, time: Long): Boolean {
             val event = MotionEvent.obtain(now, time, action, x, y, 0)
