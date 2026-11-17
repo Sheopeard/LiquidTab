@@ -127,7 +127,8 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
 
     override fun onDraw(canvas: Canvas) {
         val glass = host.get() ?: return
-        if (glass.adapterSelectedIndex != 3) return
+        val cartIndex = MeituanMainNativeTabs.cartIndex(glass.adapterNavigationSource, glass.adapterSlotCount)
+        if (glass.adapterSelectedIndex != cartIndex) return
         updateGeometry()
         if (rects.any { it.width() <= 0 || it.height() <= 0 }) return
         val density = resources.displayMetrics.density

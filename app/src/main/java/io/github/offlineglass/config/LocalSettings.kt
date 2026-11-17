@@ -268,6 +268,12 @@ object LocalSettings {
                     DouyinTopChannels.DEFAULT_PINS)
             changed = true
         }
+        // StartupPreferencesPolicy requires an explicit global glass decision in
+        // remote preferences; persist default enabled state on fresh installs.
+        if (!p.contains(ConfigContract.KEY_LIQUID_GLASS_ENABLED)) {
+            edit.putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, true)
+            changed = true
+        }
         // A first launch must export a versioned snapshot before any manual toggle.
         if (changed || !p.contains("revision")) {
             edit.putLong("revision", maxOf(System.currentTimeMillis(), p.getLong("revision", 0L) + 1L))

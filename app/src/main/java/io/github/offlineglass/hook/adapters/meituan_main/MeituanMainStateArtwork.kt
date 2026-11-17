@@ -48,12 +48,16 @@ internal class MeituanMainStateArtwork {
 
     fun prepare(row: ViewGroup?): Boolean {
         if (Looper.myLooper() != Looper.getMainLooper()) return false
-        if (row == null || row.childCount != 5 || row.width <= 0 || row.height <= 0)
+        if (row == null || row.childCount !in 4..5 || row.width <= 0 || row.height <= 0)
             return failed("native navigation source missing or not laid out")
         if (source !== row) { signature = Long.MIN_VALUE }
         val native = MeituanMainNativeTabs.bind(row) ?: return failed("native navigation binding unavailable")
+        val slotCount = row.childCount
+        val actionIndex = native.actionIndex
         val glyphs = native.cells.map { it.glyph }
+        val extras = native.cells.map { it.extraTabs }
         var key = row.width.toLong() * 31 + row.height
+        key = key * 31 + slotCount
         for (glyph in glyphs) {
             key = key * 31 + glyph.width
             key = key * 31 + glyph.height
@@ -72,6 +76,7 @@ internal class MeituanMainStateArtwork {
         if (attemptedSource === row && attemptedSignature == key) return false
         attemptedSource = row; attemptedSignature = key
         val selected = glyphs.map { it.isSelected }
+        val extraSelected = extras.map { list -> list.map { it.isSelected } }
         val alpha = row.alpha
         var restored = true
         val result = runCatching {
@@ -79,20 +84,26 @@ internal class MeituanMainStateArtwork {
             fun capture(active: Boolean): MeituanMainTabsRenderer {
                 glyphs.forEachIndexed { index, glyph ->
                     // Xiaotuan is a branded action: retain its complete native art.
-                    if (index != 2) setCaptureState(glyph, active)
+                    if (index != actionIndex) {
+                        setCaptureState(glyph, active)
+                        extras[index].forEach { extra -> runCatching { setCaptureState(extra, active) } }
+                    }
                 }
                 val bitmap = Bitmap.createBitmap(row.width, row.height, Bitmap.Config.ARGB_8888)
                 // The native wrapper owns delegated artwork/animation. Drawing
                 // its leaf directly bypasses that strategy and can yield blank art.
                 row.draw(Canvas(bitmap))
-                return MeituanMainTabsRenderer().apply { accept(bitmap, 5) }
+                return MeituanMainTabsRenderer().apply { accept(bitmap, slotCount, actionIndex) }
             }
             Pair(capture(false), capture(true), row.width, row.height)
         }
         try {
             glyphs.forEachIndexed { index, glyph ->
-                if (index != 2) try {
+                if (index != actionIndex) try {
                     setCaptureState(glyph, selected[index])
+                    extras[index].forEachIndexed { extraIdx, extra ->
+                        runCatching { setCaptureState(extra, extraSelected[index][extraIdx]) }
+                    }
                 } catch (error: Exception) {
                     restored = false
                     android.util.Log.e("MeituanBinding", "native selected-state restoration failed; takeover cancelled", error)
@@ -108,10 +119,11 @@ internal class MeituanMainStateArtwork {
     fun draw(canvas: Canvas, frame: AdapterNavigationFrame, active: Boolean) {
         val art = pair ?: return
         val renderer = if (active) art.active else art.idle
-        val scale = minOf(frame.slotWidth / (art.width / 5f), frame.height / art.height.toFloat()) * frame.extraScale
+        val divisor = frame.slotCount.coerceAtLeast(1).toFloat()
+        val scale = minOf(frame.slotWidth / (art.width / divisor), frame.height / art.height.toFloat()) * frame.extraScale
         frame.barLayout?.takeIf { !active }?.let { layout ->
             renderer.draw(canvas, layout.actionIndex, layout.actionLeft + layout.actionSize / 2f,
-                frame.height / 2f, minOf(layout.actionSize / (art.width / 5f),
+                frame.height / 2f, minOf(layout.actionSize / (art.width / divisor),
                     frame.height / art.height.toFloat()) * frame.extraScale,
                 maxIconSize = layout.actionSize * .78f)
         }

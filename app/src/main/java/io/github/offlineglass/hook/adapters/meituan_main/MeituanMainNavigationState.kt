@@ -32,7 +32,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         nativeSelected(source, slotCount)
 
     private fun nativeSelected(source: ViewGroup?, slotCount: Int): Int? {
-        if (slotCount != 5) return null
+        if (slotCount !in 4..5) return null
         val native = MeituanMainNativeTabs.bind(source) ?: return null
         return native.cells.withIndex().filter { it.value.glyph.isSelected }.singleOrNull()?.index
     }
@@ -41,7 +41,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         dispatchLive(source, index, slotCount)
 
     private fun dispatchLive(source: ViewGroup?, index: Int, count: Int): Boolean {
-        if (count != 5 || index !in 0 until count || index == 1) return false
+        if (count !in 4..5 || index !in 0 until count || (count == 5 && index == 1)) return false
         val button = MeituanMainNativeTabs.bind(source)?.cells?.getOrNull(index)?.button
             ?.takeIf { it.isAttachedToWindow && it.isEnabled } ?: return false
 
@@ -187,7 +187,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         }
         currentSelection = selected()
         val changed = prepareTakeover(source)
-        profileSafety.update(host, enabled && tabs.ready && currentSelection == 4)
+        profileSafety.update(host, enabled && tabs.ready && currentSelection == MeituanMainNativeTabs.profileIndex(source, (host as? GlassHostLayout)?.adapterSlotCount ?: 5))
         if (changed) (host as? GlassHostLayout)?.invalidateProjectionCache()
     }
     override fun forceNavigationBarImmersed(host: GlassHostLayout): Boolean? {
@@ -196,7 +196,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         val committed = nativeSelected(host.adapterNavigationSource, host.adapterSlotCount)
             ?: host.adapterSelectedIndex
         val profile = host.config.enabled && tabs.ready &&
-            committed == 4
+            committed == MeituanMainNativeTabs.profileIndex(host.adapterNavigationSource, host.adapterSlotCount)
         profileWindow.update(host, profile)
         return if (profile) true else null
     }

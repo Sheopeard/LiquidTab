@@ -19,9 +19,11 @@ internal class MeituanMainTabsRenderer {
     private val destination = RectF()
     private var preparedSource: ViewGroup? = null
 
+    private var actionSlotIndex = 2
+
     /** Do not fall back to the smaller generic projection while capture settles. */
     fun prepareFirstFrame(source: ViewGroup) {
-        if (source.width <= 0 || source.height <= 0 || source.childCount != 5) return
+        if (source.width <= 0 || source.height <= 0 || source.childCount !in 4..5) return
         if (preparedSource === source && bitmap?.isRecycled == false &&
             bitmap?.width == source.width && bitmap?.height == source.height) return
         val initial = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
@@ -30,7 +32,8 @@ internal class MeituanMainTabsRenderer {
             if (alpha < .01f) source.alpha = 1f
             source.draw(Canvas(initial))
             nextMeasure = 0L
-            accept(initial, source.childCount)
+            val actionIdx = MeituanMainNativeTabs.actionIndex(source, source.childCount)
+            accept(initial, source.childCount, actionIdx)
             preparedSource = source
         } finally {
             if (source.alpha != alpha) source.alpha = alpha
@@ -39,7 +42,8 @@ internal class MeituanMainTabsRenderer {
         // it after Canvas/RenderThread users release it rather than recycling early.
     }
 
-    fun accept(snapshot: Bitmap, count: Int) {
+    fun accept(snapshot: Bitmap, count: Int, actionIndex: Int = if (count == 4) 1 else 2) {
+        actionSlotIndex = actionIndex
         val previous = bitmap
         bitmap = snapshot
         val now = SystemClock.uptimeMillis()
@@ -89,8 +93,8 @@ internal class MeituanMainTabsRenderer {
             // Preserve the native slot axis. Asymmetric badges must not drag
             // the icon sideways, independently in selected/unselected images.
             val axis = (left + right) / 2f
-            Parts(icon, if (index == 2) null else label,
-                if (index == 2) icon.exactCenterX() else axis, label?.let { axis })
+            Parts(icon, if (index == actionIndex) null else label,
+                if (index == actionIndex) icon.exactCenterX() else axis, label?.let { axis })
         }
     }
 
@@ -100,7 +104,7 @@ internal class MeituanMainTabsRenderer {
         val tab = parts.getOrNull(index) ?: return false
         if (projectedScale <= 0f) return false
         val textScale = projectedScale * 1.2f
-        val iconScale = minOf(textScale * if (index == 2) 1.12f else 1.15f,
+        val iconScale = minOf(textScale * if (index == actionSlotIndex) 1.12f else 1.15f,
             maxIconSize / tab.icon.width(), maxIconSize / tab.icon.height())
         // Keep the previous projected icon/text gap; enlarge only the artwork.
         val gap = tab.label?.let { (it.top - tab.icon.bottom).coerceAtLeast(0) * projectedScale } ?: 0f

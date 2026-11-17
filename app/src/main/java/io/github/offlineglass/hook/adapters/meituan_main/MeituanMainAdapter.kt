@@ -37,18 +37,23 @@ internal object MeituanMainAdapter : TargetAdapter {
     override val sourceCenterActionIndex = 2
     override val suppressPlatformElevation = true
     override val continuousIndicatorMask = true
+    override fun isNavigationEntryDisabled(index: Int, slots: Int): Boolean = slots == 5 && index == 1
     override fun normalizeConfig(config: io.github.offlineglass.config.GlassConfig) =
-        config.copy(themeMode = io.github.offlineglass.config.GlassConfig.THEME_LIGHT, hiddenMask = config.hiddenMask or (1 shl 1), detachedPublish = config.meituanDetachedXiaotuan)
+        config.copy(themeMode = io.github.offlineglass.config.GlassConfig.THEME_LIGHT, detachedPublish = config.meituanDetachedXiaotuan)
     override fun barLayout(config: io.github.offlineglass.config.GlassConfig, width: Int,
         height: Int, density: Float, slots: Int): io.github.offlineglass.hook.adapters.AdapterBarLayout? {
-        if (!config.detachedPublish || slots != 5 || config.hiddenMask and 4 != 0 ||
+        if (!config.detachedPublish || slots !in 4..5 ||
             height <= 0 || width <= height + 12f * density) return null
-        val navigation = listOf(0, 3, 4).filter { config.hiddenMask and (1 shl it) == 0 }
+        val actionIdx = if (slots == 4) 1 else 2
+        if (config.hiddenMask and (1 shl actionIdx) != 0) return null
+        val navigation = (0 until slots).filter {
+            it != actionIdx && !(slots == 5 && it == 1) && config.hiddenMask and (1 shl it) == 0
+        }
         if (navigation.isEmpty()) return null
         val actionLeft = width - height.toFloat()
         return io.github.offlineglass.hook.adapters.AdapterBarLayout(
             mainWidth = actionLeft - 12f * density, actionLeft = actionLeft,
-            actionSize = height.toFloat(), actionIndex = 2, navigationIndices = navigation,
+            actionSize = height.toFloat(), actionIndex = actionIdx, navigationIndices = navigation,
         )
     }
     override val sourceDefaultTranslationDp = -6f

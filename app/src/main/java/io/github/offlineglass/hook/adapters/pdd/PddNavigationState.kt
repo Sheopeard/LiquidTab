@@ -36,15 +36,129 @@ internal class PddNavigationState : AppNavigationState {
     private val topActionBaseTranslations = java.util.WeakHashMap<View, Float>()
     private var topActionTarget: View? = null
     private var lastTopActionProbe = 0L
+    private var hasCompositorContent = false
+    private var lastCompositorProbe = 0L
+    private var compositorProbeDirty = true
+    private var compositorObservedRoot: View? = null
+    private var compositorObserver: android.view.ViewTreeObserver? = null
+    private val compositorScrollListener = android.view.ViewTreeObserver.OnScrollChangedListener {
+        compositorProbeDirty = true
+    }
+    private val compositorLayoutListener = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+        compositorProbeDirty = true
+    }
+    private val compositorClassCache = java.util.WeakHashMap<Class<*>, Boolean>()
+    private val probeRootRect = Rect()
+    private val probeChildRect = Rect()
 
     override fun onHostFrame(host: View) {
         activeHost = host as? GlassHostLayout
-        selectedIndex = activeHost?.adapterResolvedSelection()?.coerceIn(0, 4) ?: selectedIndex
+        val glass = activeHost
+        selectedIndex = glass?.adapterResolvedSelection()?.coerceIn(0, 4) ?: selectedIndex
         if (lastOpticalSelection == PROMOTION_INDEX && selectedIndex != PROMOTION_INDEX) {
-            activeHost?.updateOpticalSurfacePipeline(false)
-            activeHost?.invalidateOpticalBackdropForAdapter()
+            glass?.updateOpticalSurfacePipeline(false)
+            glass?.invalidateOpticalBackdropForAdapter()
+        }
+        if (lastOpticalSelection != selectedIndex) {
+            compositorProbeDirty = true
+            lastCompositorProbe = 0L
         }
         lastOpticalSelection = selectedIndex
+        if (glass != null) updateCompositorBackdropGuard(glass)
+    }
+
+    override fun skipLiveBackdrop(selectedIndex: Int): Boolean {
+        if (selectedIndex == PROMOTION_INDEX) return true
+        activeHost?.let { updateCompositorBackdropGuard(it) }
+        return hasCompositorContent
+    }
+
+    override fun onHostDetached() {
+        clearCompositorObserver()
+    }
+
+    private fun clearCompositorObserver() {
+        compositorObserver?.takeIf { it.isAlive }?.let {
+            it.removeOnScrollChangedListener(compositorScrollListener)
+            it.removeOnGlobalLayoutListener(compositorLayoutListener)
+        }
+        compositorObserver = null
+        compositorObservedRoot = null
+    }
+
+    private fun updateCompositorBackdropGuard(host: GlassHostLayout) {
+        val content = mainContent?.takeIf { it.isAttachedToWindow && it.isShown }
+        if (content == null) {
+            if (hasCompositorContent) {
+                hasCompositorContent = false
+            }
+            return
+        }
+        if (compositorObservedRoot !== content || compositorObserver?.isAlive != true) {
+            clearCompositorObserver()
+            compositorObservedRoot = content
+            compositorObserver = content.viewTreeObserver.also {
+                it.addOnScrollChangedListener(compositorScrollListener)
+                it.addOnGlobalLayoutListener(compositorLayoutListener)
+            }
+            compositorProbeDirty = true
+        }
+        val now = SystemClock.uptimeMillis()
+        if (!compositorProbeDirty && now - lastCompositorProbe < COMPOSITOR_PROBE_INTERVAL_MS) return
+        if (now - lastCompositorProbe < COMPOSITOR_PROBE_MIN_GAP_MS) return
+        compositorProbeDirty = false
+        lastCompositorProbe = now
+        val detected = containsVisibleCompositorSurface(content)
+        if (detected != hasCompositorContent) {
+            hasCompositorContent = detected
+            if (detected) {
+                host.invalidateOpticalSceneForAdapter()
+            } else {
+                host.invalidateProjectionCache()
+            }
+        }
+    }
+
+    private fun isCompositorView(view: View): Boolean {
+        if (view is android.view.SurfaceView || view is android.view.TextureView || view is android.webkit.WebView) {
+            return true
+        }
+        return compositorClassCache.getOrPut(view.javaClass) {
+            var current: Class<*>? = view.javaClass
+            var depth = 0
+            while (current != null && depth < 5) {
+                val lower = current.name.lowercase()
+                if (lower.contains("meco") || lower.contains("webview") || lower.contains("x5")) {
+                    return@getOrPut true
+                }
+                current = current.superclass
+                depth++
+            }
+            false
+        }
+    }
+
+    private fun containsVisibleCompositorSurface(root: View): Boolean {
+        if (!root.isShown || root.width <= 0 || root.height <= 0) return false
+        if (!root.getGlobalVisibleRect(probeRootRect)) return false
+        val stack = ArrayDeque<View>()
+        stack += root
+        var visited = 0
+        while (stack.isNotEmpty() && visited++ < MAX_COMPOSITOR_PROBE_NODES) {
+            val view = stack.removeLast()
+            if (view.visibility != View.VISIBLE || view.alpha <= .01f || view.width <= 0 || view.height <= 0) continue
+            // ViewPager keeps offscreen WebView/Meco pages with VISIBLE state;
+            // only disable live RenderNode sampling when one overlaps the viewport.
+            if (view !== root && (!view.getGlobalVisibleRect(probeChildRect) ||
+                    !Rect.intersects(probeRootRect, probeChildRect))) {
+                continue
+            }
+            if (isCompositorView(view)) return true
+            if (view is ViewGroup) {
+                for (i in view.childCount - 1 downTo 0) stack += view.getChildAt(i)
+            }
+        }
+        return false
     }
 
     override fun retainNavigationWhenNativeRowHidden(selectedIndex: Int): Boolean =
@@ -214,6 +328,9 @@ internal class PddNavigationState : AppNavigationState {
     }
 
     override fun dispose() {
+        clearCompositorObserver()
+        compositorClassCache.clear()
+        hasCompositorContent = false
         staticItems.forEachIndexed { index, bitmap -> bitmap?.takeUnless(Bitmap::isRecycled)?.recycle(); staticItems[index] = null }
         badgeItems.forEachIndexed { index, bitmap -> bitmap?.takeUnless(Bitmap::isRecycled)?.recycle(); badgeItems[index] = null }
         activeHost = null
@@ -281,5 +398,8 @@ internal class PddNavigationState : AppNavigationState {
         const val PROMOTION_INDEX = 2
         const val CONTENT_SCALE = .80f
         const val TOP_ACTION_PROBE_MS = 120L
+        const val COMPOSITOR_PROBE_MIN_GAP_MS = 48L
+        const val COMPOSITOR_PROBE_INTERVAL_MS = 240L
+        const val MAX_COMPOSITOR_PROBE_NODES = 600
     }
 }

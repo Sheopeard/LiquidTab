@@ -318,7 +318,8 @@ internal class MeituanMainPagePreview(private val host: GlassHostLayout, private
         canvas.drawRenderNode(node)
         // The cart checkout lives outside the native page. Include its glass
         // in the still, but never include the moving bottom navigation itself.
-        if (index == 3) (host.parent as? ViewGroup)?.let { parent ->
+        val cartIndex = MeituanMainNativeTabs.cartIndex(host.adapterNavigationSource, host.adapterSlotCount)
+        if (index == cartIndex) (host.parent as? ViewGroup)?.let { parent ->
             for (i in 0 until parent.childCount) {
                 val child = parent.getChildAt(i)
                 if (child is MeituanMainCartLiquidButtons && child.isShown) runCatching {
