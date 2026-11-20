@@ -79,7 +79,7 @@ dependencies {
     implementation("top.yukonga.miuix.kmp:miuix-squircle-android:0.9.3")
     implementation("top.yukonga.miuix.kmp:miuix-navigation3-ui-android:0.9.3")
 
-    compileOnly("io.github.libxposed:api:101.0.1")
-    implementation("io.github.libxposed:service:101.0.0")
+    compileOnly("io.github.libxposed:api:102.0.0")
+    implementation("io.github.libxposed:service:102.0.0")
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
 }

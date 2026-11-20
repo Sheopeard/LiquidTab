@@ -3,3 +3,4 @@
 -keep class io.github.offlineglass.config.SettingsProvider { *; }
 -keepattributes *Annotation*
 -keep class io.github.offlineglass.hook.ModernHookEntry { public <init>(); *; }
+-dontwarn io.github.libxposed.annotation.**
