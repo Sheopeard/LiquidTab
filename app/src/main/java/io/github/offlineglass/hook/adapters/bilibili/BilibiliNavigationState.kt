@@ -32,9 +32,199 @@ internal class BilibiliNavigationState : AppNavigationState {
     private var pendingSelection: Int? = null
     private var selectionGuardUntil = 0L
     private var activeSource: WeakReference<ViewGroup>? = null
+    private var activeHost: io.github.offlineglass.hook.GlassHostLayout? = null
+    private var hasCompositorContent = false
+    private var lastOpticalSurfaceMode: Boolean? = null
+    private var opticalFrameReady = false
+    private var lastUiBarAnimating = false
+    private var lastCompositorProbe = 0L
+    private var compositorProbeDirty = true
+    private var compositorObserver: android.view.ViewTreeObserver? = null
+    private val probeRootRect = android.graphics.Rect()
+    private val probeChildRect = android.graphics.Rect()
+    private val compositorClassCache = java.util.WeakHashMap<Class<*>, Boolean>()
+    private val compositorDirtyListener = android.view.ViewTreeObserver.OnScrollChangedListener {
+        compositorProbeDirty = true
+    }
+    private val compositorLayoutListener = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+        compositorProbeDirty = true
+    }
+
     override fun onHostFrame(host: View) {
         val glass = host as? io.github.offlineglass.hook.GlassHostLayout ?: return
+        activeHost = glass
         BilibiliShopDormancy.bind(glass)
+        updateCompositorBackdropGuard(glass)
+        updateBackdropRendererMode(glass)
+    }
+
+    override val allowsSoftwareBackdropCapture: Boolean
+        get() = !hasCompositorContent
+
+    override fun skipLiveBackdrop(selectedIndex: Int): Boolean {
+        activeHost?.let { updateCompositorBackdropGuard(it) }
+        return hasCompositorContent
+    }
+
+    override fun requiresSampledBackdrop(): Boolean = activeHost?.config?.let {
+        it.enabled && it.backdropCapture && !it.solidBarEnabled &&
+            (it.liquidGlassEnabled || it.blurRadius > 0f)
+    } == true
+
+    override fun allowsOpticalSurfacePipeline(): Boolean =
+        hasCompositorContent && requiresSampledBackdrop()
+
+    override fun maintainsCompositorSamplingWithoutSurface(): Boolean =
+        allowsOpticalSurfacePipeline()
+
+    override fun opticalSurfaceVisibleDuringTransition(hostVisibility: Int, hostAlpha: Float): Boolean =
+        hostVisibility == View.VISIBLE && hostAlpha > 0.001f
+
+    override fun onOpticalSurfacePipelineEnabled(wasActive: Boolean) {
+        if (!wasActive) opticalFrameReady = false
+    }
+
+    override fun onOpticalSurfaceFrameInvalidated() {
+        opticalFrameReady = false
+    }
+
+    override fun onOpticalSurfaceFrameRendered(): Boolean {
+        if (opticalFrameReady) return false
+        opticalFrameReady = true
+        return true
+    }
+
+    override fun shouldQueueOpticalRenderFromUi(animating: Boolean): Boolean {
+        val queue = animating || lastUiBarAnimating
+        lastUiBarAnimating = animating
+        return queue
+    }
+
+    override fun onOpticalRendererConfigurationChanged() {
+        lastOpticalSurfaceMode = null
+        opticalFrameReady = false
+        lastUiBarAnimating = false
+    }
+
+    override fun holdDirectBackdropUntilOpticalFrame(
+        liveBackdropActive: Boolean, hasDisplayList: Boolean,
+    ): Boolean {
+        val host = activeHost ?: return true
+        val surface = host.opticalSurfaceViewForAdapter
+        return !hasCompositorContent || !opticalFrameReady ||
+            !host.opticalSurfaceRunningForAdapter || surface?.visibility != View.VISIBLE || !surface.isShown
+    }
+
+    override fun enterDirectOpticalBackdrop(
+        surface: android.view.SurfaceView, pipelineActive: Boolean,
+    ): Boolean {
+        if (allowsOpticalSurfacePipeline()) return false
+        if (!pipelineActive && surface.visibility == View.GONE) return false
+        surface.visibility = View.GONE
+        opticalFrameReady = false
+        return true
+    }
+
+    override fun updateBackdropRendererMode(host: io.github.offlineglass.hook.GlassHostLayout): Boolean {
+        val enabled = allowsOpticalSurfacePipeline()
+        if (lastOpticalSurfaceMode != enabled) {
+            lastOpticalSurfaceMode = enabled
+            opticalFrameReady = false
+            host.liveBackdropNodeForAdapter.setRenderEffect(null)
+            host.liveBackdropNodeForAdapter.discardDisplayList()
+            host.clearLiveBackdropForAdapter()
+            host.disableOpticalSurfaceNativeBlurForAdapter()
+            if (enabled) host.enableOpticalSurfaceRendererForAdapter()
+            else host.disableOpticalSurfaceRendererForAdapter()
+            host.invalidate()
+        }
+        return true
+    }
+
+    private fun updateCompositorBackdropGuard(host: io.github.offlineglass.hook.GlassHostLayout) {
+        val observer = host.viewTreeObserver
+        if (observer !== compositorObserver) {
+            releaseCompositorObserver()
+            compositorObserver = observer
+            observer.addOnScrollChangedListener(compositorDirtyListener)
+            observer.addOnGlobalLayoutListener(compositorLayoutListener)
+            compositorProbeDirty = true
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        if (!compositorProbeDirty && now - lastCompositorProbe < 160L) return
+        lastCompositorProbe = now
+        compositorProbeDirty = false
+        val root = (host.parent as? View) ?: host.rootView
+        val excludeSurface = host.opticalSurfaceViewForAdapter
+        val compositorVisible = if (root.getGlobalVisibleRect(probeRootRect)) {
+            containsVisibleCompositorSurface(root, host, excludeSurface, probeRootRect)
+        } else {
+            false
+        }
+        if (compositorVisible == hasCompositorContent) return
+        hasCompositorContent = compositorVisible
+        host.invalidateOpticalSceneForAdapter()
+        if (compositorVisible) host.clearLiveBackdropForAdapter()
+        host.invalidateProjectionCache()
+        updateBackdropRendererMode(host)
+        host.invalidate()
+    }
+
+    private fun releaseCompositorObserver() {
+        compositorObserver?.takeIf { it.isAlive }?.let {
+            it.removeOnScrollChangedListener(compositorDirtyListener)
+            it.removeOnGlobalLayoutListener(compositorLayoutListener)
+        }
+        compositorObserver = null
+    }
+
+    private fun isCompositorView(view: View): Boolean {
+        compositorClassCache[view.javaClass]?.let { return it }
+        val result = view is android.webkit.WebView || view is android.view.SurfaceView ||
+            isCompositorClassHierarchy(view.javaClass)
+        compositorClassCache[view.javaClass] = result
+        return result
+    }
+
+    private fun isCompositorClassHierarchy(type: Class<*>): Boolean {
+        var current: Class<*>? = type
+        while (current != null && current !== View::class.java && current !== Any::class.java) {
+            val name = current.name.lowercase()
+            if (name.contains("webview") || name.contains("chromium") ||
+                name.contains("meco") || name.contains("x5")
+            ) {
+                return true
+            }
+            current = current.superclass
+        }
+        return false
+    }
+
+    private fun containsVisibleCompositorSurface(
+        view: View,
+        excludeOverlay: View,
+        excludeSurface: View?,
+        rootBounds: android.graphics.Rect,
+    ): Boolean {
+        if (view === excludeOverlay || view === excludeSurface ||
+            !view.isShown || view.alpha <= 0.001f
+        ) return false
+        if (isCompositorView(view) && view.getGlobalVisibleRect(probeChildRect) &&
+            android.graphics.Rect.intersects(rootBounds, probeChildRect)
+        ) {
+            return true
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                if (containsVisibleCompositorSurface(
+                        view.getChildAt(i), excludeOverlay, excludeSurface, rootBounds,
+                    )
+                ) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = true
@@ -63,6 +253,7 @@ internal class BilibiliNavigationState : AppNavigationState {
 
     private fun resetTransientState() {
         BilibiliShopDormancy.release()
+        releaseCompositorObserver()
         transitionUntil = 0L
         selectionReadAt = 0L
         cachedSelection = null
@@ -70,6 +261,13 @@ internal class BilibiliNavigationState : AppNavigationState {
         pendingSelection = null
         selectionGuardUntil = 0L
         activeSource = null
+        activeHost = null
+        hasCompositorContent = false
+        lastOpticalSurfaceMode = null
+        opticalFrameReady = false
+        lastUiBarAnimating = false
+        lastCompositorProbe = 0L
+        compositorProbeDirty = true
     }
 
     override fun onHostDetached() = resetTransientState()

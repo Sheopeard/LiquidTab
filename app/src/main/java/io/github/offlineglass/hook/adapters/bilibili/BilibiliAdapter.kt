@@ -91,6 +91,31 @@ internal object BilibiliAdapter : TargetAdapter {
     override val sourceIconTranslationDp = 0f
     override val snapIndicatorToSelectionOnRebind = true
     override val refreshHostGeometryOnRebind = true
+    override val usesDirectOpticalBackdropMode = true
+    override val allowsSystemBackgroundBlur = false
+    override val usesNativeOpticalBlur = false
+    override val countsOpticalCompositorCopies = true
+    override val keepsOpticalSurfaceDuringBarAnimation = true
+    override val reuseOpticalBlur = true
+    override val reuseSurfaceBlurDuringBarAnimation = true
+
+    override fun opticalCaptureGeometry(
+        rootWidth: Int, rootHeight: Int, left: Int, top: Int, width: Int, height: Int, padding: Int,
+    ): io.github.offlineglass.hook.adapters.OpticalCaptureGeometry? {
+        val rect = android.graphics.Rect(
+            (left - padding).coerceAtLeast(0),
+            (top - padding).coerceAtLeast(0),
+            (left + width + padding).coerceAtMost(rootWidth),
+            (top + height + padding).coerceAtMost(rootHeight),
+        )
+        if (rect.isEmpty) return null
+        val targetWidth = (rect.width() / 2f).toInt().coerceAtLeast(1)
+        val targetHeight = (rect.height() / 2f).toInt().coerceAtLeast(1)
+        return io.github.offlineglass.hook.adapters.OpticalCaptureGeometry(
+            rect, targetWidth, targetHeight, android.graphics.Rect(0, 0, targetWidth, targetHeight),
+        )
+    }
+
     override fun screenReferenceHeight(rootHeight: Int?, displayHeight: Int): Int =
         maxOf(rootHeight ?: 0, displayHeight)
 
