@@ -21,7 +21,8 @@ internal class WeChatTabsRenderer {
     private var weChatTabsCacheSource: View? = null
 
     fun draw(canvas: Canvas, source: ViewGroup, density: Float, configIconScale: Float = 1f,
-             selectedArtwork: Boolean? = null, dark: Boolean = false, managerEnglishLabels: Boolean = false) {
+             selectedArtwork: Boolean? = null, dark: Boolean = false, managerEnglishLabels: Boolean = false,
+             maxTotalHeightPx: Float? = null) {
 
         fun findTabs(root: ViewGroup): List<ViewGroup>? {
             if (root.childCount == 4) {
@@ -133,10 +134,6 @@ internal class WeChatTabsRenderer {
 
         val firstIcon = tabs.firstOrNull { it.icon != null }?.icon
 
-        val iconScale = 1.15f * 1.1f * configIconScale
-        val iconSize = (firstIcon?.height?.takeIf { it > 0 }?.toFloat()
-            ?: (40f * density)) * iconScale
-
         val labelH = tabs.firstOrNull { it.label != null }?.label?.let {
 
             val bounds = android.graphics.Rect()
@@ -145,6 +142,16 @@ internal class WeChatTabsRenderer {
             bounds.height().toFloat()
 
         } ?: (12f * density)
+
+        val baseIconHeight = firstIcon?.height?.takeIf { it > 0 }?.toFloat() ?: (40f * density)
+        val rawIconScale = 1.15f * 1.1f * configIconScale
+        val iconScale = if (maxTotalHeightPx != null && maxTotalHeightPx > labelH) {
+            val capped = (maxTotalHeightPx - labelH) / baseIconHeight
+            minOf(rawIconScale, capped).coerceAtLeast(rawIconScale * 0.55f)
+        } else {
+            rawIconScale
+        }
+        val iconSize = baseIconHeight * iconScale
 
         // Position the visible glyphs, not the font's extra ascent/descent
         // space. Native icon bitmaps already contain transparent edge padding.

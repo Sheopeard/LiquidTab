@@ -638,6 +638,8 @@ internal object TargetAdapterRegistry {
         io.github.offlineglass.hook.adapters.quora.QuoraAdapter,
         io.github.offlineglass.hook.adapters.eudic.EudicAdapter,
         io.github.offlineglass.hook.adapters.share.ShareAdapter,
+        io.github.offlineglass.hook.adapters.baidu_map.BaiduMapAdapter,
+        io.github.offlineglass.hook.adapters.netease_mail.NeteaseMailAdapter,
     ).associateBy(TargetAdapter::key)
 
     private val byKey: Map<String, TargetAdapter> = TargetSpecRegistry.all.associate { spec ->

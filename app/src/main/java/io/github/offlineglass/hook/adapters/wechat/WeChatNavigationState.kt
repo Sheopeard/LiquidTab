@@ -86,10 +86,10 @@ internal class WeChatNavigationState : AppNavigationState {
         // the regular adapter draw(frame) callback. Refresh the language here
         // on the shared host's live pre-draw path so the switch takes effect
         // without restarting WeChat.
-        managerEnglishLabels =
-            (host as? io.github.offlineglass.hook.GlassHostLayout)
-                ?.config?.managerEnglishNavigationLabels
-                ?: managerEnglishLabels
+        managerEnglishLabels = (host as? io.github.offlineglass.hook.GlassHostLayout)
+            ?.also { artworkHost = java.lang.ref.WeakReference(it) }
+            ?.config?.managerEnglishNavigationLabels
+            ?: managerEnglishLabels
         currentNavigationSource = source
         var context = host.context
         while (context is android.content.ContextWrapper && context !is android.app.Activity) {
@@ -157,15 +157,25 @@ internal class WeChatNavigationState : AppNavigationState {
         frostController.suppress(source, root, selected)
     }
 
+    private fun maxTabsHeightInSourceSpace(): Float? {
+        val host = artworkHost.get() ?: return null
+        if (host.height <= 0) return null
+        val density = host.resources.displayMetrics.density.takeIf { it > 0f } ?: return null
+        val heightScale = (host.height / (64f * density)).coerceIn(0.875f, 1f)
+        val drawScale = (host.config.iconScale * heightScale).coerceAtLeast(0.01f)
+        val capsuleBudgetPx = (host.height - 12f * density).coerceAtLeast(host.height * 0.65f)
+        return capsuleBudgetPx / drawScale
+    }
+
     override fun drawNativeNavigation(canvas: Canvas, source: ViewGroup, density: Float): Boolean {
         tabsRenderer.draw(canvas, source, density, selectedArtwork = selectedArtwork, dark = artworkDark,
-            managerEnglishLabels = managerEnglishLabels)
+            managerEnglishLabels = managerEnglishLabels, maxTotalHeightPx = maxTabsHeightInSourceSpace())
         return true
     }
 
     override fun drawNativeNavigation(canvas: Canvas, source: ViewGroup, density: Float, forOptics: Boolean): Boolean {
         tabsRenderer.draw(canvas, source, density, selectedArtwork = forOptics || selectedArtwork, dark = artworkDark,
-            managerEnglishLabels = managerEnglishLabels)
+            managerEnglishLabels = managerEnglishLabels, maxTotalHeightPx = maxTabsHeightInSourceSpace())
         return true
     }
 
@@ -179,7 +189,8 @@ internal class WeChatNavigationState : AppNavigationState {
         canvas.save()
         canvas.scale(frame.extraScale, frame.extraScale, frame.width / 2f, frame.height / 2f)
         tabsRenderer.draw(canvas, source, frame.density, frame.iconScale * 1.15f,
-            frame.hideSelectedForOptics || selectedArtwork, frame.darkGlass, frame.managerEnglishLabels)
+            frame.hideSelectedForOptics || selectedArtwork, frame.darkGlass, frame.managerEnglishLabels,
+            maxTotalHeightPx = maxTabsHeightInSourceSpace())
         canvas.restore()
     }
 }

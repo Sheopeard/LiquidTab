@@ -861,6 +861,18 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                 }
             }
         }
+        if (target.key == "baidu_map") {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    SwitchPreference(
+                        title = "AI按键独立到右侧",
+                        summary = "开启后四个页面在左，AI助手图标居中显示在右侧圆形液态玻璃按键内（支持点击与长按说话）；关闭后回到底栏。",
+                        checked = config.detachedPublish,
+                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
+                    )
+                }
+            }
+        }
         if (target.key == "mi_market") {
             item {
                 Card(Modifier.fillMaxWidth()) {

@@ -870,6 +870,15 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                 }
             }
         }
+        if (target.key == "baidu_map") {
+            item {
+                Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.extraLarge) {
+                    MaterialSwitchRow("AI按键独立到右侧", "开启后四个页面在左，AI助手图标居中显示在右侧圆形液态玻璃按键内（支持点击与长按说话）；关闭后回到底栏。", config.detachedPublish) {
+                        actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
+                    }
+                }
+            }
+        }
         if (target.key == "mi_market") {
             item { Card(shape = MaterialTheme.shapes.extraLarge) {
                 Text(if (target.key == "mi_market") "请在应用商店设置中关闭视频广告页面" else "请在美团设置中关闭视频广告页面", modifier = Modifier.padding(20.dp))

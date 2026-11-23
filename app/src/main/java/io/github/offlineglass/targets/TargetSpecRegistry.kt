@@ -44,6 +44,8 @@ internal object TargetSpecRegistry {
         io.github.offlineglass.hook.adapters.quora.targetSpec,
         io.github.offlineglass.hook.adapters.eudic.targetSpec,
         io.github.offlineglass.hook.adapters.share.targetSpec,
+        io.github.offlineglass.hook.adapters.baidu_map.targetSpec,
+        io.github.offlineglass.hook.adapters.netease_mail.targetSpec,
     )
     val byKey: Map<String, TargetSpec> by lazy(LazyThreadSafetyMode.PUBLICATION) {
         all.associateBy(TargetSpec::key)

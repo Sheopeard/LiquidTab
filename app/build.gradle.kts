@@ -11,8 +11,8 @@ android {
         applicationId = "com.sheopeard.liquidtab"
         minSdk = 35
         targetSdk = 37
-        versionCode = 223
-        versionName = "2.1.0"
+        versionCode = 226
+        versionName = "2.1.01"
         buildConfigField("Boolean", "BETA_BUILD", "false")
 
         vectorDrawables.useSupportLibrary = true

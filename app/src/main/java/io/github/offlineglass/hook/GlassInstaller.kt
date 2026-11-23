@@ -143,16 +143,20 @@ internal fun symmetricGlassHostWidthPx(
         // generic compact-width calculation can overwrite it.
         return glassHostWidthPx(view, referenceSlots, config, density)
     }
-    val screenWidth = view.width.coerceAtLeast(
-        view.resources.displayMetrics.widthPixels,
-    )
+    // In split/parallel-window modes (e.g. MIUI Magic Windows), displayMetrics.widthPixels
+    // may reflect the wider companion pane rather than this Activity's content container.
+    val screenWidth = view.width.takeIf { it > 0 }
+        ?: view.rootView.width.takeIf { it > 0 }
+        ?: view.resources.displayMetrics.widthPixels
     val fullWidth = (screenWidth - 2 * symmetricGlassSideMarginPx(view, density))
-        .coerceAtLeast((4 * config.tabWidth * density).toInt())
+        .coerceAtLeast((4 * config.tabWidth * density).toInt().coerceAtMost(screenWidth))
+        .coerceAtMost(screenWidth)
     if (slots >= 4) return fullWidth
     val slotWidth = (fullWidth - 8f * density) / 4f
     return (8f * density + slotWidth * slots)
         .toInt()
-        .coerceAtLeast((slots * config.tabWidth * density).toInt())
+        .coerceAtLeast((slots * config.tabWidth * density).toInt().coerceAtMost(screenWidth))
+        .coerceAtMost(screenWidth)
 }
 
 object GlassInstaller {
