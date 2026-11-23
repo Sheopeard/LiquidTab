@@ -7,7 +7,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.WindowManager
-import android.widget.LinearLayout
 import io.github.offlineglass.hook.compat.XC_MethodHook
 import io.github.offlineglass.hook.compat.XposedBridge
 import java.util.WeakHashMap
@@ -89,10 +88,8 @@ internal object XhsCommentGlass {
             val frame = Rect(); root.getWindowVisibleDisplayFrame(frame)
             if (root.height - frame.bottom > root.height / 4) { glass.restore(); return true }
             val all = nodes
-            val comment = all.firstOrNull { it.id == 0x7f090b23 && it.isShown } as? ViewGroup ?: return true
-            val button = (0 until comment.childCount).map(comment::getChildAt).firstOrNull {
-                it is LinearLayout && it.width > root.width * .8f && it.height > 0
-            } ?: return true
+            val comment = XhsVideoButtons.commentLayout(root)?.takeIf { it.isShown } ?: return true
+            val button = XhsVideoButtons.commentPlate(comment, root.width) ?: return true
             val recycler = all.firstOrNull { it.javaClass.name.contains("RecyclerView") && it.isShown && it.height > root.height / 4 } as? ViewGroup ?: return true
             if (list !== recycler) { list = recycler; padding = recycler.paddingBottom; clipping = recycler.clipToPadding }
             recycler.clipToPadding = false

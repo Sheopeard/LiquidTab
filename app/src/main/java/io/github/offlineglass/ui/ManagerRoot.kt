@@ -19,6 +19,10 @@ import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 @Composable
 fun ManagerRoot(settings: ManagerSettings, actions: UiActions) {
     val postureView = androidx.compose.ui.platform.LocalView.current
+    androidx.compose.runtime.SideEffect { managerRefractionScale = settings.glass.refractionScale }
+    androidx.compose.runtime.SideEffect {
+        managerHighlightTransparency.floatValue = settings.glass.highlightTransparency
+    }
     androidx.compose.runtime.LaunchedEffect(settings.glass.liquidViscosity,
         settings.glass.flowHorizontalStrength, settings.glass.flowVerticalStrength) {
         io.github.offlineglass.rendering.LiquidMotion.configure(postureView,
@@ -62,7 +66,8 @@ fun ManagerRoot(settings: ManagerSettings, actions: UiActions) {
         UiMode.MIUIX -> MiuixManager(settings, selectedPage, onSelected, settingsActions)
     }
     }
-    RootPermissionNotice(rootBackdrop, dark, settings.glass.blurRadius, suppressed = frostConfirmation) {
+    RootPermissionNotice(rootBackdrop, dark, settings.glass.blurRadius, suppressed = frostConfirmation,
+        highlightStrength = settings.glass.darkBarHighlightStrength) {
         rootNoticeVisible = it
     }
     if (frostConfirmation) {
@@ -71,7 +76,7 @@ fun ManagerRoot(settings: ManagerSettings, actions: UiActions) {
             "取消", "确认", onDismiss = { frostConfirmation = false }, onConfirm = {
                 actions.setFrostedGlassEnabled(true)
                 frostConfirmation = false
-            })
+            }, highlightStrength = settings.glass.darkBarHighlightStrength)
     }
     }
     }

@@ -9,12 +9,36 @@ import java.util.zip.*;
 /** Read-only APK contracts rooted in platform/Compose API and drawing semantics.
  * Internal descriptors are discovered outputs only, never search keys. */
 public final class ChatGptNativeContract {
+    enum Capability {
+        GLASS("scope.content","scope.type","scope.canvasScope","scope.parameters","parameters.canvas",
+            "parameters.size","parameters.direction","parameters.density","background.draw","background.shape","background.type",
+            "node.coordinate","node.attached","node.next","node.delegate","node.type","layout.outer","layout.children",
+            "layout.chain","layout.owner","layout.parent","layout.placed","layout.deactivated","chain.head","chain.inner",
+            "owner.nodes","semantics.lookup","coordinate.layout","coordinate.relativeMatrix","coordinate.screen",
+            "coordinate.size","coordinate.type","coordinate.invalidate","layout.draw","canvas.native","canvas.type",
+            "shape.outline","outline.bounds","outline.round","outline.roundValue","outline.generic","outline.path","path.native",
+            "rectangle.left","rectangle.top","rectangle.right","rectangle.bottom","round.left","round.top","round.right","round.bottom",
+            "round.topLeft","round.topRight","round.bottomRight","round.bottomLeft"),
+        NATIVE_SHADOW("shadow.draw","shadow.paint","shadow.painter","shadow.registryNode","shadow.registryDraw",
+            "shadow.registry","shadow.entryPainter","shadow.entryActive"),
+        EXTERIOR_SHADOW("coordinate.parent","coordinate.layer","layer.graphics","graphics.renderer","renderer.native"),
+        SEARCH_GRADIENT("searchGradient.type","searchGradient.draw"),
+        SCAFFOLD_GRADIENT("scaffoldGradient.draw","scaffoldGradient.builder","scaffoldGradient.factory");
+
+        final List<String> roles;
+        Capability(String... roles){this.roles=List.of(roles);}
+        List<String> missing(Properties properties){
+            return roles.stream().filter(role->properties.getProperty(role)==null).toList();
+        }
+    }
+
     public record Ref(String owner,String name,String result,List<String> args) {
         public String key(){return owner+"|"+name+"|"+result+"|"+String.join(",",args);}
     }
     public record Field(String owner,String name,String type) { public String key(){return owner+"|"+name+"|"+type;} }
     static final class Body {
         final Ref ref;final int flags;final Set<String> strings=new HashSet<>();
+        final Map<String,List<Field>> castReads=new HashMap<>();
         final Map<String,List<Field>> labelled=new HashMap<>();final List<Ref> calls=new ArrayList<>();final List<Field> reads=new ArrayList<>(),writes=new ArrayList<>();
         Body(Ref r,int f){ref=r;flags=f;}
     }
@@ -35,7 +59,7 @@ public final class ChatGptNativeContract {
                 try(InputStream in=z.getInputStream(e)){new Dex(in.readAllBytes()).scan(i);}
                 if(i.types.containsKey(LAYOUT)&&i.types.containsKey(VIEW)) {
                     ChatGptNativeContract c=new ChatGptNativeContract(i);c.bind();
-                    if(c.roles.getProperty("background.draw")!=null)return c.roles;
+                    if(Arrays.stream(Capability.values()).allMatch(capability->capability.missing(c.roles).isEmpty()))return c.roles;
                 }
             }
         }
@@ -52,6 +76,17 @@ public final class ChatGptNativeContract {
         return unique(role,type(owner).methods.stream().filter(match).map(b->b.ref).toList());
     }
     private Field field(String role,String owner,Predicate<Field> match){return unique(role,type(owner).fields.stream().filter(match).toList());}
+    private void bindChainField(String role,Type chain,Predicate<String> valueType){
+        Set<Field> candidates=new LinkedHashSet<>();
+        for(Field field:chain.fields)if(valueType.test(field.type))candidates.add(field);
+        for(Type owner:List.of(type(LAYOUT),chain)){
+            for(Body method:owner.methods)method.castReads.forEach((cast,fields)->{
+                if(valueType.test(cast))for(Field field:fields)
+                    if(field.owner.equals(chain.name)&&field.type.equals("Ljava/lang/Object;")&&chain.fields.contains(field))candidates.add(field);
+            });
+        }
+        unique(role,candidates);
+    }
     private static boolean args(Ref r,String... args){return r.args.equals(List.of(args));}
     private Body body(Ref r){return index.methods.get(r);}
     private void bind(){
@@ -72,8 +107,10 @@ public final class ChatGptNativeContract {
         if(detach==null)return;String node=detach.owner;unique("node.type",List.of(node));
         Field attached=unique("node.attached",body(detach).writes.stream().filter(f->f.owner.equals(node)&&f.type.equals("Z")).toList());
         field("node.coordinate",node,f->f.type.equals(coord));
-        Field head=field("chain.head",chain.type,f->f.type.equals(node));
-        Field inner=field("chain.inner",chain.type,f->index.types.containsKey(f.type)&&coord.equals(type(f.type).parent));
+        Type chainType=index.types.get(chain.type);
+        if(chainType==null)return;
+        bindChainField("chain.head",chainType,t->t.equals(node));
+        bindChainField("chain.inner",chainType,t->index.types.containsKey(t)&&coord.equals(type(t).parent));
         unique("node.next",body(content).reads.stream().filter(f->f.owner.equals(node)&&f.type.equals(node)&&type(node).methods.stream().filter(b->b.ref.name.equals("<init>")).noneMatch(b->b.writes.contains(f))).distinct().toList());
         // Resolve the draw dispatcher through its single concrete Canvas wrapper.
         List<String> wrappers=index.types.values().stream().filter(t->t.fields.stream().anyMatch(f->f.type.equals("Landroid/graphics/Canvas;"))).map(t->t.name).toList();
@@ -128,6 +165,13 @@ public final class ChatGptNativeContract {
         unique("node.delegate",body(content).reads.stream().filter(f->f.type.equals(node)&&!f.owner.equals(node)).toList());
         Ref text=method("layout.description",LAYOUT,b->b.ref.name.equals("toString")&&args(b.ref)&&b.strings.contains(" deactivated: "));
         if(text!=null)unique("layout.deactivated",body(text).labelled.getOrDefault(" deactivated: ",List.of()).stream().filter(f->f.owner.equals(LAYOUT)&&f.type.equals("Z")).toList());
+        if(text!=null){
+            var virtualFields=body(text).labelled.getOrDefault(" isVirtual: ",List.of());
+            Field virtual=unique("layout.virtual",virtualFields.stream().filter(f->f.owner.equals(LAYOUT)&&f.type.equals("Z")).toList());
+            if(virtual!=null)method("layout.parent",LAYOUT,b->args(b.ref)&&b.ref.result.equals(LAYOUT)
+                &&b.calls.isEmpty()&&b.writes.isEmpty()&&b.reads.contains(virtual)
+                &&b.reads.stream().filter(f->f.owner.equals(LAYOUT)&&f.type.equals(LAYOUT)).count()>=2);
+        }
         Ref nodes=method("owner.nodes",VIEW,b->b.ref.name.equals("getLayoutNodes")&&args(b.ref)&&(b.flags&64)==0);
         if(nodes!=null){String map=nodes.result;
             while(map!=null){List<Body> gets=type(map).methods.stream().filter(b->args(b.ref,"I")&&b.ref.result.equals("Ljava/lang/Object;")&&b.writes.isEmpty()&&b.calls.stream().allMatch(c->c.owner.startsWith("Ljava/lang/"))&&b.reads.stream().anyMatch(f->f.type.equals("[Ljava/lang/Object;"))&&b.reads.stream().anyMatch(f->f.type.equals("[I"))).toList();
@@ -154,7 +198,112 @@ public final class ChatGptNativeContract {
                 }
             }
         }
-        if(shape!=null){
+        try {
+            bindSearchGradient(node, scope, content);
+        } catch(RuntimeException e) {
+            roles.setProperty("searchGradientFailure", e.toString());
+        }
+        try {
+            bindScaffoldGradient(node, scope);
+        } catch(RuntimeException e) {
+            roles.setProperty("scaffoldGradientFailure", e.toString());
+        }
+        try {
+            if(shape!=null)bindNativeShadow(scope,content,shape);
+        } catch(RuntimeException e) {
+            roles.setProperty("nativeShadowFailure",e.toString());
+        }
+        try {
+            if(invalidation!=null)bindExteriorShadow(coord,invalidation);
+        } catch(RuntimeException e) {
+            roles.setProperty("exteriorShadowFailure",e.toString());
+        }
+    }
+    private void bindSearchGradient(String node, String scope, Ref content) {
+        Ref element = unique("searchGradient.element", all().stream()
+            .filter(body -> body.strings.contains("elevatedContentGradient"))
+            .flatMap(body -> body.calls.stream())
+            .filter(call -> call.name.equals("<init>") && call.args.size() == 4
+                && call.args.get(0).startsWith("L") && call.args.subList(1, 4).equals(List.of("I", "J", "Z")))
+            .toList());
+        if (element == null || !index.types.containsKey(element.owner)) return;
+        Ref created = unique("searchGradient.nodeConstructor", type(element.owner).methods.stream()
+            .filter(body -> args(body.ref) && body.ref.result.equals(node))
+            .flatMap(body -> body.calls.stream())
+            .filter(call -> call.name.equals("<init>") && call.args.equals(element.args)
+                && index.types.containsKey(call.owner) && node.equals(type(call.owner).parent))
+            .toList());
+        if (created == null) return;
+        Ref drawing = method("searchGradient.draw", created.owner, body ->
+            body.ref.result.equals("V") && args(body.ref, scope) && body.calls.contains(content)
+                && body.calls.stream().filter(call -> call.owner.equals(created.owner) && args(call))
+                    .map(index.methods::get).filter(Objects::nonNull)
+                    .anyMatch(helper -> helper.reads.stream().anyMatch(
+                        field -> field.owner.equals(created.owner) && field.type.equals("J"))));
+        if (drawing != null) unique("searchGradient.type", List.of(created.owner));
+    }
+
+    private void bindScaffoldGradient(String node, String scope) {
+        String function = "Lkotlin/jvm/functions/Function1;";
+        String object = "Ljava/lang/Object;";
+        Predicate<Ref> buildsFade = call -> call.args.size() == 8 && call.result.equals(call.args.get(0))
+            && call.args.subList(1, 5).equals(List.of("J", function, function, function))
+            && call.args.subList(6, 8).equals(List.of("I", "I")) && body(call) != null;
+        // The scaffold's dock modifier and MainTabBarHost independently
+        // reach the same cached bitmap fade factory.
+        Set<Ref> factories = new LinkedHashSet<>();
+        for (Body entry : index.methods.values()) {
+            if (entry.strings.contains("MainTabBarHost") && entry.strings.contains("main-tab-bar")) {
+                entry.calls.stream().filter(buildsFade).forEach(factories::add);
+            }
+            if (entry.strings.contains("ScaffoldLayout")) {
+                entry.calls.stream()
+                    .filter(call -> call.args.size() == 4 && call.args.get(0).equals("I")
+                        && call.result.equals(call.args.get(2)) && call.args.get(3).equals("Z"))
+                    .map(this::body).filter(Objects::nonNull)
+                    .flatMap(modifier -> modifier.calls.stream().filter(call -> call.result.equals(modifier.ref.result)))
+                    .filter(buildsFade).forEach(factories::add);
+            }
+        }
+        Ref factory = unique("scaffoldGradient.composition", factories);
+        if (factory == null) return;
+        String modifier = factory.result;
+        Body composition = body(factory);
+        Ref builder = unique("scaffoldGradient.builderConstructor", composition.calls.stream()
+            .filter(call -> call.name.equals("<init>") && call.args.size() == 4
+                && call.args.get(0).equals(function) && call.args.subList(2, 4).equals(List.of(function, function))
+                && index.types.containsKey(call.owner) && type(call.owner).interfaces.contains(function)
+                && type(call.owner).methods.stream().anyMatch(method -> args(method.ref, object)
+                    && method.ref.result.equals(object)
+                    && method.calls.stream().anyMatch(c -> c.owner.equals("Landroid/graphics/Canvas;") && c.name.equals("drawRect"))
+                    && method.calls.stream().anyMatch(c -> c.owner.equals("Landroid/graphics/Bitmap;") && c.name.equals("getHeight"))))
+            .toList());
+        Ref cache = unique("scaffoldGradient.cacheModifier", composition.calls.stream()
+            .filter(call -> args(call, modifier, function) && call.result.equals(modifier) && body(call) != null)
+            .toList());
+        if (builder == null || cache == null) return;
+        Ref element = unique("scaffoldGradient.cacheElement", body(cache).calls.stream()
+            .filter(call -> call.name.equals("<init>") && args(call, function) && index.types.containsKey(call.owner))
+            .toList());
+        if (element == null) return;
+        Ref created = unique("scaffoldGradient.cacheNode", type(element.owner).methods.stream()
+            .filter(method -> args(method.ref) && method.ref.result.equals(node))
+            .flatMap(method -> method.calls.stream())
+            .filter(call -> call.name.equals("<init>") && call.args.size() == 2 && call.args.get(1).equals(function)
+                && index.types.containsKey(call.owner) && node.equals(type(call.owner).parent))
+            .toList());
+        if (created == null) return;
+        Ref draw = method("scaffoldGradient.draw", created.owner, method ->
+            args(method.ref, scope) && method.ref.result.equals("V")
+                && method.strings.contains("DrawResult not defined, did you forget to call onDraw?"));
+        if (draw != null) {
+            unique("scaffoldGradient.builder", List.of(builder.owner));
+            unique("scaffoldGradient.factory", body(created).writes.stream()
+                .filter(field -> field.owner.equals(created.owner) && field.type.equals(function)).toList());
+        }
+    }
+
+    private void bindNativeShadow(String scope,Ref content,Field shape){
             List<Body> shadowDraws=all().stream().filter(b->args(b.ref,scope)&&b.ref.result.equals("V")&&b.calls.contains(content)&&
                 type(b.ref.owner).fields.stream().anyMatch(f->f.type.equals(shape.type))&&
                 type(b.ref.owner).fields.stream().anyMatch(f->f.type.equals("Lkotlin/jvm/functions/Function0;"))&&
@@ -171,7 +320,8 @@ public final class ChatGptNativeContract {
                     }
                 }
             }
-        }
+    }
+    private void bindExteriorShadow(String coord,Ref invalidation){
         Ref alpha=unique("renderer.alphaSetter",all().stream().filter(b->b.ref.result.equals("V")&&args(b.ref,"F")&&
             b.calls.stream().anyMatch(c->c.owner.equals("Landroid/graphics/RenderNode;")&&c.name.equals("setAlpha")&&args(c,"F"))).map(b->b.ref).toList());
         if(alpha!=null){
@@ -235,6 +385,14 @@ public final class ChatGptNativeContract {
                 if(op==0x02||op==0x05||op==0x08)registers.put(word>>>8,registers.get(u2(start+(pos+1)*2)));
                 if((op>=0x52&&op<=0x58)||(op>=0x60&&op<=0x66)){
                     Field f=field(u2(start+(pos+1)*2));body.reads.add(f);registers.put(op<=0x58?(word>>>8)&15:word>>>8,f);
+                }
+                if(op==0x54&&pos+3<count){
+                    int next=u2(start+(pos+2)*2);
+                    if((next&255)==0x1f&&(next>>>8)==((word>>>8)&15)){
+                        Field field=field(u2(start+(pos+1)*2));
+                        if(field.type.equals("Ljava/lang/Object;"))
+                            body.castReads.computeIfAbsent(type(u2(start+(pos+3)*2)),key->new ArrayList<>()).add(field);
+                    }
                 }
                 if((op>=0x59&&op<=0x5f)||(op>=0x67&&op<=0x6d))body.writes.add(field(u2(start+(pos+1)*2)));
                 pos+=w;

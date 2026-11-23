@@ -64,23 +64,11 @@ internal object JdClassicLayout {
             val above = lp.getRule(RelativeLayout.ABOVE)
             if (above == 0) continue
             val shell = (0 until root.childCount).map(root::getChildAt).firstOrNull { it.id == above } ?: continue
-            if (ownsNavigation(shell)) return page
+            if (JdNavigationBinding.findInShell(shell) != null) return page
         }
         // Once detached from ABOVE, retain the verified identity via binding.
         bindings[root]?.content?.takeIf { it.parent === root }?.let { return it }
         return null
-    }
-
-    private fun ownsNavigation(shell: View): Boolean {
-        val stack = ArrayDeque<View>(); stack.add(shell)
-        var visited = 0
-        while (stack.isNotEmpty() && visited++ < 80) {
-            val view = stack.removeLast()
-            if (view.javaClass.name == "com.jingdong.common.unification.navigationbar.newbar.NavigationGroup" &&
-                view is ViewGroup && view.childCount == 5) return true
-            if (view is ViewGroup) for (i in 0 until view.childCount) stack.add(view.getChildAt(i))
-        }
-        return false
     }
 
     fun adjust(host: GlassHostLayout, nav: View, enabled: Boolean): Boolean {

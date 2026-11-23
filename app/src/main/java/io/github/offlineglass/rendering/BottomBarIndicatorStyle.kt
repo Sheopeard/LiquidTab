@@ -1,5 +1,6 @@
 package io.github.offlineglass.rendering
 import io.github.offlineglass.hook.setBottomBarSquircle
+import kotlin.math.roundToInt
 
 /** Shared, user-accepted bottom-tab lens style. No app identity or page logic. */
 internal object BottomBarIndicatorStyle {
@@ -14,6 +15,7 @@ internal object BottomBarIndicatorStyle {
     fun idleBlueAlpha(dark: Boolean) = if (dark) .025f else .018f
     fun idlePinkAlpha(dark: Boolean) = if (dark) .020f else .016f
     const val PRESS_SCALE = 1.48f
+    const val PRESS_GROWTH_GAIN = 1.08f
     // Reference five-tab bar: 497dpi app geometry on a 520dpi display.
     // Screen-relative conversion prevents per-app density overrides changing height.
     fun compactBarHeightPx(heightDp: Float, fallbackDensity: Float): Int {
@@ -32,7 +34,15 @@ internal object BottomBarIndicatorStyle {
         else activeCurve
     const val SPECULAR_WIDTH_DP = 1f
     const val SPECULAR_MIN_ALPHA = 0.8f
-    const val RESTING_TINT_RETURN_MS = 160L
+    const val HIDDEN_SPECULAR_GAIN = 0.25f
+    const val RESTING_TINT_RETURN_MS = 240L
+    // The moving outline is un-clipped and already in final draw coordinates.
+    // Match the visible width of the shared, inside-clipped hairline in light mode.
+    fun expandedRimStrokeDp(dark: Boolean): Float =
+        if (dark) .45f else GlassEdgeHighlight.BLACK_HAIRLINE_STROKE_DP / 2f
+    fun expandedRimAlpha(dark: Boolean, progress: Float): Int =
+        ((if (dark) 135 else GlassEdgeHighlight.LIGHT_BLACK_HAIRLINE_ALPHA) *
+            progress.coerceIn(0f, 1f)).roundToInt()
     private val contours = android.util.LruCache<List<Float>, FloatArray>(16)
     fun contour(w: Float, h: Float, radius: Float, curve: Float = CURVE): FloatArray {
         val key = listOf(w, h, radius, curve)

@@ -1,6 +1,10 @@
 package io.github.offlineglass.hook.adapters.douyin
 
 import android.graphics.Rect
+import android.app.Activity
+import android.graphics.Color
+import android.os.Build
+import android.view.WindowInsets
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -54,10 +58,73 @@ internal object DouyinProfilePages {
                 }
                 XposedBridge::class.java.getMethod("hookMethod", java.lang.reflect.Member::class.java, XC_MethodHook::class.java)
                     .invoke(null, method, hook)
+                if (name == "com.ss.android.ugc.aweme.profile.ProfilePageFragmentV2") {
+                    val getView = type.getMethod("getView")
+                    val getActivity = type.getMethod("getActivity")
+                    val sync = object : XC_MethodHook() {
+                        override fun afterHookedMethod(p: MethodHookParam) {
+                            val page = getView.invoke(p.thisObject) as? View ?: return
+                            val activity = getActivity.invoke(p.thisObject) as? Activity ?: return
+                            page.post { syncDetailNavigation(page, activity) }
+                        }
+                    }
+                    XposedBridge.hookMethod(type.getDeclaredMethod("onStart"), sync)
+                    XposedBridge.hookMethod(type.getDeclaredMethod("onPageSelected", Int::class.javaPrimitiveType), sync)
+                }
             }.onFailure {
                 XposedBridge.log("[LiquidTab] Douyin profile lifecycle binding unavailable $name: $it")
             }
         }
+    }
+
+    private data class NavigationState(val color: Int, val contrast: Boolean, val flags: Int, val fitTypes: Int)
+    private val detailNavigation = WeakHashMap<Activity, NavigationState>()
+
+    @Suppress("DEPRECATION")
+    private fun syncDetailNavigation(page: View, activity: Activity) {
+        val window = activity.window
+        val decor = window.decorView
+        val pager = page.parent as? ViewGroup ?: return
+        val namespace = pager.javaClass.name
+        if (roots[page] != true || page.rootView !== decor ||
+            (!namespace.startsWith("com.ss.android.ugc.aweme.detail.") &&
+                !namespace.startsWith("com.bytedance.ies.ugc.aweme.photos.detail."))) return
+        val layoutFlag = View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        val active = page.isShown && page.getGlobalVisibleRect(visibleRect) &&
+            visibleRect.width() > pager.width / 2 &&
+            io.github.offlineglass.hook.HookConfigReader.read(activity, activity.packageName).enabled
+        if (active) {
+            detailNavigation.getOrPut(activity) {
+                NavigationState(window.navigationBarColor,
+                    Build.VERSION.SDK_INT >= 29 && window.isNavigationBarContrastEnforced,
+                    decor.systemUiVisibility, if (Build.VERSION.SDK_INT >= 30) window.attributes.fitInsetsTypes else 0)
+            }
+            // Extend the content behind the system navigation controls using
+            // Android's layout flag. Do not move or hide those controls.
+            decor.systemUiVisibility = decor.systemUiVisibility or layoutFlag
+            if (Build.VERSION.SDK_INT >= 30) {
+                val attrs = window.attributes
+                val types = attrs.fitInsetsTypes and WindowInsets.Type.navigationBars().inv()
+                if (types != attrs.fitInsetsTypes) {
+                    attrs.setFitInsetsTypes(types)
+                    window.attributes = attrs
+                }
+            }
+            window.navigationBarColor = Color.TRANSPARENT
+            if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = false
+        } else {
+            val original = detailNavigation.remove(activity) ?: return
+            if (Build.VERSION.SDK_INT >= 30) {
+                val attrs = window.attributes
+                val nav = WindowInsets.Type.navigationBars()
+                attrs.setFitInsetsTypes((attrs.fitInsetsTypes and nav.inv()) or (original.fitTypes and nav))
+                window.attributes = attrs
+            }
+            decor.systemUiVisibility = (decor.systemUiVisibility and layoutFlag.inv()) or (original.flags and layoutFlag)
+            window.navigationBarColor = original.color
+            if (Build.VERSION.SDK_INT >= 29) window.isNavigationBarContrastEnforced = original.contrast
+        }
+        decor.requestApplyInsets()
     }
 
     fun contains(view: View): Boolean {

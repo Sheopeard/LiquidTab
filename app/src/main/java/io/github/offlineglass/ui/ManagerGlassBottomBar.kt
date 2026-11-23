@@ -55,10 +55,10 @@ import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asComposePath
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.shadow.Shadow
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LayoutCoordinates
@@ -70,6 +70,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.fastCoerceIn
@@ -278,6 +279,8 @@ fun ManagerGlassBottomBar(
     liquidGlassEnabled: Boolean = true,
     solidBarEnabled: Boolean = false,
     postureEffectsEnabled: Boolean = true,
+    indicatorInteractionLightEnabled: Boolean = true,
+    simplifyTabSwitch: Boolean = true,
     outlineEnabled: Boolean = true,
     blurRadius: Float = 0f,
     cornerRadiusPercent: Float = 50f,
@@ -287,6 +290,7 @@ fun ManagerGlassBottomBar(
     lightAlpha: Float = 0.40f,
     darkAlpha: Float = 0.40f,
     classicNavigation: Boolean = false,
+    iconOnly: Boolean = false,
 ) {
     val liquidOptics = liquidGlassEnabled && !solidBarEnabled
     val density = LocalDensity.current
@@ -335,7 +339,7 @@ fun ManagerGlassBottomBar(
     }
     val contentScale = ManagerBottomBarGeometry(
         with(density) { barWidth.toPx() }, with(density) { normalizedHeight.dp.toPx() },
-        density.density, pages.size, selectedIndex.toFloat(), 0f, 1f, 0f, density.fontScale,
+        density.density, pages.size, selectedIndex.toFloat(), 1f, density.fontScale,
     ).contentScale
     val tabIconSize = (28f * contentScale).dp
     val barCornerDp = normalizedHeight * cornerRadiusPercent.coerceIn(15f, 50f) / 100f
@@ -346,25 +350,25 @@ fun ManagerGlassBottomBar(
         )
     }
 
-    var tabWidthPx by remember { mutableFloatStateOf(0f) }
+    var panelSize by remember { mutableStateOf(IntSize.Zero) }
+    val tabWidthPx = (panelSize.width - with(density) { 4.dp.toPx() } * 2) / pages.size.toFloat()
     var dragIndex by remember { mutableFloatStateOf(selectedIndex.toFloat()) }
     var dragging by remember { mutableStateOf(false) }
     var pressedIndex by remember { mutableStateOf<Int?>(null) }
     val motion = remember(pages.size, liquidOptics) { ManagerBottomBarMotion(selectedIndex.toFloat(), pages.size, liquidOptics) }
     DisposableEffect(motion) { onDispose { motion.dispose() } }
     val selectWithPress: (Int) -> Unit = { index ->
-        motion.tap(index.toFloat(), liquidOptics)
+        motion.selectByTap(index.toFloat(), liquidOptics && !simplifyTabSwitch)
         onSelectedPage(pages[index])
     }
     val pressProgress = { motion.pressProgress }
-    val expansionProgress = { (motion.scaleY - 1f) /
-        (io.github.offlineglass.rendering.BottomBarIndicatorStyle.PRESS_SCALE - 1f) }
-    val indicatorCurve = -1f
-    // The manager's narrow three-tab panel uses full 1.48x horizontal growth;
-    // keep target apps' compact-tab reduction unchanged in the shared policy.
-    val indicatorShape = {
-        val indicatorOutset = (normalizedHeight - 8f) * 0.5f * (motion.scaleY - 1f) * 1.6f
-        BottomBarSquircleShape(CornerSize(((barCornerDp - 4f).coerceAtLeast(0f) + indicatorOutset).dp), indicatorCurve)
+    val insetIndicator = remember(panelSize, barCornerDp, cornerSmoothing, density.density, pages.size) {
+        if (tabWidthPx <= 0f || panelSize.height <= 0) null else with(density) {
+            ManagerInsetIndicatorShape(
+                panelSize.width.toFloat(), panelSize.height.toFloat(), barCornerDp.dp.toPx(),
+                cornerSmoothing.coerceIn(-1f, 1f), 4.dp.toPx(), pages.size,
+            )
+        }
     }
     // Finger position is authoritative during a drag. Restarting animateTo on
     // every MOVE can cancel it before its first frame and pin the lens in place.
@@ -374,6 +378,7 @@ fun ManagerGlassBottomBar(
     // lag and rebound; only the lens centre follows the pointer immediately.
     val latestSelection by rememberUpdatedState(selectedIndex)
     val latestOnSelected by rememberUpdatedState(onSelectedPage)
+    val latestRichTap by rememberUpdatedState(liquidOptics && !simplifyTabSwitch)
     val restingTintProgress = { io.github.offlineglass.rendering.IndicatorReturnPolicy.mix(
         motion.restingTintProgress, dragging || pressedIndex != null, true, true) }
     LaunchedEffect(selectedIndex) {
@@ -387,6 +392,9 @@ fun ManagerGlassBottomBar(
     // sensor while liquid glass is on — plain/solid modes draw no stroke.
     // Defer pose reads until drawing. Otherwise every sensor tick recomposes
     // the entire bar, its layouts, three icon rows and pointer-input modifiers.
+    val panelEdge = remember { ManagerGlassEdge() }
+    val hiddenEdge = remember { ManagerGlassEdge() }
+    val sliderEdge = remember { ManagerGlassEdge() }
     val baseHighlight = { if (liquidOptics) currentManagerHighlight(-45f, postureEffectsEnabled) else iosIndicatorSpecular }
     val pillHighlight = { if (liquidOptics) currentManagerHighlight(90f, postureEffectsEnabled) else iosIndicatorSpecular }
 
@@ -402,18 +410,12 @@ fun ManagerGlassBottomBar(
                 .width(barWidth)
                 .height(normalizedHeight.dp)
                 .graphicsLayer {
-                    // Same panel-width-derived growth as GlassHostLayout.updateOuterScale.
-                    val scale = 1f + 16.dp.toPx() / size.width.coerceAtLeast(1f) * pressProgress()
                     translationX = io.github.offlineglass.rendering.BottomBarMotionSprings.panelTranslation(
                         motion.panelDragOffset, size.width, density.density)
-                    scaleX = scale
-                    scaleY = scale
-                    clip = false
                 }
                 .onSizeChanged {
                     // Measure the host, not a Row with inner padding modifiers.
-                    tabWidthPx = (it.width - with(density) { 4.dp.roundToPx() } * 2) /
-                        pages.size.toFloat()
+                    panelSize = it
                 }
                 .drawWithCache {
                     val illuminationClip = Path().apply {
@@ -421,7 +423,7 @@ fun ManagerGlassBottomBar(
                             size.height * cornerRadiusPercent.coerceIn(15f, 50f) / 100f, cornerSmoothing)
                     }
                     onDrawBehind {
-                        if (pressProgress() > 0.001f && !solidBarEnabled) {
+                        if (indicatorInteractionLightEnabled && pressProgress() > 0.001f && !solidBarEnabled) {
                             val center = Offset(4.dp.toPx() + (settledIndex() + 0.5f) * tabWidthPx, size.height / 2f)
                             val radius = 96.dp.toPx()
                             clipPath(illuminationClip) {
@@ -434,9 +436,17 @@ fun ManagerGlassBottomBar(
                 },
             contentAlignment = Alignment.CenterStart,
         ) {
-            Row(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .graphicsLayer {
+                        // Only the panel grows. Tabs, hit targets and the independently
+                        // measured thumb stay in unscaled host coordinates.
+                        val panelPress = if (motion.sliderOnlyPress) 0f else pressProgress()
+                        val grow = 16.dp.toPx() / size.width.coerceAtLeast(1f) * panelPress * 0.8f
+                        scaleX = 1f + grow * 0.65f
+                        scaleY = 1f + grow
+                    }
                     .dropShadow(
                         shape = barShape,
                         shadow = Shadow(
@@ -475,45 +485,13 @@ fun ManagerGlassBottomBar(
                         },
                         onDrawSurface = {
                             drawRect(if (solidBarEnabled) containerColor else configuredFill.copy(alpha = configuredAlpha))
+                            if (outlineEnabled && liquidOptics && !solidBarEnabled) {
+                                val light = (baseHighlight().style as BloomStroke).primaryLight.position
+                                panelEdge.draw(this, barShape, isDark,
+                                    (if (isDark) .58f else .75f) * darkBarHighlightStrength, light.x, light.y)
+                            }
                         },
                     )
-                    .drawWithCache {
-                        val path = Path().apply {
-                            addBottomBarSquircle(
-                                width = size.width,
-                                height = size.height,
-                                radius = size.minDimension *
-                                    (cornerRadiusPercent.coerceIn(15f, 50f) / 100f),
-                                smoothing = cornerSmoothing,
-                            )
-                        }
-                        val outerLight = (baseHighlight().style as BloomStroke).primaryLight.position
-                        val dx = outerLight.x - LIGHT_REF_X
-                        val dy = outerLight.y - LIGHT_REF_Y
-                        val length = sqrt(dx * dx + dy * dy).coerceAtLeast(0.001f)
-                        val ux = dx / length
-                        val uy = dy / length
-                        val reach = size.maxDimension * 0.58f
-                        val center = Offset(size.width * 0.5f, size.height * 0.5f)
-                        val brush = Brush.linearGradient(
-                            colors = listOf(
-                                Color.Transparent,
-                                Color.White.copy(alpha = if (isDark) 0.07f * darkBarHighlightStrength else 0.10f),
-                                Color.White.copy(alpha = if (isDark) 0.50f * darkBarHighlightStrength else 0.68f),
-                                Color.White.copy(alpha = if (isDark) 0.11f * darkBarHighlightStrength else 0.16f),
-                                Color.Transparent,
-                            ),
-                            start = center - Offset(ux * reach, uy * reach),
-                            end = center + Offset(ux * reach, uy * reach),
-                        )
-                        val stroke = Stroke(width = 1.dp.toPx())
-                        onDrawWithContent {
-                            drawContent()
-                            if (liquidOptics && outlineEnabled && !solidBarEnabled) {
-                                drawPath(path = path, brush = brush, style = stroke)
-                            }
-                        }
-                    }
                     .then(
                         if (!liquidOptics && outlineEnabled) Modifier.border(
                             width = 1.dp,
@@ -522,7 +500,9 @@ fun ManagerGlassBottomBar(
                             shape = barShape,
                         ) else Modifier,
                     )
-                    .padding(4.dp),
+            )
+            Row(
+                modifier = Modifier.fillMaxSize().padding(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 ManagerTabs(
@@ -538,6 +518,7 @@ fun ManagerGlassBottomBar(
                     interactive = true,
                     iconSize = tabIconSize,
                     contentScale = contentScale,
+                    iconOnly = iconOnly,
                 )
             }
 
@@ -567,19 +548,19 @@ fun ManagerGlassBottomBar(
                             )
                         },
                         highlight = {
-                            pillHighlight().copy(
-                                width = io.github.offlineglass.rendering.BottomBarIndicatorStyle.SPECULAR_WIDTH_DP.dp,
-                                alpha = if (liquidOptics && outlineEnabled && !solidBarEnabled)
-                                    io.github.offlineglass.rendering.BottomBarIndicatorStyle.SPECULAR_MIN_ALPHA * pressProgress().coerceIn(0f, 1f)
-                                else 0f,
-                            )
+                            iosIndicatorSpecular.copy(alpha = 0f)
                         },
                         onDrawSurface = {
                             // Only the hidden source carries its material fill.
                             drawRect(configuredFill.copy(alpha = configuredAlpha))
                             if (liquidOptics && !solidBarEnabled) {
-                                drawRect(if (isDark) Color.White else Color.Black,
-                                    alpha = 0.10f * restingTintProgress())
+                                val strength = io.github.offlineglass.rendering.BottomBarIndicatorStyle.SPECULAR_MIN_ALPHA *
+                                    io.github.offlineglass.rendering.BottomBarIndicatorStyle.HIDDEN_SPECULAR_GAIN *
+                                    pressProgress().coerceIn(0f, 1f)
+                                if (outlineEnabled && pressProgress() > 0f) {
+                                    val light = (pillHighlight().style as BloomStroke).primaryLight.position
+                                    hiddenEdge.draw(this, hiddenShape, isDark, strength * 2f * darkBarHighlightStrength, light.x, light.y)
+                                }
                             }
                         },
                     )
@@ -601,36 +582,60 @@ fun ManagerGlassBottomBar(
                     // the indicator grows; only the sampled backdrop refracts.
                     iconSize = tabIconSize,
                     contentScale = contentScale,
+                    iconOnly = iconOnly,
                 )
             }
 
-            if (tabWidthPx > 0f) {
+            if (insetIndicator != null) {
                 // The child is measured with the REAL enlarged lens dimensions.
                 // A requiredSize after drawBackdrop reports a height constrained
                 // by the bar to the shader, then centres a larger child inside it.
                 // That mismatch clips sampled artwork and exposes hard seams.
                 ManagerIndicatorLayout(
-                    position = settledIndex, progress = expansionProgress,
+                    position = settledIndex, verticalScale = { motion.scaleY },
                     tabs = pages.size, density = density.density,
-                    expansionGain = 1.6f,
                 ) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .drawWithCache {
+                            val rim = android.graphics.Path()
+                            val transform = android.graphics.Matrix()
+                            val pen = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                style = android.graphics.Paint.Style.STROKE
+                                color = android.graphics.Color.BLACK
+                                strokeWidth = io.github.offlineglass.rendering.BottomBarIndicatorStyle
+                                    .expandedRimStrokeDp(isDark).dp.toPx()
+                            }
+                            onDrawWithContent {
+                                drawContent()
+                                val progress = pressProgress()
+                                if (liquidOptics && outlineEnabled && progress > 0.001f) {
+                                    insetIndicator.copyStretchedOutline(size,
+                                        ManagerBottomBarGeometry.stretchX(motion.velocity),
+                                        ManagerBottomBarGeometry.stretchY(motion.velocity), rim, transform)
+                                    pen.alpha = io.github.offlineglass.rendering.BottomBarIndicatorStyle
+                                        .expandedRimAlpha(isDark, progress)
+                                    drawContext.canvas.nativeCanvas.drawPath(rim, pen)
+                                }
+                            }
+                        }
                         .drawBackdrop(
                             backdrop = combinedBackdrop,
-                            shape = indicatorShape,
+                            shape = { insetIndicator },
                             effects = {
                                 if (solidBarEnabled) {
                                     // Opaque mode uses only the selected-state fill.
                                 } else if (liquidOptics) {
+                                    val lensProgress = maxOf(pressProgress(),
+                                        if (simplifyTabSwitch && pressedIndex == null && !dragging &&
+                                            kotlin.math.abs(motion.position - selectedIndex) > 0.001f) 0.35f else 0f)
                                     managerLens(
-                                        refractionHeight = 10.dp.toPx() * pressProgress(),
-                                        refractionAmount = 14.dp.toPx() * pressProgress(),
+                                        refractionHeight = 10.dp.toPx() * lensProgress,
+                                        refractionAmount = 14.dp.toPx() * lensProgress,
                                         depthEffect = false,
                                         chromaticAberration = io.github.offlineglass.rendering.indicatorChromaticAberration(pressProgress()),
-                                        continuousIndicator = true,
-                                        indicatorCurve = indicatorCurve,
+                                        insetIndicator = insetIndicator,
                                         postureBlend = if (dragging || pressedIndex != null) 0f
                                             else restingTintProgress() * pressProgress(),
                                     )
@@ -641,27 +646,31 @@ fun ManagerGlassBottomBar(
                                     // the pill's backdrop sampling.
                                 }
                             },
-                            highlight = {
-                                pillHighlight().copy(
-                                    alpha = if (outlineEnabled) {
-                                        io.github.offlineglass.rendering.indicatorHighlightAlpha(
-                                            pressProgress(), isDark)
-                                    } else {
-                                        0f
-                                    },
-                                )
-                            },
+                            highlight = { iosIndicatorSpecular.copy(alpha = 0f) },
                             layerBlock = {
                                 scaleX = ManagerBottomBarGeometry.stretchX(motion.velocity)
                                 scaleY = ManagerBottomBarGeometry.stretchY(motion.velocity)
                             },
                             onDrawSurface = {
+                                // Apply selection tint to the final clipped output, not to
+                                // the smaller hidden sample (whose edge may refract).
+                                if (liquidOptics) {
+                                    val alpha = 0.10f * restingTintProgress()
+                                    if (alpha > 0f) drawRect(if (isDark) Color.White else Color.Black, alpha = alpha)
+                                }
+                                if (outlineEnabled && liquidOptics && !solidBarEnabled && pressProgress() > 0.001f) {
+                                    val light = (pillHighlight().style as BloomStroke).primaryLight.position
+                                    val strength = io.github.offlineglass.rendering.indicatorHighlightAlpha(pressProgress(), isDark)
+                                    // Light mode uses one black hairline on the final transformed outline.
+                                    sliderEdge.draw(this, insetIndicator, isDark, strength * 2f * darkBarHighlightStrength,
+                                        light.x, light.y, blackOutline = isDark)
+                                }
                                 if (solidBarEnabled) drawRect(containerColor)
                                 if (!liquidOptics) drawRect(
                                     color = if (isDark) Color.White.copy(alpha = 0.10f)
                                     else Color.Black.copy(alpha = 0.10f),
                                 )
-                                if (isDark && pressProgress() > 0.001f) drawRect(Brush.radialGradient(
+                                if (indicatorInteractionLightEnabled && isDark && pressProgress() > 0.001f) drawRect(Brush.radialGradient(
                                     colors = listOf(Color.White.copy(alpha = 0.14f * pressProgress().coerceIn(0f, 1f)), Color.Transparent),
                                     center = Offset(size.width / 2f, size.height / 2f),
                                     radius = size.maxDimension * 0.65f,
@@ -689,6 +698,7 @@ fun ManagerGlassBottomBar(
                         interactive = false,
                         iconSize = tabIconSize,
                         contentScale = contentScale,
+                        iconOnly = iconOnly,
                     )
                 }
             }
@@ -707,9 +717,7 @@ fun ManagerGlassBottomBar(
                             val startPosition = motion.position
                             val startGeometry = ManagerBottomBarGeometry(
                                 size.width.toFloat(), size.height.toFloat(), density.density, pages.size,
-                                startPosition, (motion.scaleY - 1f) /
-                                    (io.github.offlineglass.rendering.BottomBarIndicatorStyle.PRESS_SCALE - 1f),
-                                io.github.offlineglass.rendering.BottomBarIndicatorStyle.PRESS_SCALE, 1.6f, density.fontScale,
+                                startPosition, motion.scaleY, density.fontScale,
                             )
                             val centre = startGeometry.left + startGeometry.lensWidth * 0.5f
                             val halfWidth = startGeometry.lensWidth * ManagerBottomBarGeometry.stretchX(motion.velocity) * 0.5f
@@ -749,7 +757,7 @@ fun ManagerGlassBottomBar(
                                     motion.releaseTo(target.toFloat(), if (moved) dragIndex else null)
                                     latestOnSelected(pages[target])
                                 } else if (!moved && upIndex == startIndex) {
-                                    motion.tap(startIndex.toFloat(), liquidOptics)
+                                    motion.selectByTap(startIndex.toFloat(), latestRichTap)
                                     latestOnSelected(pages[startIndex])
                                 }
                             } else dragIndex = latestSelection.toFloat()
@@ -771,6 +779,7 @@ private fun androidx.compose.foundation.layout.RowScope.ManagerTabs(
     interactive: Boolean,
     iconSize: androidx.compose.ui.unit.Dp,
     contentScale: Float,
+    iconOnly: Boolean,
 ) {
     pages.forEachIndexed { index, page ->
         val selected = index == selectedIndex
@@ -798,7 +807,7 @@ private fun androidx.compose.foundation.layout.RowScope.ManagerTabs(
                 modifier = Modifier.width(iconSize).height(iconSize),
                 tint = if (selected) selectedColor else unselectedColor,
             )
-            Text(
+            if (!iconOnly) Text(
                 text = page.title,
                 color = if (selected) selectedColor else unselectedColor,
                 fontSize = (11f * contentScale).sp,
@@ -814,17 +823,15 @@ private fun androidx.compose.foundation.layout.RowScope.ManagerTabs(
 @Composable
 private fun ManagerIndicatorLayout(
     position: () -> Float,
-    progress: () -> Float,
+    verticalScale: () -> Float,
     tabs: Int,
     density: Float,
-    expansionGain: Float,
     content: @Composable () -> Unit,
 ) {
     Layout(content = content, modifier = Modifier.fillMaxSize()) { children, constraints ->
         val geometry = ManagerBottomBarGeometry(
             constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat(), density,
-            tabs, 0f, progress(),
-            io.github.offlineglass.rendering.BottomBarIndicatorStyle.PRESS_SCALE, expansionGain, 1f,
+            tabs, 0f, verticalScale(), 1f,
         )
         val lens = children.single().measure(Constraints.fixed(
             geometry.lensWidth.roundToInt().coerceAtLeast(1),

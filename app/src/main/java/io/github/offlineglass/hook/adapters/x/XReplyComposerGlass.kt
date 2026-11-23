@@ -32,7 +32,7 @@ internal object XReplyComposerGlass {
         val binding=XComposeBridge(bindings)
         XReplyPageSource(binding) // Validate all source contracts before installing any hooks.
         bridge=binding
-        val surface=requireNotNull(bindings.methods["replyBorderScope"]) { "reply surface semantic scope missing" }
+        val surface=requireNotNull(bindings.methods["replySurface"]) { "reply surface semantic scope missing" }
         val stateType=surface.parameterTypes.single { it.name.startsWith("dev.chrisbanes.haze.") }
         val stateIndex=surface.parameterTypes.indices.single { surface.parameterTypes[it]==stateType }
         hook(surface,object: XC_MethodHook() {
@@ -54,7 +54,11 @@ internal object XReplyComposerGlass {
         bindings.methods["replyComposer"]?.let { method -> hook(method,object: XC_MethodHook() {
             override fun afterHookedMethod(p: MethodHookParam) { if(nodes.isEmpty()) schedule() }
         }) }
-        data class Pass(val node: Any,val scope: Any,val frame: XComposeBridge.Frame,var painted: Boolean=false,var outerClip: Int=-1)
+        data class Pass(val hook: XC_MethodHook.MethodHookParam,val scope: Any,val frame: XComposeBridge.Frame,
+                        val coordinate: Any,var controller: Controller?=null,var shape: XComposeBridge.Shape?=null,
+                        var painted: Boolean=false,var outerClip: Int=-1) {
+            val node: Any get() = hook.thisObject
+        }
         val passes=ThreadLocal.withInitial { ArrayDeque<Pass>() }
         val saved=WeakHashMap<XC_MethodHook.MethodHookParam,Pair<android.graphics.Canvas,Int>>()
         hook(binding.drawMethod,object: XC_MethodHook() {
@@ -62,13 +66,13 @@ internal object XReplyComposerGlass {
                 if(!active) return
                 val scope=p.args.firstOrNull() ?: return
                 runCatching {
+                    if(!binding.ownsReply(p.thisObject)) return
                     val frame=binding.frame(scope) ?: return
                     if(!frame.canvas.isHardwareAccelerated) return
-                    val pass=Pass(p.thisObject,scope,frame)
-                    passes.get()?.addLast(pass)
                     val coordinate=binding.coordinator(p.thisObject) ?: return
+                    val pass=Pass(p,scope,frame,coordinate)
+                    passes.get()?.addLast(pass)
                     observed[p.thisObject]=Observed(WeakReference(coordinate),frame.width,frame.height)
-                    if(!binding.ownsReply(p.thisObject)) return
                     val rect=binding.bounds(coordinate) ?: return
                     val controller=uniqueController(binding,p.thisObject,rect,frame.width,frame.height)
                     if(controller==null) { if(controllers.isEmpty()) schedule();return }
@@ -76,6 +80,8 @@ internal object XReplyComposerGlass {
                     val config=HookConfigReader.read(controller.anchor.context,XAdapter.PACKAGE_NAME)
                     if(!config.enabled || !config.backdropCapture) return
                     val shape=binding.shape(p.thisObject,scope,frame)
+                    pass.controller=controller
+                    pass.shape=shape
                     val contour=controller.material.prepareContour(frame,shape)
                     pass.outerClip=frame.canvas.save()
                     frame.canvas.clipPath(contour)
@@ -83,7 +89,7 @@ internal object XReplyComposerGlass {
             }
             override fun afterHookedMethod(p: MethodHookParam) {
                 val stack=passes.get() ?: return
-                if(stack.lastOrNull()?.node===p.thisObject) {
+                if(stack.lastOrNull()?.hook===p) {
                     val pass=stack.removeLast()
                     if(pass.outerClip>=0) pass.frame.canvas.restoreToCount(pass.outerClip)
                 }
@@ -102,17 +108,19 @@ internal object XReplyComposerGlass {
                     // Do not put a backdrop into that recording or redraw its content.
                     if(frame.canvas!==pass.frame.canvas || !frame.canvas.isHardwareAccelerated) return
                     val coordinate=binding.coordinator(node) ?: return
-                    if(!binding.ownsReply(node)) return
-                    observed[node]=Observed(WeakReference(coordinate),frame.width,frame.height)
-                    if(controllers.isEmpty()) { schedule();return }
-                    val rect=binding.bounds(coordinate) ?: return
-                    val controller=uniqueController(binding,node,rect,frame.width,frame.height) ?: return
-                    nodes[node]=controller;boundCoordinates[node]=WeakReference(coordinate)
-                    val config=HookConfigReader.read(controller.anchor.context,XAdapter.PACKAGE_NAME)
-                    if(!config.enabled) return
-                    val shape=binding.shape(node,p.thisObject,frame)
+                    val sameGeometry=coordinate===pass.coordinate && frame.size==pass.frame.size
+                    val controller=(if(sameGeometry) pass.controller else null) ?: run {
+                        if(!binding.ownsReply(node)) return
+                        observed[node]=Observed(WeakReference(coordinate),frame.width,frame.height)
+                        val rect=binding.bounds(coordinate) ?: return
+                        val found=uniqueController(binding,node,rect,frame.width,frame.height) ?: return
+                        nodes[node]=found;boundCoordinates[node]=WeakReference(coordinate)
+                        found
+                    }
+                    val shape=(if(sameGeometry) pass.shape else null) ?: binding.shape(node,p.thisObject,frame)
                     pass.painted=true
                     if(!controller.render(node,coordinate,frame,shape)) return
+                    if(sameGeometry && pass.outerClip>=0) return
                     val save=frame.canvas.save()
                     frame.canvas.clipPath(controller.material.contour)
                     saved[p]=frame.canvas to save
@@ -233,12 +241,7 @@ internal object XReplyComposerGlass {
             return abs(rect.height()-t.height())<4f ||
                 (rect.bottom>=t.bottom && t.height()>=rect.height()*.5f)
         }
-        fun bind(node: Any,coordinate: Any) {
-            source.bind(node,coordinate)
-            anchor.post { invalidate();anchor.invalidate() }
-        }
         fun render(node: Any,coordinate: Any,frame: XComposeBridge.Frame,shape: XComposeBridge.Shape): Boolean {
-            source.bind(node,coordinate)
             val rendered=material.draw(frame.canvas,node,coordinate,frame,shape)
             renderOutcome="rendered=$rendered; ${material.diagnostic}"
             report("target=$target; rendered=$rendered; nativeBordersRemoved=${XReplyNativeBorder.removed}; footerMasksRemoved=${XReplyBackdropMask.removed}; ${material.diagnostic}; ${source.diagnostic}")
@@ -256,6 +259,7 @@ internal object XReplyComposerGlass {
                 }
                 return
             }
+            val changed=target!=found || missingSince!=0L
             missingSince=0L;anchor.removeCallbacks(confirmMissing)
             target=found
             // Reject duplicate native draw owners instead of selecting by order.
@@ -267,15 +271,21 @@ internal object XReplyComposerGlass {
             }
             if(candidates.size==1) {
                 val (node,coordinate)=candidates.single()
-                if(nodes[node]!==this) { nodes[node]=this;boundCoordinates[node]=WeakReference(coordinate);bind(node,coordinate) }
+                if(nodes[node]!==this || boundCoordinates[node]?.get()!==coordinate) {
+                    nodes[node]=this;boundCoordinates[node]=WeakReference(coordinate)
+                    anchor.post { invalidate();anchor.invalidate() }
+                }
             } else if(candidates.size>1) {
-                candidates.forEach { nodes.remove(it.first);boundCoordinates.remove(it.first) }
+                candidates.forEach { (node,_) ->
+                    if(nodes.remove(node)!=null) runCatching { bridge.invalidate(node) }
+                    boundCoordinates.remove(node)
+                }
             }
             val evidence=if(found!=null && candidates.isEmpty()) observed.entries.take(6).joinToString { (node,seen) ->
                 "${seen.width.toInt()}x${seen.height.toInt()}/${seen.coordinate.get()?.let(bridge::bounds)}/owned=${bridge.ownsReply(node)}"
             } else ""
             report("semantics target=$found; nativeCandidates=${candidates.size}; bound=${nodes.values.count { it===this }}; $renderOutcome; observed=[$evidence]; source=${source.diagnostic}")
-            invalidate()
+            if(changed) invalidate()
         }
         private fun report(text: String) {
             val now=SystemClock.uptimeMillis()

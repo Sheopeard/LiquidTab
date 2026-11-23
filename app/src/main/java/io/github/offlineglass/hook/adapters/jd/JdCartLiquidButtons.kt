@@ -19,15 +19,14 @@ import java.lang.ref.WeakReference
 /** JD cart geometry matches the Taobao 48dp dual-capsule row. Native business
  * views remain the foreground and receive mapped native touch sequences. */
 internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
-    private var source: ViewGroup, private val select: View, private val amount: View,
-    private val checkout: View, private val sceneProvider: () -> View?, private var eventRoot: ViewGroup) : View(context),
+    private val binding: JdCheckoutBinding, private val sceneProvider: () -> View?) : View(context),
     io.github.offlineglass.hook.adapters.AdapterOwnedOverlay {
     private val host = WeakReference(host)
     private val rects = Array(2) { RectF() }
     private val paths = Array(2) { Path() }
     private val highlightPaths = Array(2) { Path() }
     private val highlights = Array(2) {
-        runCatching { RuntimeShader(GlassHostLayout.BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
+        runCatching { io.github.offlineglass.rendering.GlassEdgeHighlight.shader() }.getOrNull()
     }
     private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val nodes = Array(2) { RenderNode("JdCartCapsule$it") }
@@ -41,7 +40,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
     private val parentLocation = IntArray(2)
     private var geometry = ""
     private val targets = Array(3) { RectF() }
-    private val nativeViews = arrayOf(select, amount, checkout)
+    private val nativeViews = arrayOf(binding.select, binding.amount, binding.checkout)
     private val contentRects = Array(3) { RectF() }
     private val sourcePosition = IntArray(2)
     private val scenePosition = IntArray(2)
@@ -78,7 +77,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
                 if (view !is ViewGroup || (index == 0 && isSelectionGlyph(view))) {
                     if (view.width > 0 && view.height > 0)
                         bounds.union(x, y, x + view.width, y + view.height)
-                } else if (view is ViewGroup) {
+                } else {
                     for (i in 0 until view.childCount) {
                         val child = view.getChildAt(i)
                         collect(child, x + child.left + child.translationX, y + child.top + child.translationY)
@@ -93,19 +92,6 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
     fun capsuleTopInWindow(): Int {
         getLocationInWindow(location)
         return (location[1] + rects[0].top).toInt()
-    }
-
-    fun validBinding(): Boolean = nativeViews.all { it.isAttachedToWindow }
-
-    fun bind(source: ViewGroup, select: View, amount: View, checkout: View, eventRoot: ViewGroup) {
-        this.source = source
-        this.eventRoot = eventRoot
-        nativeViews[0] = select; nativeViews[1] = amount; nativeViews[2] = checkout
-        downKind = null
-        geometry = ""
-        updateContentBounds()
-        updateGeometry()
-        invalidate()
     }
 
     fun refresh() {
@@ -153,7 +139,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
 
     override fun onDraw(canvas: Canvas) {
         val glass = host.get() ?: return
-        if (glass.adapterSelectedIndex != 3) return
+        if (!binding.isCurrent()) return
         val scene = sceneProvider()?.takeIf { it.isAttachedToWindow && it.isShown }
         if (sampledScene !== scene) {
             sampledScene = scene
@@ -202,7 +188,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
             if (glass.config.backdropCapture && !glass.config.solidBarEnabled &&
                 (glass.config.liquidGlassEnabled || blur > 0f) &&
                 canvas.isHardwareAccelerated && scene != null && inputNode?.hasDisplayList() == true) {
-                val pad = NativeBackdropBlur.padding(blur, 24f * density)
+                val pad = NativeBackdropBlur.padding(blur, 24f * density * glass.config.refractionPaddingScale)
                 val w = (rect.width() + pad * 2).toInt()
                 val h = (rect.height() + pad * 2).toInt()
                 val node = nodes[i]
@@ -221,7 +207,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
                     } finally { node.endRecording() }
                     recordings[i] = record
                 }
-                val effect = "$w:$h:$blur:$density:${glass.config.liquidGlassEnabled}"
+                val effect = "$w:$h:$blur:$density:${glass.config.liquidGlassEnabled}:${glass.config.refractionStrength}"
                 if (effects[i] != effect) {
                     val lens = lenses[i]
                     lens.setFloatUniform("size", rect.width(), rect.height())
@@ -229,7 +215,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
                     lens.setFloatUniform("cornerRadii", FloatArray(4) { rect.height() / 2f })
                     // Kyant LiquidButton reference: 48dp high, lens(12dp, 24dp).
                     lens.setFloatUniform("refractionHeight", 12f * density)
-                    lens.setFloatUniform("refractionAmount", -24f * density)
+                    lens.setFloatUniform("refractionAmount", -24f * density * glass.config.refractionScale)
                     lens.setFloatUniform("depthEffect", 0f)
                     val blurEffect = NativeBackdropBlur.effect(blur)
                     node.setRenderEffect(if (glass.config.liquidGlassEnabled)
@@ -251,34 +237,18 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
                 else if (dark) Color.argb(184, 28, 28, 30) else Color.argb(184, 255, 255, 255)
             canvas.drawRect(rect, paint)
             canvas.restoreToCount(save)
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = .6f * density
-            paint.color = Color.argb(if (dark) 30 else 90, 255, 255, 255)
-            canvas.drawPath(path, paint)
+            if (!glass.config.liquidGlassEnabled || glass.config.solidBarEnabled) {
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = .6f * density
+                paint.color = Color.argb(if (dark) 30 else 90, 255, 255, 255)
+                canvas.drawPath(path, paint)
+            }
             val light = canvas.save()
             canvas.clipPath(path)
             drawHighlight(canvas, i, glass, density)
             canvas.restoreToCount(light)
         }
         // Foreground is drawn AFTER both lens effects, once.
-        if (!validBinding() || !source.isShown) {
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = 1.3f * density
-            paint.color = if (dark) 0xFFB8B8BD.toInt() else 0xFF77777C.toInt()
-            canvas.drawCircle(rects[0].left + 20f * density, rects[0].centerY(), 9f * density, paint)
-            paint.style = Paint.Style.FILL
-            paint.textSize = 14f * density
-            paint.textAlign = Paint.Align.LEFT
-            canvas.drawText("全选", rects[0].left + 36f * density, rects[0].centerY() - (paint.ascent() + paint.descent()) / 2, paint)
-            paint.textAlign = Paint.Align.RIGHT
-            paint.textSize = 12f * density
-            canvas.drawText("计算中…", rects[0].right - 12f * density, rects[0].centerY() - (paint.ascent() + paint.descent()) / 2, paint)
-            paint.color = Color.WHITE
-            paint.textSize = 16f * density
-            paint.textAlign = Paint.Align.CENTER
-            canvas.drawText("去结算", rects[1].centerX(), rects[1].centerY() - (paint.ascent() + paint.descent()) / 2, paint)
-            return
-        }
         nativeViews.forEachIndexed { index, view ->
             val target = targets[index]
             if (view.width > 0 && view.height > 0 && target.width() > 0f) {
@@ -299,7 +269,7 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
 
     /** UI-owned chrome: never touch the host's worker-owned shader, Paint or Path. */
     private fun drawHighlight(canvas: Canvas, index: Int, glass: GlassHostLayout, density: Float) {
-        if (!glass.config.liquidGlassEnabled || !glass.config.outlineEnabled) return
+        if (!glass.config.liquidGlassEnabled || !glass.config.outlineEnabled || glass.config.solidBarEnabled) return
         val shader = highlights[index] ?: return
         val rect = rects[index]
         var gx = if (glass.config.postureEffectsEnabled) BloomTiltTracker.gravityX else 0f
@@ -332,7 +302,9 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
         highlightPaint.strokeWidth = density
         val saved = canvas.save()
         canvas.translate(rect.left, rect.top)
-        canvas.drawPath(highlightPaths[index], highlightPaint)
+        io.github.offlineglass.rendering.GlassEdgeHighlight.draw(
+            canvas, highlightPaths[index], highlightPaint, shader, density, glass.adapterContentOrSystemDark(),
+            glass.config.darkBarHighlightStrength > 0f)
         canvas.restoreToCount(saved)
         highlightPaint.shader = null
     }
@@ -359,7 +331,8 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
     }
 
     private fun send(index: Int, action: Int, x: Float, y: Float) {
-        if (!validBinding() || !source.isShown) return
+        if (!binding.isCurrent()) return
+        val eventRoot = binding.eventRoot
         val view = nativeViews[index]
         val target = targets[index]
         val content = contentRects[index]
@@ -372,13 +345,13 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
         val px = ((x - originX) / scale + content.left).coerceIn(1f, (view.width - 1).coerceAtLeast(1).toFloat()) + location[0] - sourcePosition[0]
         val py = ((y - originY) / scale + content.top).coerceIn(1f, (view.height - 1).coerceAtLeast(1).toFloat()) + location[1] - sourcePosition[1]
         val event = MotionEvent.obtain(downAt, android.os.SystemClock.uptimeMillis(), action, px, py, 0)
-        // ReactRootView.onInterceptTouchEvent calls dispatchJSTouchEvent and
-        // dispatchJSPointerEvent (16.1.0). Sending just to the footer bypasses
-        // those business events. Our overlay is outside this React root.
+        // The React root dispatches the mapped touch and pointer events to
+        // the original checkout handlers, including on ReactSurfaceView.
         try { eventRoot.onInterceptTouchEvent(event) } finally { event.recycle() }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!binding.isCurrent()) return false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val index = targetAt(event.x, event.y)
@@ -409,6 +382,8 @@ internal class JdCartLiquidButtons(context: Context, host: GlassHostLayout,
     }
 
     fun release() {
+        downKind?.toIntOrNull()?.let { send(it, MotionEvent.ACTION_CANCEL, downX, downY) }
+        downKind = null
         io.github.offlineglass.rendering.PostureGlass.track(this, false)
         nodes.forEach { it.discardDisplayList() }
         sampledScene = null

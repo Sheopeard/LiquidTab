@@ -52,12 +52,13 @@ internal object TaobaoAdapter : TargetAdapter {
     // Share the same full-quality blur input between the panel and its lens.
     override val reuseOpticalBlur = true
     override val reuseSurfaceBlurDuringBarAnimation = true
-    override val independentSampledIndicatorHighlight = true
-    // Animation submits through the app-owned worker, rather than also drawing
-    // from PixelCopy while the UI thread is submitting the same Surface.
+    // Keep the indicator's own bloom, but do not refract the panel's thin
+    // outline a second time through the moving indicator lens.
+    override val samplesPanelHighlightInIndicator = false
+    // Animation submits through the app-owned worker.
     override val deferOpticalRenderDuringBarAnimation = true
     // Keep one output across tabs: cart entry must not rebuild the compositor.
-    override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean = selectedIndex in 0..4
+    override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean = selectedIndex in 0..4 && selectedIndex != 3
     override fun onWindowTouch(host: View, event: android.view.MotionEvent) {
         (host as? GlassHostLayout)?.appNavigationState
             ?.let { it as? TaobaoNavigationState }

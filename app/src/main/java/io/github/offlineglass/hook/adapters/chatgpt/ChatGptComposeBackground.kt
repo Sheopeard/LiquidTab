@@ -22,7 +22,14 @@ internal object ChatGptComposeBackground {
     private val shapes=WeakHashMap<Any,Cached>()
     private val suspended=WeakHashMap<XC_MethodHook.MethodHookParam,List<Pair<Any,Boolean>>>()
     private var installed=false
-    fun clearGeometryCache(){shapes.clear()}
+    private var nativeShadowInstalled = false
+    private val renderedGlass = WeakHashMap<Any, Unit>()
+    fun isGlassActive(owner: Any): Boolean =
+        renderedGlass.containsKey(owner) && ChatGptPageSource.hasBackdrop(owner) && b.attached(owner)
+
+    private fun suppressShadow(owner: Any) =
+        nativeShadowInstalled && renderedGlass.containsKey(owner) && ChatGptPageSource.hasBackdrop(owner)
+
     fun hasSkippedBorder(owner:Any)=false
     fun hasSkippedShadow(owner:Any)=shadows.values.any {it.get()===owner}
     private fun painter(value:Any,owner:Any){
@@ -32,7 +39,7 @@ internal object ChatGptComposeBackground {
         if(painterHooks.add(actual))XposedBridge.hookMethod(actual,object:XC_MethodHook(){
             override fun beforeHookedMethod(param:MethodHookParam){
                 val owner=painters[param.thisObject]?.get()?:return
-                if(renderers.containsKey(owner))param.result=null
+                if(suppressShadow(owner))param.result=null
             }
         })
     }
@@ -43,13 +50,11 @@ internal object ChatGptComposeBackground {
         val entry=map[node]?:return
         b.read("shadow.entryPainter",entry)?.let {painter(it,owner)}
     }
-    fun installResolved(){
-        check(!installed)
-        ChatGptPageSource.installResolved()
+    fun installNativeShadow(){
         XposedBridge.hookMethod(b.method("shadow.draw"),object:XC_MethodHook(){
             override fun beforeHookedMethod(param:MethodHookParam){
                 val owner=shadows[param.thisObject]?.get()?:return
-                if(!renderers.containsKey(owner))return
+                if(!suppressShadow(owner))return
                 bindPainter(param.thisObject,owner)
                 b.call("scope.content",param.args[0]);param.result=null
             }
@@ -60,7 +65,7 @@ internal object ChatGptComposeBackground {
                 val changed=mutableListOf<Pair<Any,Boolean>>()
                 shadows.entries.toList().forEach { (node,reference)->
                     val owner=reference.get()
-                    if(owner!=null&&renderers.containsKey(owner)&&b.read("shadow.registryNode",node)===param.thisObject){
+                    if(owner!=null&&suppressShadow(owner)&&b.read("shadow.registryNode",node)===param.thisObject){
                         val entry=map[node]?:return@forEach
                         bindPainter(node,owner)
                         changed.add(entry to (b.read("shadow.entryActive",entry) as Boolean))
@@ -71,16 +76,22 @@ internal object ChatGptComposeBackground {
             }
             override fun afterHookedMethod(param:MethodHookParam){suspended.remove(param)?.forEach {(entry,active)->b.field("shadow.entryActive").setBoolean(entry,active)}}
         })
+        nativeShadowInstalled = true
+    }
+    fun installResolved(){
+        check(!installed)
+        ChatGptPageSource.installResolved()
         XposedBridge.hookMethod(b.method("background.draw"),object:XC_MethodHook(){
             override fun beforeHookedMethod(param:MethodHookParam){
                 val owner=param.thisObject
                 val renderer=renderers[owner]
                 if(renderer==null){
                     val primary=extras[owner]?.get()?:return
-                    if(renderers.containsKey(primary)){b.call("scope.content",param.args[0]);param.result=null}
+                    if(renderedGlass.containsKey(primary)&&ChatGptPageSource.hasBackdrop(primary)){b.call("scope.content",param.args[0]);param.result=null}
                     return
                 }
-                runCatching {
+                var painted = false
+                try {
                     val scope=param.args[0]
                     val parameters=b.read("scope.parameters",b.read("scope.canvasScope",scope)!!)!!
                     val wrapper=b.read("parameters.canvas",parameters)!!
@@ -113,37 +124,71 @@ internal object ChatGptComposeBackground {
                     val save=canvas.save()
                     try{shape.contentClip?.let(canvas::clipPath);b.call("scope.content",scope)}finally{canvas.restoreToCount(save)}
                     param.result=null
-                }.onFailure {XposedBridge.log("[LiquidTab][ChatGPT] native draw contract: $it")}
+                    painted = true
+                } catch (error: Exception) {
+                    XposedBridge.log("[LiquidTab][ChatGPT] native draw contract: $error")
+                } finally {
+                    val changed = if (painted) renderedGlass.put(owner, Unit) == null else renderedGlass.remove(owner) != null
+                    if (changed) {
+                        val view = b.layout(owner)?.let { b.read("layout.owner", it) } as? View
+                        view?.post {
+                            invalidate(ownedExtras[owner].orEmpty().toSet())
+                            invalidate(shadows.filterValues { it.get() === owner }.keys)
+                            ChatGptDockMasks.invalidate(owner)
+                        }
+                    }
+                }
             }
         })
         installed=true
     }
-    fun find(anchor:View,semanticsId:Int,bounds:Rect,composer:Boolean=false):Set<Any> = runCatching {
-        val map=b.call("owner.nodes",anchor)!!
-        val ids=listOf(semanticsId,semanticsId-2_000_000_000,semanticsId-1_000_000_000).filter {it>=0}
-        val start=ids.firstNotNullOfOrNull {b.call("semantics.lookup",map,it)}?:return emptySet()
+    fun find(
+        anchor: View, semanticsId: Int, bounds: Rect, composer: Boolean = false, dock: Boolean = false,
+    ): Set<Any> = runCatching {
+        val start = b.semanticLayout(anchor, semanticsId) ?: return emptySet()
         val layouts=linkedSetOf<Any>();val queue=java.util.ArrayDeque<Pair<Any,Int>>();queue.add(start to 0)
         while(queue.isNotEmpty()&&layouts.size<128){val (layout,depth)=queue.removeFirst();if(!layouts.add(layout)||depth>=6)continue;b.children(layout).forEach {queue.add(it to depth+1)}}
         var current:Any?=start
-        repeat(12){current?.let {layouts.add(it);current=b.parent(it)}}
+        val ancestors = linkedSetOf<Any>()
+        repeat(12) { current?.let { ancestors.add(it); current = b.parent(it) } }
+        layouts.addAll(ancestors)
+        val maskCandidates = ArrayList<Triple<ChatGptDockMasks.Kind, Any, Any>>()
+        val backgroundType = b.type("background.type")
+        val shadowType = if (composer && nativeShadowInstalled) b.method("shadow.draw").declaringClass else null
         val backgrounds=linkedSetOf<Any>();val nativeShadows=linkedSetOf<Any>()
         val visited=java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any,Boolean>())
         for(layout in layouts){
             val chain=b.read("layout.chain",layout)!!
-            val pending=java.util.ArrayDeque<Any>();b.read("chain.head",chain)?.let(pending::add)
+            val pending=java.util.ArrayDeque<Any>()
+            b.read("chain.head",chain)?.takeIf(b.type("node.type")::isInstance)?.let(pending::add)
             while(pending.isNotEmpty()&&visited.size<4096){
                 val node=pending.removeFirst();if(!visited.add(node))continue
                 if(b.field("node.delegate").declaringClass.isInstance(node))b.read("node.delegate",node)?.let(pending::add)
-                val rect=screenBounds(node,anchor)
-                if(rect!=null&&abs(rect.left-bounds.left)<=3&&abs(rect.top-bounds.top)<=3&&abs(rect.width()-bounds.width())<=3&&abs(rect.height()-bounds.height())<=3){
-                    if(b.type("background.type").isInstance(node))backgrounds.add(node)
-                    if(composer&&b.method("shadow.draw").declaringClass.isInstance(node))nativeShadows.add(node)
+                if (dock) ChatGptDockMasks.kindOf(node)?.let { kind ->
+                    maskCandidates.add(Triple(kind, node, layout))
+                }
+                val background = backgroundType.isInstance(node)
+                val shadow = shadowType?.isInstance(node) == true
+                if (background || shadow) {
+                    val rect = screenBounds(node, anchor)
+                    if(rect!=null&&abs(rect.left-bounds.left)<=3&&abs(rect.top-bounds.top)<=3&&abs(rect.width()-bounds.width())<=3&&abs(rect.height()-bounds.height())<=3){
+                        if(background)backgrounds.add(node)
+                        if(shadow)nativeShadows.add(node)
+                    }
                 }
                 b.read("node.next",node)?.let(pending::add)
             }
         }
         backgrounds.take(1).toSet().also { owners->owners.forEach {owner->
-            nativeShadows.forEach {node->shadows[node]=java.lang.ref.WeakReference(owner);bindPainter(node,owner);b.invalidate(node)}
+            nativeShadows.forEach { node ->
+                runCatching {
+                    bindPainter(node, owner)
+                    shadows[node] = java.lang.ref.WeakReference(owner)
+                    b.invalidate(node)
+                }.onFailure { ChatGptDiagnostics.report(anchor.context, "nativeShadowBindingFailure", it.toString()) }
+            }
+            if (dock) runCatching { ChatGptDockMasks.bind(anchor, owner, bounds, maskCandidates) }
+                .onFailure { ChatGptDiagnostics.report(anchor.context, "dockGradientBindingFailure", it.toString()) }
             if(composer)ownedExtras[owner]=backgrounds.filter {it!==owner}
             ChatGptDiagnostics.report(anchor.context,"nativeDecoration","backgrounds=${backgrounds.size}; shadows=${nativeShadows.size}")
         }}
@@ -175,9 +220,15 @@ internal object ChatGptComposeBackground {
     }
     fun invalidate(nodes:Set<Any>){nodes.forEach {runCatching {b.invalidate(it)}}}
     fun replace(old:Set<Any>,next:Set<Any>,renderer:((Any,Canvas,Shape)->Boolean)?=null){
-        (old-next).forEach {owner->renderers.remove(owner);shapes.remove(owner);ownedExtras.remove(owner)?.forEach {runCatching {b.invalidate(it)}};ChatGptPageSource.unbind(owner)}
+        (old-next).forEach {owner->
+            ChatGptDockMasks.clear(owner)
+            renderers.remove(owner);renderedGlass.remove(owner);shapes.remove(owner);ownedExtras.remove(owner)?.forEach {runCatching {b.invalidate(it)}};ChatGptPageSource.unbind(owner)}
         next.forEach {if(renderer!=null)renderers[it]=renderer}
-        shadows.entries.removeAll {it.value.get()?.let {owner->!renderers.containsKey(owner)}!=false}
+        shadows.entries.removeAll {
+            val removed = it.value.get()?.let(renderers::containsKey) != true
+            if (removed) runCatching { b.invalidate(it.key) }
+            removed
+        }
         painters.entries.removeAll {it.value.get()?.let {owner->!renderers.containsKey(owner)}!=false}
         extras.clear();ownedExtras.forEach {(owner,values)->if(renderers.containsKey(owner))values.forEach {extras[it]=java.lang.ref.WeakReference(owner);runCatching {b.invalidate(it)}}}
         invalidate(old+next)

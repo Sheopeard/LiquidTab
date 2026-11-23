@@ -1,7 +1,6 @@
 package io.github.offlineglass.hook.adapters.quora
 
 import android.content.Context
-import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.view.View
 import android.view.ViewGroup
@@ -10,7 +9,6 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AppNavigationState
-import io.github.offlineglass.hook.adapters.OpticalCaptureGeometry
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.targets.TargetSpec
 
@@ -36,11 +34,7 @@ internal object QuoraAdapter : TargetAdapter {
     override val usesNavigationOpticalMix = true
     override val persistentNavigationOpticalMix = false
     override val foregroundMaskInsetDp = 0f
-    // Quora pages are WebViews; use the existing window-surface capture engine.
-    override val usesDirectOpticalBackdropMode = true
-    override val keepsOpticalSurfaceDuringBarAnimation = true
-    override val deferOpticalRenderDuringBarAnimation = true
-    override val reuseSurfaceBlurDuringBarAnimation = true
+    override val retainsExistingBackdropRenderNode = true
     private val nativeBackgrounds = java.util.WeakHashMap<ViewGroup, Drawable?>()
 
     // Installer calls this before clearing parent chrome. Retain its native
@@ -54,17 +48,6 @@ internal object QuoraAdapter : TargetAdapter {
 
     internal fun originalBackground(bar: ViewGroup): Drawable? = nativeBackgrounds[bar]
     internal fun forgetBackground(bar: ViewGroup) { nativeBackgrounds.remove(bar) }
-
-    override fun opticalCaptureGeometry(
-        rootWidth: Int, rootHeight: Int, left: Int, top: Int,
-        width: Int, height: Int, padding: Int,
-    ): OpticalCaptureGeometry? {
-        val rect = Rect((left - padding).coerceAtLeast(0), (top - padding).coerceAtLeast(0),
-            (left + width + padding).coerceAtMost(rootWidth),
-            (top + height + padding).coerceAtMost(rootHeight))
-        return if (rect.isEmpty) null else OpticalCaptureGeometry(
-            rect, rect.width(), rect.height(), Rect(0, 0, rect.width(), rect.height()))
-    }
 
     override fun findNavigation(root: View, spec: TargetSpec): NavigationCandidate? {
         val matches = ArrayList<ViewGroup>()
@@ -118,9 +101,9 @@ internal object QuoraAdapter : TargetAdapter {
     }
 }
 
-private class QuoraNavigationState(
-    private val opticalWork: QuoraOpticalWork = QuoraOpticalWork(),
-) : AppNavigationState by opticalWork {
+private class QuoraNavigationState : QuoraChromeState {
+    override val pageBackdrop = QuoraPageBackdrop()
+    override val usesArtworkOnlyIndicatorLens = true
     private var bar: ViewGroup? = null
     private var originalTopMargin = 0
     private var appliedTopMargin: Int? = null
@@ -129,14 +112,16 @@ private class QuoraNavigationState(
     private var originalBottomPadding: Int? = null
     private val webSafety = QuoraWebSafety()
     private val artwork = QuoraNavigationArtwork()
-    private val topBar = QuoraTopBar()
+    private val topBar = QuoraTopBar(pageBackdrop)
     private val sidebar = QuoraSidebar()
     private val gradients = QuoraEdgeGradients()
     override fun onHostFrame(host: View) {
         sidebar.update(insetOwner)
         (host as? io.github.offlineglass.hook.GlassHostLayout)?.let {
-            topBar.update(it, insetOwner,sidebar.open())
+            val sidebarOpen = sidebar.open()
+            topBar.update(it, insetOwner, sidebarOpen)
             gradients.update(it, topBar.visibilityHost())
+            pageBackdrop.update(webSafety.visibleBoundWeb(), it, topBar.glassHosts())
         }
     }
     override fun pageAllowsNavigation(root: View?): Boolean? = if(sidebar.open()) false else null
@@ -244,7 +229,14 @@ private class QuoraNavigationState(
     }
 
     override fun dispose() {
-        gradients.clear(); opticalWork.dispose()
+        pageBackdrop.dispose()
+        gradients.clear()
         sidebar.restore();topBar.dispose(); restore(); artwork.prepare(null)
+    }
+
+    override fun onHostDetached() = pageBackdrop.dispose()
+
+    override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+        if (!hasFocus) pageBackdrop.dispose()
     }
 }

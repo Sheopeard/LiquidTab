@@ -44,6 +44,7 @@ internal object XhsNativeBindings {
                         }
                     }.onFailure { android.util.Log.w("LiquidTabXhsBinding", "$role interface rejected", it) }
                     fields = fs; methods = ms; ready = true
+                    XhsOriginalImageExport.install(roles, loader, app)
                     XhsSplashAdsHooks.installResolved(roles, loader, ms)
                     android.util.Log.i("LiquidTabXhsBinding", "native contracts ${android.os.SystemClock.uptimeMillis() - began}ms: fields=${fs.keys}, methods=${ms.keys}; " +
                         roles.stringPropertyNames().filter { it.endsWith(".count") }.sorted().joinToString { "$it=${roles[it]}" })

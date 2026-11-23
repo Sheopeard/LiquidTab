@@ -15,12 +15,13 @@ internal class WeiboBottomGradient {
     private val gradient = HomeEdgeColorGradient(top = false)
     private val hostPosition = IntArray(2)
     private val parentPosition = IntArray(2)
-    fun update(host: View, enabled: Boolean) {
+    fun update(host: View, enabled: Boolean, dark: Boolean) {
         if (!enabled) { clear(); return }
         val parent = host.parent as? FrameLayout ?: return
         if (layer?.parent !== parent) {
             clear()
             layer = Layer(host.context).apply {
+                setForceDarkAllowed(false)
                 background = gradient; isClickable = false; isFocusable = false
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
                 parent.addView(this, parent.indexOfChild(host).coerceAtLeast(0), FrameLayout.LayoutParams(1, 1))
@@ -28,7 +29,7 @@ internal class WeiboBottomGradient {
         }
         val view = layer ?: return
         view.visibility = if (host.isShown) View.VISIBLE else View.GONE
-        gradient.setDark((host as? GlassHostLayout)?.adapterContentOrSystemDark() ?: false)
+        gradient.setDark(dark)
         host.getLocationInWindow(hostPosition); parent.getLocationInWindow(parentPosition)
         val top = (hostPosition[1] - parentPosition[1]).coerceIn(0, parent.height)
         val height = (parent.height - top).coerceAtLeast(1)

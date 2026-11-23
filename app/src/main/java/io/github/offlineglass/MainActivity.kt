@@ -57,7 +57,6 @@ class MainActivity : ComponentActivity() {
         setOutlineEnabled = { LocalSettings.setOutlineEnabled(this, it); refresh() },
         setAppEnabled = { packageName, enabled ->
             LocalSettings.setAppEnabled(this, packageName, enabled)
-
             refresh()
             stopTargetAfterSwitch(packageName)
         },

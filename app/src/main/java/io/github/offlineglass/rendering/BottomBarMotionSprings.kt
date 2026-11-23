@@ -21,7 +21,7 @@ internal class BottomBarMotionSprings(
             if (width <= 0f) return 0f
             val fraction = (offset / width).coerceIn(-1f, 1f)
             val eased = followEase.getInterpolation(kotlin.math.abs(fraction))
-            return 4f * density * if (fraction < 0f) -eased else eased
+            return 1.5f * density * if (fraction < 0f) -eased else eased
         }
     }
     val velocity = SpringFloat(0f, 300f, 0.5f, 0.01f) { value, _ -> onVelocity(value) }
@@ -35,11 +35,19 @@ internal class BottomBarMotionSprings(
     val panelOffset = SpringFloat(0f, 300f, 0.5f, 0.01f) { value, _ -> onPanelOffset(value) }
 
     fun press(pressedScale: Float, slots: Int) {
+        scaleX.resumeOscillation()
+        scaleY.resumeOscillation()
+        velocity.resumeOscillation()
         press.animateTo(1f)
         scaleX.animateTo(BottomBarIndicatorStyle.pressedScaleX(slots, pressedScale))
         scaleY.animateTo(pressedScale)
     }
     fun resetPress() { press.snapTo(0f); scaleX.snapTo(1f); scaleY.snapTo(1f) }
-    fun release() { press.animateTo(0f); scaleX.animateTo(1f); scaleY.animateTo(1f); velocity.animateTo(0f) }
+    fun release() {
+        press.animateTo(0f)
+        scaleX.returnTo(1f)
+        scaleY.returnTo(1f)
+        velocity.returnTo(0f)
+    }
     fun cancel() { listOf(position, velocity, press, scaleX, scaleY, panelOffset).forEach(SpringFloat::cancel) }
 }

@@ -19,7 +19,7 @@ import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
 
 /** Quora-owned binding, geometry and continuity. All material/press/posture is shared. */
-internal class QuoraTopBar {
+internal class QuoraTopBar(private val backdrop: QuoraPageBackdrop) {
     private data class Binding(val bar: ViewGroup, val profile: View, val avatar: ImageView,
         val title: TextView, val search: View, val searchImage: ImageView,
         val add: View, val addImage: ImageView)
@@ -70,6 +70,7 @@ internal class QuoraTopBar {
     private var safetyBottom = 0
     fun contentSafetyBottom(): Int = if(nativeVisible) safetyBottom else 0
     fun visibilityHost(): GlassHostLayout? = buttons.firstOrNull()
+    fun glassHosts(): List<GlassHostLayout> = buttons
 
     private fun extendContent(b: Binding) {
         val root=owner ?: return
@@ -244,16 +245,8 @@ internal class QuoraTopBar {
     }
 
     private fun createButton(activity: Activity, role: Int): GlassHostLayout {
-        val state = object: AppNavigationState by QuoraOpticalWork() {
-            override fun skipLiveBackdrop(selectedIndex: Int)=true
-            // WebView and neighboring optical hosts must never be software
-            // redrawn into this control. Retained native GPU nodes own input.
-            override val allowsSoftwareBackdropCapture=false
-            // Sample only native application branches. Other glass hosts must
-            // never become input to this button's retained blur scene.
-            override fun backdropSceneViews(content: ViewGroup,hostIndex: Int): List<View> =
-                (0 until content.childCount).map(content::getChildAt)
-                    .filter { it !is GlassHostLayout && it !is AdapterOwnedOverlay && it.visibility==View.VISIBLE }
+        val state = object : QuoraChromeState {
+            override val pageBackdrop = backdrop
             override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
                 val d=frame.density;val cy=frame.height/2f
                 fun icon(drawable: Drawable?,cx: Float,size: Float) {
@@ -304,21 +297,7 @@ internal class QuoraTopBar {
             override val ownsNavigationTap=true
             override val skipNavigationSnapshot=true
             override val managesHostSiblingOrder=true
-            override val usesDirectOpticalBackdropMode=true
-            override val keepsOpticalSurfaceDuringBarAnimation=true
-            override val deferOpticalRenderDuringBarAnimation=true
-            override val reuseSurfaceBlurDuringBarAnimation=true
-            override val ownsOpticalSurfaceLayout=true
-            override fun opticalSurfaceLayout(contentWidth: Int,contentHeight: Int,hostLeft: Int,hostTop: Int,
-                hostWidth: Int,hostHeight: Int,overflow: Int)=OpticalSurfaceLayout(
-                    hostWidth+2*overflow,hostHeight+2*overflow,hostLeft-overflow,hostTop-overflow,
-                    0,0,android.view.Gravity.TOP or android.view.Gravity.LEFT)
-            override fun opticalCaptureGeometry(rootWidth: Int,rootHeight: Int,left: Int,top: Int,
-                width: Int,height: Int,padding: Int)=QuoraAdapter.opticalCaptureGeometry(
-                    rootWidth,rootHeight,left,top,width,height,padding)
-            override val allowRenderNodeRefresh=false
             override val retainsExistingBackdropRenderNode=true
-            override val skipBackdropStableDelay=true
             override val allowsSystemBackgroundBlur=false
             override fun createNavigationState(context: android.content.Context)=state
             override fun normalizeConfig(config: io.github.offlineglass.config.GlassConfig)=material.apply(config)

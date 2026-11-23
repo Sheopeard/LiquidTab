@@ -1,6 +1,7 @@
 package io.github.offlineglass.hook.adapters.x
 
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.RenderNode
 import java.lang.reflect.Field
 
@@ -34,8 +35,8 @@ internal class XReplyPageSource(private val bridge: XComposeBridge) {
         val backend=path[0].get(graphicsLayer) ?: return null
         return path[1].get(backend) as? RenderNode
     }
-    private data class Input(val node: RenderNode,val coordinate: Any)
-    private fun inputs(consumer: Any): List<Input>? {
+    data class Input(val node: RenderNode,val transform: Matrix)
+    fun resolve(consumer: Any,coordinate: Any): List<Input>? {
         if(!selection.declaringClass.isInstance(consumer)) return null
         val selected=selection.get(consumer) as? List<*> ?: return null
         if(selected.isEmpty() || selected.size>32) return null
@@ -46,29 +47,18 @@ internal class XReplyPageSource(private val bridge: XComposeBridge) {
             val graphicsLayer=layer.invoke(area) ?: return null
             val node=nativeNode(graphicsLayer) ?: return null
             if(!node.hasDisplayList()) return null
-            Input(node,position)
-        }
+            Input(node,bridge.transform(position,coordinate))
+        }.also { diagnostic="native Haze source layers=${it.size}" }
     }
-    fun bind(consumer: Any,coordinate: Any): Boolean {
-        val count=inputs(consumer)?.size ?: 0
-        diagnostic=if(count>0) "native Haze source layers=$count" else "native Haze source not ready"
-        return count>0
-    }
-    fun draw(canvas: Canvas,consumer: Any,coordinate: Any,padding: Float): Boolean {
-        if(!canvas.isHardwareAccelerated) return false
-        // Validate all inputs before drawing. Never show a partially valid source.
-        val inputs=inputs(consumer) ?: return false
-        val transforms=inputs.map { bridge.transform(it.coordinate,coordinate) }
-        inputs.forEachIndexed { index,input ->
+    fun draw(canvas: Canvas,inputs: List<Input>,padding: Float) {
+        for(input in inputs) {
             val save=canvas.save()
             try {
                 canvas.translate(padding,padding)
-                canvas.concat(transforms[index])
+                canvas.concat(input.transform)
                 canvas.drawRenderNode(input.node)
             } finally { canvas.restoreToCount(save) }
         }
-        diagnostic="native Haze source layers=${inputs.size}"
-        return true
     }
     fun clear() { nativePaths.clear() }
 }

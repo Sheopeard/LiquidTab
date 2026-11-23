@@ -5,8 +5,6 @@
  */
 package io.github.offlineglass.ui.ios
 
-import androidx.compose.foundation.background
-
 import io.github.offlineglass.rendering.postureDropShadow
 
 import androidx.compose.foundation.background
@@ -33,15 +31,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
-import androidx.compose.ui.util.fastRoundToInt
 import androidx.compose.ui.util.lerp
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
@@ -157,16 +159,23 @@ fun LiquidSlider(
 
             Box(
                 Modifier
-                    .clip(RoundedCornerShape(50))
+                    .graphicsLayer {
+                        // Only the fill's clip changes. The track already owns
+                        // the full width, so an animated child measurement did
+                        // not change any visible layout, but dirtied the card
+                        // and its backdrop coordinates on every spring frame.
+                        // Keep the original integer width and round-rect clip;
+                        // do not scale a recorded texture (including its caps).
+                        val filledWidth = SliderTrackGeometry.widthPx(trackWidth, dampedDragAnimation.progress)
+                        shape = SliderTrackFillShape(filledWidth)
+                        // An empty Android Outline can mean "no clipping".
+                        // The former zero-width child painted nothing.
+                        alpha = if (filledWidth == 0) 0f else 1f
+                        clip = true
+                    }
                     .background(accentColor)
                     .height(6f.dp)
-                    .layout { measurable, constraints ->
-                        val placeable = measurable.measure(constraints)
-                        val width = (constraints.maxWidth * dampedDragAnimation.progress).fastRoundToInt()
-                        layout(width, placeable.height) {
-                            placeable.place(0, 0)
-                        }
-                    }
+                    .fillMaxWidth()
             )
         }
 
@@ -235,6 +244,18 @@ fun LiquidSlider(
                 else Modifier.background(Color.White, RoundedCornerShape(50)))
                 .size(40f.dp, 24f.dp)
         )
+    }
+}
+
+/** Same rounded clip as the old width-measured fill, in a stable full-track layer. */
+private data class SliderTrackFillShape(val filledWidthPx: Int) : Shape {
+    override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
+        val left = SliderTrackGeometry.leftPx(size.width, filledWidthPx, layoutDirection == LayoutDirection.Rtl)
+        val radius = SliderTrackGeometry.radiusPx(filledWidthPx, size.height)
+        return Outline.Rounded(RoundRect(
+            left = left, top = 0f, right = left + filledWidthPx, bottom = size.height,
+            cornerRadius = CornerRadius(radius, radius),
+        ))
     }
 }
 

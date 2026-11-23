@@ -13,11 +13,6 @@ import io.github.offlineglass.hook.adapters.TargetAdapterRegistry
 
 class HookEntry {
     fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (lpparam.packageName == "com.android.systemui" && lpparam.processName == "com.android.systemui") {
-            runCatching { io.github.offlineglass.hook.adapters.bilibili_island.BilibiliIslandBridge.install(lpparam.classLoader) }
-                .onFailure { XposedBridge.log("LiquidTab Bilibili island capability unavailable: $it") }
-            return
-        }
         val spec = AppCatalog.forPackage(lpparam.packageName) ?: return
         if (!spec.hooksAllProcesses && lpparam.processName != lpparam.packageName &&
             spec.uiProcessSuffixes.none { lpparam.processName == "${lpparam.packageName}:$it" }

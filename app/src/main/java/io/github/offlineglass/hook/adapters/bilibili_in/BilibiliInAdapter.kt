@@ -16,6 +16,9 @@ import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
+import io.github.offlineglass.hook.adapters.bilibili.BilibiliHomeFeedEdges
+import io.github.offlineglass.hook.adapters.bilibili.BilibiliSearchFeedback
+import io.github.offlineglass.hook.adapters.bilibili.twoTabCompoundWidth
 import io.github.offlineglass.targets.TargetSpec
 import io.github.offlineglass.config.GlassConfig
 
@@ -39,6 +42,7 @@ internal object BilibiliInAdapter : TargetAdapter {
             runCatching { BilibiliInVideoAmbient.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international video ambient: $it") }
             runCatching { BilibiliInCommentHooks.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international comments: $it") }
             runCatching { BilibiliInHomeLayoutHooks.install(lpparam.classLoader) }.onFailure { XposedBridge.log("LiquidTab international home install: $it") }
+            runCatching { BilibiliHomeFeedEdges.install(lpparam.classLoader, PACKAGE_NAME) }.onFailure { XposedBridge.log("LiquidTab international home feed edges: $it") }
             runCatching { BilibiliInSpeedHaptics.install() }.onFailure { XposedBridge.log("LiquidTab international speed haptics: $it") }
         }
     }
@@ -57,9 +61,12 @@ internal object BilibiliInAdapter : TargetAdapter {
     override fun pushedConfig(): GlassConfig? = latestPushedConfig
     override fun acceptPushedConfig(config: GlassConfig): Boolean {
         latestPushedConfig = config.normalized()
+        BilibiliHomeFeedEdges.configChanged(PACKAGE_NAME, config)
         return true
     }
     override val foregroundNavigationOverSelection = true
+    override fun compactHostWidth(config: GlassConfig, density: Float, height: Int, tabRowWidth: (Int) -> Int) =
+        twoTabCompoundWidth(config, 4, density, height, tabRowWidth)
     override val ownsNavigationTap = true
     override val commitSelectionAfterTap = true
     override val suppressPlatformElevation = true
@@ -76,6 +83,18 @@ internal object BilibiliInAdapter : TargetAdapter {
     override val persistentNavigationOpticalMix = true
     override fun createNavigationState(context: android.content.Context): io.github.offlineglass.hook.adapters.AppNavigationState =
         object : io.github.offlineglass.hook.adapters.AppNavigationState {
+            private val searchFeedback = BilibiliSearchFeedback()
+            override fun actionButtonPressProgress() = searchFeedback.progress
+            override fun interceptNavigationTouch(host: View, event: MotionEvent): Boolean? {
+                val glass = host as? io.github.offlineglass.hook.GlassHostLayout ?: return null
+                searchFeedback.touch(host, event, barLayout(glass.config, host.width,
+                    host.height, host.resources.displayMetrics.density, glass.adapterSlotCount) != null)
+                return null
+            }
+            override fun onHostDetached() = searchFeedback.reset()
+            override fun onHostWindowFocusChanged(hasFocus: Boolean) { if (!hasFocus) searchFeedback.reset() }
+            override fun drawPanelEdgeGlow(canvas: Canvas, path: android.graphics.Path, density: Float) =
+                searchFeedback.drawLight(canvas, path)
             override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
                 if (index == 4) {
                     // This action is not a fifth native page and must never commit tab selection.
@@ -84,7 +103,7 @@ internal object BilibiliInAdapter : TargetAdapter {
                 }
                 return dispatchTabTap(source, index, slotCount)
             }
-            override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = drawNavigation(canvas, frame)
+            override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = drawNavigation(canvas, frame, searchFeedback.progress)
             override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = true
             override fun drawForeground(canvas: Canvas, frame: AdapterNavigationFrame,
                 selectionPath: android.graphics.Path, drawSource: () -> Unit) =
@@ -99,7 +118,8 @@ internal object BilibiliInAdapter : TargetAdapter {
     override val suppressSourceOnHostRebind = true
     override val accentColor: Int = ACCENT_COLOR
     override fun configureNavigationInsets(decor: View, enabled: Boolean) = configureInsets(decor, enabled)
-    override fun drawNavigation(canvas: Canvas, frame: AdapterNavigationFrame) {
+    override fun drawNavigation(canvas: Canvas, frame: AdapterNavigationFrame) = drawNavigation(canvas, frame, 0f)
+    private fun drawNavigation(canvas: Canvas, frame: AdapterNavigationFrame, searchPress: Float) {
         BilibiliInRenderer.draw(
         canvas, frame.extraScale, frame.slotCount, frame.width, frame.height, frame.slotWidth,
         frame.density, frame.iconScale, frame.textSize, frame.scaledDensity,
@@ -107,8 +127,12 @@ internal object BilibiliInAdapter : TargetAdapter {
         frame.managerEnglishLabels,
         )
         if (!frame.hideSelectedForOptics) frame.barLayout?.let { layout ->
+            val saved = canvas.save()
+            val scale = 1f + .08f * searchPress
+            canvas.scale(scale, scale, layout.actionLeft+layout.actionSize/2, frame.height/2f)
             BilibiliInHomeLayoutHooks.drawSearchGlyph(canvas, layout.actionLeft+layout.actionSize/2,
                 frame.height/2f, frame.density*1.15f, frame.darkGlass)
+            canvas.restoreToCount(saved)
         }
     }
     override fun dispatchNavigationTap(source: ViewGroup?, index: Int, slotCount: Int): Boolean =

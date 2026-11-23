@@ -265,6 +265,7 @@ internal object BilibiliPlaylistGlassHooks {
         private val ambient = RenderNode("Bili-playlist-shadow")
         private val lens = PostureGlass.shader(GlassHostLayout.ROUNDED_RECT_REFRACTION_SHADER)
         private val path = Path(); private val rect = RectF(); private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
         private val matrix = Matrix(); private val inverse = Matrix()
         private var key = ""
         @Volatile private var config = HookConfigReader.startupSnapshot(packageName) ?: GlassConfig()
@@ -286,7 +287,7 @@ internal object BilibiliPlaylistGlassHooks {
             val config = this.config
             val w = bounds.width(); val h = bounds.height(); val dp = host.resources.displayMetrics.density
             val dark = host.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-            val radius = h / 2f; val pad = NativeBackdropBlur.padding(minOf(config.blurRadius, 8f) * dp, 28f * dp).toInt()
+            val radius = h / 2f; val pad = NativeBackdropBlur.padding(minOf(config.blurRadius, 8f) * dp, 28f * dp * config.refractionPaddingScale).toInt()
             val width = w + 2 * pad; val height = h + 2 * pad
             rect.set(0f, 0f, w.toFloat(), h.toFloat()); path.setBottomBarSquircle(rect, radius, -1f)
             PostureGlass.sync(lens, host, config.postureEffectsEnabled && config.liquidGlassEnabled && !config.solidBarEnabled,
@@ -297,7 +298,7 @@ internal object BilibiliPlaylistGlassHooks {
                 lens.setFloatUniform("size", w.toFloat(), h.toFloat()); lens.setFloatUniform("offset", -pad.toFloat(), -pad.toFloat())
                 lens.setFloatUniform("cornerRadii", radius, radius, radius, radius)
                 lens.setFloatUniform("safeSampleBounds", .5f, .5f, width - .5f, height - .5f)
-                lens.setFloatUniform("refractionHeight", 12f * dp); lens.setFloatUniform("refractionAmount", -24f * dp)
+                lens.setFloatUniform("refractionHeight", 12f * dp); lens.setFloatUniform("refractionAmount", -24f * dp * config.refractionScale)
                 lens.setFloatUniform("depthEffect", 0f); lens.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
                 for (name in listOf("unifiedDropletPilot", "directionalRimPilot", "monotoneFlowPilot", "continuousShape")) lens.setFloatUniform(name, 0f)
                 lens.setFloatUniformExact("flowingLiquidEnabled", 1f); lens.setFloatUniformExact("flowMotionEnabled", 1f)
@@ -324,9 +325,13 @@ internal object BilibiliPlaylistGlassHooks {
             paint.shader = null; paint.style = Paint.Style.FILL
             paint.color = if (config.solidBarEnabled) (if (dark) 0xFF202023.toInt() else Color.WHITE) else (if (dark) 0x70202023 else 0x80FFFFFF.toInt())
             canvas.drawPath(path, paint)
-            paint.style = Paint.Style.STROKE; paint.strokeWidth = .7f * dp
-            paint.shader = LinearGradient(0f, 0f, w.toFloat(), h.toFloat(), intArrayOf(0x90FFFFFF.toInt(), 0x15FFFFFF, 0x55FFFFFF), null, Shader.TileMode.CLAMP)
-            canvas.drawPath(path, paint); paint.shader = null; paint.style = Paint.Style.FILL
+            if (config.liquidGlassEnabled && !config.solidBarEnabled) {
+                if (config.outlineEnabled) glassEdge.draw(canvas, path, dp, dark, (if (dark) .42f else .6f) * 2f * config.darkBarHighlightStrength)
+            } else {
+                paint.style = Paint.Style.STROKE; paint.strokeWidth = .7f * dp
+                paint.shader = LinearGradient(0f, 0f, w.toFloat(), h.toFloat(), intArrayOf(0x90FFFFFF.toInt(), 0x15FFFFFF, 0x55FFFFFF), null, Shader.TileMode.CLAMP)
+                canvas.drawPath(path, paint); paint.shader = null; paint.style = Paint.Style.FILL
+            }
             if (flash > 0f) { paint.color = Color.argb((flash * 65).toInt(), 255, 255, 255); canvas.drawPath(path, paint) }
         }
         fun shadow(canvas: Canvas, root: View) {

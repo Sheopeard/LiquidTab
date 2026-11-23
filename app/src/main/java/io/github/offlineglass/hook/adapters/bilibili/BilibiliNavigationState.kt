@@ -17,6 +17,16 @@ import java.util.IdentityHashMap
 
 /** Native navigation owns page changes; glass only owns the gesture. */
 internal class BilibiliNavigationState : AppNavigationState {
+    private val searchFeedback = BilibiliSearchFeedback()
+    override fun actionButtonPressProgress() = searchFeedback.progress
+    override fun interceptNavigationTouch(host: View, event: MotionEvent): Boolean? {
+        val glass = host as? io.github.offlineglass.hook.GlassHostLayout ?: return null
+        searchFeedback.touch(host, event, BilibiliAdapter.barLayout(glass.config, host.width,
+            host.height, host.resources.displayMetrics.density, glass.adapterSlotCount)?.actionIndex == BilibiliAdapter.SEARCH_INDEX)
+        return null
+    }
+    override fun drawPanelEdgeGlow(canvas: android.graphics.Canvas, path: android.graphics.Path, density: Float) =
+        searchFeedback.drawLight(canvas, path)
     override val persistentRestingIndicatorFill = true
     override val retainHiddenSourceFillWhileExpanded = true
     private var getterClass: Class<*>? = null
@@ -234,7 +244,7 @@ internal class BilibiliNavigationState : AppNavigationState {
         BilibiliOpticalForeground.draw(canvas, frame, selectionPath, drawSource)
 
     override fun draw(canvas: android.graphics.Canvas, frame: io.github.offlineglass.hook.adapters.AdapterNavigationFrame) =
-        BilibiliRenderer.draw(canvas, frame)
+        BilibiliRenderer.draw(canvas, frame, searchFeedback.progress)
 
     // Theme discovery may wait for native selection, but optical references
     // must follow the newly visible page even while its slider is animating.
@@ -252,6 +262,7 @@ internal class BilibiliNavigationState : AppNavigationState {
     override fun onHostWindowFocusChanged(hasFocus: Boolean) = resetTransientState()
 
     private fun resetTransientState() {
+        searchFeedback.reset()
         BilibiliShopDormancy.release()
         releaseCompositorObserver()
         transitionUntil = 0L
@@ -308,6 +319,12 @@ internal class BilibiliNavigationState : AppNavigationState {
     }
 
     override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
+        if (index == BilibiliAdapter.SEARCH_INDEX) {
+            val opened = BilibiliHomeLayoutHooks.openSearch(host.rootView)
+            if (io.github.offlineglass.BuildConfig.DEBUG)
+                android.util.Log.i("LiquidTabBiliSearch", "action dispatch opened=$opened")
+            return false
+        }
         if (index == BilibiliAdapter.SHOP_INDEX || cachedSelection == BilibiliAdapter.SHOP_INDEX ||
             lastDispatchedSelection == BilibiliAdapter.SHOP_INDEX) {
             (host as? io.github.offlineglass.hook.GlassHostLayout)?.let {

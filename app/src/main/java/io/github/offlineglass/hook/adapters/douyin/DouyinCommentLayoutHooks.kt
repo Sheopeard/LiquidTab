@@ -1,5 +1,9 @@
 package io.github.offlineglass.hook.adapters.douyin
 
+import android.app.Activity
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -9,6 +13,7 @@ import android.widget.TextView
 import io.github.offlineglass.hook.compat.XC_MethodHook
 import io.github.offlineglass.hook.compat.XposedBridge
 import java.lang.reflect.Modifier
+import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import kotlin.math.roundToInt
 
@@ -18,8 +23,70 @@ internal object DouyinCommentLayoutHooks {
     private var installed = false
     private data class HeightOwnership(val original: Int, var applied: Int)
     private val imposedHeights = WeakHashMap<View, HeightOwnership>()
+    private val sheets = WeakHashMap<View, WeakReference<ViewGroup>>()
     private val reported = WeakHashMap<View, Boolean>()
     private var reports = 0
+
+    fun requiresNativeNavigationFit(root: View): Boolean {
+        val sheet = sheets[root]?.get() ?: return false
+        return sheet.isAttachedToWindow && sheet.isShown && sheet.alpha > 0f &&
+            sheet.height > 0 && sheet.rootView === root
+    }
+
+    private data class NavigationAppearance(val color: Int, val darkIcons: Boolean)
+    private data class NavigationOwnership(val original: NavigationAppearance, val applied: NavigationAppearance)
+    private val navigationAppearance = WeakHashMap<Activity, NavigationOwnership>()
+
+    fun updateNavigationAppearance(activity: Activity, root: View) {
+        val window = activity.window
+        val controller = window.insetsController ?: return
+        val light = android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        val current = NavigationAppearance(window.navigationBarColor, controller.systemBarsAppearance and light != 0)
+        val owned = navigationAppearance[activity]
+        val sheet = sheets[root]?.get()?.takeIf { requiresNativeNavigationFit(root) }
+        val color = sheet?.let(::panelColor)
+        if (color == null) {
+            if (owned != null) {
+                navigationAppearance.remove(activity)
+                if (current.color == owned.applied.color) window.navigationBarColor = owned.original.color
+                if (current.darkIcons == owned.applied.darkIcons) {
+                    controller.setSystemBarsAppearance(if (owned.original.darkIcons) light else 0, light)
+                }
+            }
+            return
+        }
+
+        val desired = NavigationAppearance(color, Color.luminance(color) > 0.179f)
+        if (current == desired) return
+        navigationAppearance[activity] = NavigationOwnership(owned?.original ?: current, desired)
+        if (current.color != desired.color) window.navigationBarColor = desired.color
+        if (current.darkIcons != desired.darkIcons) {
+            controller.setSystemBarsAppearance(if (desired.darkIcons) light else 0, light)
+        }
+    }
+
+    private fun panelColor(sheet: ViewGroup): Int? {
+        // The native sheet has a separate full-width FrameLayout below its scrim.
+        var panel: FrameLayout? = null
+        for (index in 0 until sheet.childCount) {
+            val child = sheet.getChildAt(index) as? FrameLayout ?: continue
+            if (!child.isShown || child.width != sheet.width || child.bottom != sheet.height || child.height <= 0) continue
+            if (panel != null) return null
+            panel = child
+        }
+        val surface = panel ?: return null
+        return opaqueBackground(surface) ?: (surface.getChildAt(0) as? LinearLayout)?.let(::opaqueBackground)
+    }
+
+    private fun opaqueBackground(view: View): Int? {
+        val color = view.backgroundTintList?.getColorForState(view.drawableState, Color.TRANSPARENT)
+            ?: when (val background = view.background) {
+                is ColorDrawable -> background.color
+                is GradientDrawable -> background.color?.getColorForState(view.drawableState, Color.TRANSPARENT)
+                else -> null
+            }
+        return color?.takeIf { Color.alpha(it) == 255 }
+    }
 
     fun install(loader: ClassLoader) {
         if (installed) return
@@ -43,6 +110,17 @@ internal object DouyinCommentLayoutHooks {
             }
             XposedBridge::class.java.getMethod("hookMethod", java.lang.reflect.Member::class.java, XC_MethodHook::class.java)
                 .invoke(null, requireNotNull(entry), callback)
+            // CommentListPageFragment owns this native sheet. Its keyboard is
+            // a separate fragment that reads the window's navigation/IME insets.
+            val measure = rootType.getDeclaredMethod("onMeasure", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            XposedBridge.hookMethod(measure, object : XC_MethodHook() {
+                override fun afterHookedMethod(p: MethodHookParam) {
+                    val sheet = p.thisObject as? ViewGroup ?: return
+                    if (!sheet.isAttachedToWindow || !sheet.isShown) return
+                    val root = sheet.rootView
+                    if (sheets[root]?.get() !== sheet) sheets[root] = WeakReference(sheet)
+                }
+            })
             installed = true
         }.onFailure { XposedBridge.log("[LiquidTab] comment layout binding unavailable: $it") }
     }

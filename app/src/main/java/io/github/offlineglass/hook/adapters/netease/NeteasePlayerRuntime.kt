@@ -425,7 +425,7 @@ internal fun GlassHostLayout.adjustNeteaseMiniPlayer() {
 
                 ROUNDED_RECT_REFRACTION_SHADER,
 
-                runCatching { RuntimeShader(BLOOM_STROKE_DUAL_SHADER) }.getOrNull(),
+                runCatching { io.github.offlineglass.rendering.GlassEdgeHighlight.shader() }.getOrNull(),
 
             )
 
@@ -552,7 +552,7 @@ internal fun GlassHostLayout.adjustNeteaseMiniPlayer() {
 
             } else {
 
-                0.75f
+                0.75f * if (config.liquidGlassEnabled) config.darkBarHighlightStrength else 1f
 
             },
 
@@ -1713,7 +1713,9 @@ internal fun GlassHostLayout.drawNeteaseMiniPlayerGlass(canvas: Canvas) {
 
             }
 
-            canvas.drawPath(neteaseRuntime.playerPath, neteaseRuntime.playerStrokePaint)
+            if (config.liquidGlassEnabled)
+                neteaseRuntime.glassEdge.draw(canvas, neteaseRuntime.playerPath, density, dark, (if (dark) .35f else .5f) * 2f * config.darkBarHighlightStrength)
+            else canvas.drawPath(neteaseRuntime.playerPath, neteaseRuntime.playerStrokePaint)
 
         }
 

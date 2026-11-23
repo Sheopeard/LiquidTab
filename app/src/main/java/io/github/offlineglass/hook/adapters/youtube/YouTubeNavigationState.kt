@@ -104,15 +104,44 @@ internal class YouTubeNavigationState(
 
     override fun logDiagnostic(message: String) = android.util.Log.i("YouTubeGlassDiag", message).let { }
 
-    // A SurfaceView display list contains a compositor hole, not video pixels.
-    // Replaying it beneath an animated bar can move that hole with the bar.
-    override fun skipLiveBackdrop(selectedIndex: Int): Boolean =
-        true
+    private var pivot: YouTubePivotBinding? = null
+    private var pivotRetryAt = 0L
+    private var lastPivotProbe: ViewGroup? = null
+
+    private fun bindPivot(source: ViewGroup? = host.adapterNavigationSource): YouTubePivotBinding? {
+        if (source == null) { pivot = null; return null }
+        pivot?.takeIf { it.matches(source) }?.let { return it }
+        val now = SystemClock.uptimeMillis()
+        if (lastPivotProbe === source && pivot == null && now < pivotRetryAt) return null
+        lastPivotProbe = source
+        pivotRetryAt = now + 250L
+        return YouTubePivotBinding.resolve(source).also { pivot = it }
+    }
+
+    override fun isNavigationEntryAvailable(index: Int): Boolean = bindPivot()?.entry(index) != null
+
+    override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int =
+        bindPivot(source)?.selected() ?: host.adapterSelectedIndex
+
+    override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
+        // Revalidate the current cell against its role before dispatching.
+        val verified = source?.let(YouTubePivotBinding::resolve) ?: return false
+        pivot = verified
+        val target = verified.entry(index)?.cell ?: return false
+        if (!target.isAttachedToWindow || !target.isEnabled || !target.hasOnClickListeners()) return false
+        if (!target.performClick()) return false
+        onNavigationSelectionRequested(index, slotCount, SystemClock.uptimeMillis())
+        return true
+    }
+
+    // Ordinary pages use existing RenderNodes. Only an overlapping decoder
+    // snapshot owns the independent Surface, avoiding two optical outputs.
+    override fun skipLiveBackdrop(selectedIndex: Int): Boolean = videoBackdrop() != null
 
     override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
-        if (host.liveBackdropActiveForAdapter) host.clearLiveBackdropForAdapter()
+        val videoReady = canDrawNavigation() && videoBackdrop() != null
         host.disableOpticalSurfaceNativeBlurForAdapter()
-        if (canDrawNavigation()) host.enableOpticalSurfaceRendererForAdapter()
+        if (videoReady) host.enableOpticalSurfaceRendererForAdapter()
         else host.disableOpticalSurfaceRendererForAdapter()
         return true
     }
@@ -122,9 +151,7 @@ internal class YouTubeNavigationState(
 
     override fun requestVideoBackdrop(host: View, pageAllowed: Boolean) {
         if (!host.hasWindowFocus() || host.windowVisibility != View.VISIBLE) { videoSampler.pause(); return }
-        YouTubeBackdropRegistry.bind(host.rootView, videoSampler, this.host)
-        videoSampler.request(this.host,
-            (pageAllowed && canDrawNavigation()) || YouTubeBackdropRegistry.hasVisible(host.rootView))
+        videoSampler.request(this.host, pageAllowed && canDrawNavigation())
     }
 
     override fun videoBackdrop(): AppVideoBackdrop? = videoSampler.frame(host)
@@ -132,7 +159,6 @@ internal class YouTubeNavigationState(
     override fun onHostFrame(host: View) {
         bottomGradient.update(canDrawNavigation())
         searchLayout.update(host.rootView, YouTubeSearchPage.active(host.rootView))
-        YouTubeTopBar.updateHomeSelection(host.rootView, this.host.adapterSelectedIndex == 0)
         // Resume the existing full-rate probe on a native page redraw rather
         // than increasing the sampling rate of genuinely idle pages.
         if (host.rootView.isDirty) contentMovingUntil = SystemClock.uptimeMillis() + 120L
@@ -170,13 +196,14 @@ internal class YouTubeNavigationState(
     override fun beforeHostDraw(host: View, source: ViewGroup?): Boolean = canDrawNavigation()
     override fun drawsNavigationContent(): Boolean = canDrawNavigation()
     override fun includeNavigationInIndicatorScene(surfaceActive: Boolean): Boolean = true
+    override fun navigationOpticalMixEnabled(): Boolean = host.adapterNavigationAnimationRunning
     override fun drawForeground(
         canvas: Canvas,
         frame: io.github.offlineglass.hook.adapters.AdapterNavigationFrame,
         selectionPath: android.graphics.Path,
         drawSource: () -> Unit,
     ): Boolean {
-        if (frame.navigationOpticalMix <= 0f || selectionPath.isEmpty) {
+        if (frame.navigationOpticalMix <= 0f || selectionPath.isEmpty || !host.adapterNavigationAnimationRunning) {
             drawSource()
             return true
         }
@@ -201,20 +228,21 @@ internal class YouTubeNavigationState(
     }
     override fun hostChromeAlpha(host: View, selectedIndex: Int): Float =
         if (canDrawNavigation()) 1f else 0f
-    override fun allowsHostTouch(): Boolean = host.hasWindowFocus() && canDrawNavigation() && !YouTubeDrawerPage.active(host.rootView)
+    override fun allowsHostTouch(): Boolean =
+        host.hasWindowFocus() && nativeBottomVisible() && !YouTubeDrawerPage.active(host.rootView)
 
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
         if (!canDrawNavigation()) return
-        val source = host.adapterNavigationSource
+        val binding = bindPivot()
         val scale = frame.iconScale * frame.extraScale
         frame.enabledIndices.forEachIndexed { visual, index ->
             val cx = 4f * frame.density + (visual + .5f) * frame.slotWidth
             val cy = frame.height / 2f
             val optical = tabsRenderer.opticalSelected ?: if (host.drawingNavigationForIndicatorOptics)
                 host.isNavigationSlotInsideIndicator(cx, cy) else null
-            val drawn = source != null && tabsRenderer.drawSlot(canvas, source, frame.slotCount,
+            val drawn = binding != null && tabsRenderer.drawSlot(canvas, binding,
                 index, cx, cy, scale, host.config, optical, frame.darkGlass,
-                frame::localizeNavigationLabel)
+                frame.iconOnly, frame::localizeNavigationLabel)
             if (!drawn) {
                 val iconY = if (frame.iconOnly) cy else cy - 8f * frame.density
                 drawFallbackGlyph(canvas, index, cx, iconY, 44f * frame.density * scale, frame.darkGlass)
@@ -235,13 +263,15 @@ internal class YouTubeNavigationState(
         canvas: Canvas, index: Int, selectedIndex: Int, dark: Boolean,
         centerX: Float, centerY: Float, boxSize: Float,
     ): Boolean {
-        val source = host.adapterNavigationSource ?: return true
-        val scale = boxSize / min(source.width / 5f, source.height.toFloat()).coerceAtLeast(1f)
+        val binding = bindPivot() ?: return true
+        val source = binding.source
+        val scale = boxSize / min(source.width / host.adapterSlotCount.toFloat(), source.height.toFloat()).coerceAtLeast(1f)
         val opticalState = tabsRenderer.opticalSelected ?: if (host.drawingNavigationForIndicatorOptics) {
             host.isNavigationSlotInsideIndicator(centerX, centerY)
         } else null
-        val drawn = canDrawNavigation() && tabsRenderer.drawSlot(canvas, source,
-            5, index, centerX, host.height / 2f, scale, host.config, opticalState, dark,
+        val drawn = canDrawNavigation() && tabsRenderer.drawSlot(canvas, binding,
+            index, centerX, host.height / 2f, scale, host.config, opticalState, dark,
+            host.config.iconOnly || host.config.bottomBarIconOnly,
             { label ->
                 if (host.config.managerEnglishNavigationLabels)
                     io.github.offlineglass.hook.adapters.NavigationLabelLocalization.toEnglish("youtube", label)
@@ -253,6 +283,7 @@ internal class YouTubeNavigationState(
 
     override fun drawAppBadgeOverlay(canvas: Canvas, host: View, contentScale: Float) {
         if (!canDrawNavigation()) return
+        if (!isNavigationEntryAvailable(2)) return
         val action = YouTubeAdapter.barLayout(this.host.config, host.width, host.height,
             host.resources.displayMetrics.density, 5) ?: return
         drawPublishGlyph(canvas, action.actionLeft + action.actionSize / 2f,
@@ -317,7 +348,8 @@ internal class YouTubeNavigationState(
         fun collect(view: View): Boolean {
             if (view === host || view === host.adapterNavigationSource ||
                 view is io.github.offlineglass.hook.adapters.AdapterOwnedOverlay ||
-                view.visibility != View.VISIBLE || view.alpha <= 0.001f) return true
+                view is GlassHostLayout) return true
+            if (view.visibility != View.VISIBLE || view.alpha <= 0.001f) return false
             if (view is SurfaceView || view is TextureView) return true
             val start = safe.size
             // A removed player can still be in the preceding display list.
@@ -345,27 +377,19 @@ internal class YouTubeNavigationState(
         shortsLayout.update(this.host, enabled && isShortsActive(), shortsRecycler)
     }
 
-    // Home and Shorts no longer use an idle timer or scroll-to-hide policy.
-    // Keep artwork/glass alive during the shared exit animation. The drawer
-    // changes only the visibility target; it must not zero the drawing alpha.
-    override fun hostPageAllowsNavigation(host: GlassHostLayout, root: View?): Boolean =
-        canDrawNavigation() && !YouTubeDrawerPage.active(host.rootView)
+    private val nativeBottomBounds = Rect()
+    private fun nativeBottomVisible(): Boolean {
+        val source = host.adapterNavigationSource ?: return false
+        // YouTube may leave the PivotBar visible with just a few pixels of
+        // inset while its actual row and all tab cells have collapsed to zero.
+        return source.isAttachedToWindow && bindPivot(source)?.hasVisibleCell(nativeBottomBounds) == true
+    }
+
+    // Source alpha is deliberately suppressed by the host. Follow native
+    // visibility and clipping without using that projection alpha as a signal.
+    override fun hostPageAllowsNavigation(host: GlassHostLayout, root: View?): Boolean = nativeBottomVisible()
     override fun forceNavigationBarImmersed(host: GlassHostLayout): Boolean? =
         if (YouTubeSearchPage.active(host.rootView)) false else null
-
-    override fun retainNavigationWhenNativeRowHidden(selectedIndex: Int): Boolean {
-        if (isShortsActive()) return true
-        if (selectedIndex != 0) return false
-        val source = host.adapterNavigationSource ?: return false
-        if (!source.isAttachedToWindow) return false
-        // Keep Home's projected bar through native scrolling, but let the
-        // normal watch page continue to hide it when a video is opened.
-        val root = host.rootView
-        val watchId = root.resources.getIdentifier(
-            "next_gen_watch_layout_no_player_fragment_container", "id", "com.google.android.youtube",
-        )
-        return watchId == 0 || root.findViewById<View>(watchId)?.isShown != true
-    }
 
     override fun suppressNativeChromeEarly(source: ViewGroup?) = suppressNativeChrome(source)
 
@@ -492,19 +516,19 @@ internal class YouTubeNavigationState(
 
     override fun onHostDetached() {
         bottomGradient.release()
+        pivot = null
         tabsRenderer.clear()
         shortsLayout.restore()
         videoSampler.dispose()
-        YouTubeBackdropRegistry.unbind(host.rootView, videoSampler)
         resetShortsState()
     }
 
     override fun dispose() {
         bottomGradient.release()
+        pivot = null
         tabsRenderer.clear()
         shortsLayout.restore()
         videoSampler.dispose()
-        YouTubeBackdropRegistry.unbind(host.rootView, videoSampler)
         resetShortsState()
         badgeRects = emptyList()
         recyclerClassCache.clear()
@@ -512,21 +536,7 @@ internal class YouTubeNavigationState(
     }
 
     private fun pivotBarSelectsShorts(): Boolean? {
-        val source = host.adapterNavigationSource ?: return null
-        if (!source.isShown) return null
-        val stack = ArrayDeque<Pair<View, Int>>()
-        stack += source to 0
-        while (stack.isNotEmpty()) {
-            val (view, depth) = stack.removeLast()
-            if (view is TextView && view.isSelected) {
-                val label = view.contentDescription?.toString() ?: view.text?.toString().orEmpty()
-                return label.contains("Shorts", ignoreCase = true)
-            }
-            if (view is ViewGroup && depth < 4) {
-                for (index in 0 until view.childCount) stack += view.getChildAt(index) to depth + 1
-            }
-        }
-        return null
+        return bindPivot()?.selected()?.let { it == 1 }
     }
 
     private fun isShortsActive(): Boolean {

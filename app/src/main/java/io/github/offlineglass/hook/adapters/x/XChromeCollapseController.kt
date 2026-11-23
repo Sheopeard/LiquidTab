@@ -93,7 +93,6 @@ internal class XChromeCollapseController(host: GlassHostLayout) {
             animation?.cancel(); animation = null
             target = collapse
             motionProgress = if (collapse) 1f else 0f
-            applyGeometry()
         } else if (collapse != target) {
             target = collapse
             animation?.cancel()
@@ -139,7 +138,6 @@ internal class XChromeCollapseController(host: GlassHostLayout) {
         lp.width = w; lp.height = h
         if (changed) {
             host.layoutParams = lp
-            host.requestLayout()
         }
         XAdapter.updateFloatingCollapse(host, motionProgress, fullWidth, h)
         if (changed || appliedProgress != motionProgress) host.invalidate()

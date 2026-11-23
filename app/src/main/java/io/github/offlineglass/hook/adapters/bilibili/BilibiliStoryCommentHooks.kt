@@ -269,7 +269,14 @@ internal object BilibiliStoryCommentHooks {
         emoji.setPadding((10f * density).roundToInt(), (10f * density).roundToInt(), (10f * density).roundToInt(), (10f * density).roundToInt())
         emoji.scaleType = ImageView.ScaleType.FIT_CENTER
         nativeMainLayout?.invoke(main, bar)
-        val owner = Owner(source, input, emoji, bar, row, main)
+        // Refresh can move the list from its parent draw pass. Sampling the
+        // recycler alone bypasses that pass. Use only the refresh branch that
+        // owns this recycler and is separate from the floating input.
+        val refresh = find("cmt3_swipe_refresh") as? ViewGroup
+        val scene = refresh?.takeIf {
+            source.parent === it && !isWithin(bar, it)
+        } ?: source
+        val owner = Owner(source, scene, input, emoji, bar, row, main)
         bindings[decor] = owner
         input.background = owner.textGlass
         emoji.background = owner.emojiGlass
@@ -278,7 +285,13 @@ internal object BilibiliStoryCommentHooks {
         // The GPU references the list's live node; no recursive capture or permanent frame loop.
     }
 
-    private class Owner(val source: View, val input: EditText, val emoji: ImageView, val bar: ViewGroup, val row: LinearLayout, val main: View) {
+    private fun isWithin(view: View, ancestor: View): Boolean =
+        generateSequence(view) { it.parent as? View }.any { it === ancestor }
+
+    private class Owner(
+        val source: View, scene: View, val input: EditText, val emoji: ImageView,
+        val bar: ViewGroup, val row: LinearLayout, val main: View,
+    ) {
         fun matchesPlaylistStructure(): Boolean =
             source.isAttachedToWindow && main.isAttachedToWindow && main.parent === bar.parent &&
                 input.parent === row && emoji.parent === row && row.isAttachedToWindow
@@ -305,8 +318,8 @@ internal object BilibiliStoryCommentHooks {
             appliedListBottomPadding = required
         }
 
-        val textGlass = Glass(input, source, false)
-        val emojiGlass = Glass(emoji, source, true)
+        val textGlass = Glass(input, scene, source, false)
+        val emojiGlass = Glass(emoji, scene, source, true)
         private val shadowHost = bar.rootView as ViewGroup
         private val shadows = object : View(source.context) {
             init { setWillNotDraw(false); isClickable = false; importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
@@ -416,17 +429,18 @@ internal object BilibiliStoryCommentHooks {
         fun touch(event: MotionEvent) { textGlass.touch(event); emojiGlass.touch(event); shadows.invalidate() }
     }
 
-    private class Glass(val host: View, val source: View, val circular: Boolean) : Drawable() {
+    private class Glass(val host: View, val scene: View, val source: View, val circular: Boolean) : Drawable() {
         private val node = RenderNode("BiliStoryCommentGlass")
         private val ambient = RenderNode("BiliStoryCommentAmbient")
         private val lens = io.github.offlineglass.rendering.PostureGlass.shader(KYANT_LENS_SHADER)
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val path = Path()
+        private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
         private val outsideClip = Path()
         private val outsideMatrix = Matrix()
         private val rect = RectF()
         private val location = IntArray(2)
-        private val sourceLocation = IntArray(2)
+        private val sampleMatrix = Matrix()
         private var signature = ""
         private var down = false
         private var press = 0f
@@ -450,7 +464,7 @@ internal object BilibiliStoryCommentHooks {
             val pad = (26f * d).roundToInt()
             io.github.offlineglass.rendering.PostureGlass.sync(lens, host,
                 config.postureEffectsEnabled && config.liquidGlassEnabled && !config.solidBarEnabled, config.liquidViscosity, config.flowHorizontalStrength, config.flowVerticalStrength)
-            val key = "$w/$h/$dark/${config.blurRadius}/${config.liquidGlassEnabled}/${config.cornerSmoothing}"
+            val key = "$w/$h/$dark/${config.blurRadius}/${config.liquidGlassEnabled}/${config.cornerSmoothing}:${config.refractionStrength}"
             val postureChanged = io.github.offlineglass.rendering.PostureGlass.effectChanged(lens)
             val geometryChanged = signature != key
             if (geometryChanged || postureChanged) {
@@ -458,7 +472,7 @@ internal object BilibiliStoryCommentHooks {
                 lens.setFloatUniform("offset", -pad.toFloat(), -pad.toFloat())
                 lens.setFloatUniform("cornerRadii", radius, radius, radius, radius)
                 lens.setFloatUniform("refractionHeight", min(h / 2f, 24f * d))
-                lens.setFloatUniform("refractionAmount", -24f * d)
+                lens.setFloatUniform("refractionAmount", -24f * d * config.refractionScale)
                 lens.setFloatUniform("depthEffect", 0f)
                 val blur = NativeBackdropBlur.effect(config.blurRadius * .8f * d)
                 node.setRenderEffect(if (config.liquidGlassEnabled) RenderEffect.createChainEffect(RenderEffect.createRuntimeShaderEffect(lens, "content"), blur) else blur)
@@ -479,16 +493,15 @@ internal object BilibiliStoryCommentHooks {
             }
             val save = canvas.save()
             if (canvas.isHardwareAccelerated) {
-                val src = sourceField.get(source) as RenderNode
-                host.getLocationInWindow(location); source.getLocationInWindow(sourceLocation)
+                val src = sourceField.get(scene) as RenderNode
                 node.setPosition(-pad, -pad, w + pad, h + pad)
                 val c = node.beginRecording(w + pad * 2, h + pad * 2)
                 c.drawColor(if (dark) 0xFF17171A.toInt() else Color.WHITE)
-                // RenderNode already carries source's own layout/transform.
+                // RenderNode already carries the scene's own layout/transform.
                 // Map its parent space into the moving button, including sheet
                 // translations and press scale, rather than subtracting origins.
-                val sampleMatrix = Matrix()
-                (source.parent as? View)?.transformMatrixToGlobal(sampleMatrix)
+                sampleMatrix.reset()
+                (scene.parent as? View)?.transformMatrixToGlobal(sampleMatrix)
                 host.transformMatrixToLocal(sampleMatrix)
                 c.translate(pad.toFloat(), pad.toFloat())
                 c.concat(sampleMatrix)
@@ -499,10 +512,14 @@ internal object BilibiliStoryCommentHooks {
             paint.shader = null; paint.style = Paint.Style.FILL
             paint.color = if (dark) Color.argb((config.darkAlpha * 255).toInt(), 33, 31, 38) else Color.argb((config.lightAlpha * 255).toInt(), 255, 255, 255)
             canvas.drawPath(path, paint)
-            paint.style = Paint.Style.STROKE; paint.strokeWidth = .7f * d
-            paint.shader = LinearGradient(0f, 0f, w.toFloat(), h.toFloat(), intArrayOf(0xB3FFFFFF.toInt(), 0x18FFFFFF, 0x60FFFFFF), null, Shader.TileMode.CLAMP)
-            canvas.drawPath(path, paint)
-            paint.style = Paint.Style.FILL; paint.shader = null
+            if (config.liquidGlassEnabled && !config.solidBarEnabled) {
+                if (config.outlineEnabled) glassEdge.draw(canvas, path, d, dark, (if (dark) .42f else .6f) * 2f * config.darkBarHighlightStrength)
+            } else {
+                paint.style = Paint.Style.STROKE; paint.strokeWidth = .7f * d
+                paint.shader = LinearGradient(0f, 0f, w.toFloat(), h.toFloat(), intArrayOf(0xB3FFFFFF.toInt(), 0x18FFFFFF, 0x60FFFFFF), null, Shader.TileMode.CLAMP)
+                canvas.drawPath(path, paint)
+                paint.style = Paint.Style.FILL; paint.shader = null
+            }
             if (press > 0f || glow > 0f) {
                 val alpha = ((max(press, 0f) * .20f + glow * .38f) * 255).toInt().coerceIn(0, 255)
                 paint.shader = RadialGradient(w * x, h * y, max(h.toFloat(), w * (.22f + spread * .55f)), intArrayOf(Color.argb(alpha,255,255,255),0x00FFFFFF), null, Shader.TileMode.CLAMP)
@@ -540,11 +557,11 @@ internal object BilibiliStoryCommentHooks {
             matrix.getValues(values)
             val hostGeometry = values.contentToString()
             matrix.reset()
-            (source.parent as? View)?.transformMatrixToGlobal(matrix)
+            source.transformMatrixToGlobal(matrix)
             matrix.getValues(values)
             // Drawable display lists cache the recorded sampling transform.
-            // A sheet move/list remeasure need not invalidate this sibling's
-            // background, even though its source RenderNode remains live.
+            // Include the recycler's own drag translation as well as its
+            // ancestors. The floating sibling does not get these invalidations.
             return "${host.isShown}/${host.width}/${host.height}/$hostGeometry/" +
                 "${values.contentToString()}/${source.left}/${source.top}/" +
                 "${source.width}/${source.height}/${source.scrollX}/${source.scrollY}"

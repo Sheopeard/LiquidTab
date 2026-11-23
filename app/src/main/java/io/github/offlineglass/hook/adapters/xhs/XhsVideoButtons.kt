@@ -8,6 +8,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.content.res.ColorStateList
 import io.github.offlineglass.config.GlassConfig
@@ -30,6 +31,7 @@ internal class XhsVideoButtons {
     private val dividers = LinkedHashMap<View, Float>()
     private var overlayRoot: View? = null
     private var shadowState = Long.MIN_VALUE
+    private var shadowConfig: GlassConfig? = null
     private val shadowPosition = IntArray(2)
     private val shadowOverlay = object : Drawable() {
         private val rootPosition = IntArray(2)
@@ -56,7 +58,7 @@ internal class XhsVideoButtons {
         shadowOverlay.setBounds(0, 0, root.width, root.height)
         val material = skins.getOrPut(button) { Material(button, button.background) }
         if (latestConfig.solidBarEnabled) backdrop.release() else backdrop.bind(listOf(source))
-        material.bind(listOf(source), latestConfig)
+        material.bind(backdrop.updateGeometry(root), latestConfig, true, source.isDirty)
         if (button.background !== material) button.background = material
         shadowOverlay.invalidateSelf()
     }
@@ -74,53 +76,66 @@ internal class XhsVideoButtons {
         if (scanAt == 0L || now - scanAt >= 500L) {
             scanAt = now
             val wanted = ArrayList<View>()
+            val wantedForegrounds = LinkedHashSet<View>()
+            val wantedDividers = LinkedHashSet<View>()
             for (bar in bars) {
-                // Verified 9.51.0: InnerStreamBottomCommentBarView replaces the
-                // background on this LinearLayout; the fullscreen icon is a
-                // separate Lottie sibling over its square background View.
-                bar.findViewById<View>(0x7f090b21)?.takeIf {
-                    it.isShown && it.width > bar.width * .6f && it.height > 0
-                }?.let { wanted.add(it) }
-                bar.findViewById<View>(0x7f09560f)?.takeIf {
-                    it.isShown && it.javaClass == View::class.java && it.height > 0 &&
-                        kotlin.math.abs(it.width - it.height) <= 2
-                }?.let { wanted.add(it) }
-                // Only these native foreground branches, never the glass
-                // background Views or video, are recolored.
                 fun whiten(view: View) {
-                    if (!view.isShown) return
-                    if (view is TextView || view is ImageView)
-                        foregrounds.getOrPut(view) { WhiteForeground(view) }
-                    if (view is ViewGroup) for (i in 0 until view.childCount) whiten(view.getChildAt(i))
+                    if (view is TextView || view is ImageView) wantedForegrounds.add(view)
+                    if (view is ViewGroup && !XhsTopBinding.isRecycler(view))
+                        for (i in 0 until view.childCount) whiten(view.getChildAt(i))
                 }
-                bar.findViewById<View>(0x7f090b23)?.let(::whiten)
-                bar.findViewById<View>(0x7f0955cb)?.let(::whiten)
+                val comment = XhsTopBinding.find(bar) {
+                    it.javaClass.name == "com.xingin.videofeed.container.bottombar.commentbar.InnerStreamBottomCommentBarView"
+                } as? ViewGroup
+                comment?.let { host ->
+                    commentLayout(host)?.let { layout ->
+                        commentPlate(layout, host.width)?.let { plate ->
+                            wanted.add(plate)
+                            whiten(layout)
+                        }
+                    }
+                }
+                // A clickable Lottie icon and a passive square plate occupy
+                // the exact same slot in a direct sibling of the comment branch.
+                val commentBranch = comment?.parent
+                val fullscreen = (bar as? ViewGroup)?.children().orEmpty().filter { it !== commentBranch }
+                    .mapNotNull(::fullscreenPair).singleOrNull()
+                fullscreen?.let { (plate, icon) ->
+                    wanted.add(plate)
+                    whiten(icon)
+                }
             }
             // The runtime tree identifies a separate 6px full-width strip
             // beneath the native seekbar. Preserve the seekbar and its listener.
             val item = (player.parent as? View)?.parent as? View
-            val progress = item?.findViewById<ViewGroup>(0x7f094e8a)
-            if (progress?.findViewById<View>(0x7f092f32)?.javaClass?.name ==
-                "com.xingin.video.feed.videoitem.progress.VideoSeekBar") {
-                for (i in 0 until progress.childCount) {
-                    val child = progress.getChildAt(i)
-                    if (child.javaClass == View::class.java && !child.isClickable &&
-                        child.width >= progress.width * .95f && child.height in
-                        1..(3f * root.resources.displayMetrics.density).toInt())
-                        dividers.putIfAbsent(child, child.alpha)
-                }
+            val seek = item?.let { XhsTopBinding.find(it) { view ->
+                view.javaClass.name == "com.xingin.video.feed.videoitem.progress.VideoSeekBar"
+            } }
+            val progress = seek?.parent?.parent as? ViewGroup
+            progress?.children()?.singleOrNull { child ->
+                child.javaClass == View::class.java && !child.isClickable && child.id == View.NO_ID &&
+                    child.width >= progress.width * .95f && child.height in
+                    1..(3f * root.resources.displayMetrics.density).toInt()
+            }?.let(wantedDividers::add)
+            foregrounds.keys.filter { it !in wantedForegrounds }.forEach { foregrounds.remove(it)?.restore() }
+            dividers.keys.filter { it !in wantedDividers }.forEach { view ->
+                dividers.remove(view)?.let { view.alpha = it }
             }
+            for (view in wantedForegrounds) foregrounds.getOrPut(view) { WhiteForeground(view) }
+            for (view in wantedDividers) dividers.putIfAbsent(view, view.alpha)
             skins.keys.toList().filter { it !in wanted }.forEach { view -> skins.remove(view)?.release() }
             for (view in wanted) skins.getOrPut(view) { Material(view, view.background) }
         }
         if (config.solidBarEnabled || skins.isEmpty()) backdrop.release() else backdrop.bind(visiblePlayers)
+        val sourceState = backdrop.updateGeometry(root)
+        val sourceDirty = !backdrop.observesFrames && backdrop.nativeContentDirty
         for ((view, material) in skins) {
-            material.bind(visiblePlayers, config)
+            material.bind(sourceState, config, visiblePlayers.isNotEmpty(), sourceDirty)
             if (view.background !== material) view.background = material
         }
-        foregrounds.values.forEach { it.apply() }
+        foregrounds.forEach { (view, ink) -> if (view.isShown) ink.apply() }
         dividers.keys.forEach { if (it.alpha != 0f) it.alpha = 0f }
-        var state = config.hashCode().toLong()
+        var state = 0L
         for (view in skins.keys) {
             view.getLocationInWindow(shadowPosition)
             state = state * 31 + shadowPosition[0]
@@ -129,7 +144,11 @@ internal class XhsVideoButtons {
             state = state * 31 + PostureGlass.revision(view,
                 config.postureEffectsEnabled && config.liquidGlassEnabled && !config.solidBarEnabled)
         }
-        if (state != shadowState) { shadowState = state; shadowOverlay.invalidateSelf() }
+        if (state != shadowState || config != shadowConfig) {
+            shadowState = state
+            shadowConfig = config
+            shadowOverlay.invalidateSelf()
+        }
     }
     fun restore() {
         skins.values.forEach { it.release() }
@@ -137,7 +156,7 @@ internal class XhsVideoButtons {
         foregrounds.values.forEach { it.restore() }; foregrounds.clear()
         dividers.forEach { (view, alpha) -> view.alpha = alpha }; dividers.clear()
         overlayRoot?.overlay?.remove(shadowOverlay); overlayRoot = null
-        shadowState = Long.MIN_VALUE
+        shadowState = Long.MIN_VALUE; shadowConfig = null
         backdrop.release()
     }
     private class WhiteForeground(private val view: View) {
@@ -208,26 +227,18 @@ internal class XhsVideoButtons {
         }
     }
     private inner class Material(private val owner: View, private val original: Drawable?) : Drawable() {
-        private var sources: List<View> = emptyList()
+        private var hasSource = false
         private var sourceState = Long.MIN_VALUE
         private var config = GlassConfig()
         fun refreshPixels() { if (owner.isShown && !config.solidBarEnabled) invalidateSelf() }
-        fun bind(players: List<View>, value: GlassConfig) {
-            var state = 0L
-            for (player in players) {
-                player.getLocationInWindow(sourcePosition)
-                state = state * 31 + System.identityHashCode(player)
-                state = state * 31 + sourcePosition[0]
-                state = state * 31 + sourcePosition[1]
-                state = state * 31 + player.width * 31 + player.height
-            }
-            val changed = state != sourceState || config != value
-            sources = players
+        fun bind(state: Long, value: GlassConfig, hasPixels: Boolean, sourceDirty: Boolean) {
+            val changed = state != sourceState || config != value || hasSource != hasPixels
+            hasSource = hasPixels
             sourceState = state
             config = value
             // If a target update removes/replaces the native listener, retain
             // ordinary native-traversal refresh without adding a polling loop.
-            if (changed || (!backdrop.observesFrames && backdrop.nativeContentDirty)) invalidateSelf()
+            if (changed || sourceDirty) invalidateSelf()
         }
         private val node = RenderNode("XHS-video-button")
         private val lens = PostureGlass.shader(GlassHostLayout.ROUNDED_RECT_REFRACTION_SHADER)
@@ -236,19 +247,20 @@ internal class XhsVideoButtons {
         private val shadowNode = RenderNode("XHS-video-button-independent-shadow")
         private var shadowKey = ""
         private val path = Path()
+        private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
         private val rect = RectF()
         private val sourcePosition = IntArray(2)
         private val ownerPosition = IntArray(2)
         private var effectKey = ""
         private var rim: Shader? = null
         override fun draw(canvas: Canvas) {
-            if (!canvas.isHardwareAccelerated || sources.isEmpty()) return
+            if (!canvas.isHardwareAccelerated || !hasSource) return
             val width = bounds.width().toFloat()
             val height = bounds.height().toFloat()
             if (width <= 0 || height <= 0) return
             val dp = owner.resources.displayMetrics.density
             val blur = minOf(config.blurRadius, 8f) * dp
-            val pad = NativeBackdropBlur.padding(blur, 24f * dp).toInt()
+            val pad = NativeBackdropBlur.padding(blur, 24f * dp * config.refractionPaddingScale).toInt()
             val w = bounds.width() + pad * 2
             val h = bounds.height() + pad * 2
             val radius = minOf(width, height) / 2f
@@ -264,7 +276,7 @@ internal class XhsVideoButtons {
             root.getLocationInWindow(sourcePosition)
             val sx = sourcePosition[0] - ownerPosition[0] + pad
             val sy = sourcePosition[1] - ownerPosition[1] + pad
-            val key = "$w:$h:$blur:${config.liquidGlassEnabled}:${config.solidBarEnabled}:$sx:$sy:${root.width}:${root.height}"
+            val key = "$w:$h:$blur:${config.liquidGlassEnabled}:${config.solidBarEnabled}:$sx:$sy:${root.width}:${root.height}:${config.refractionStrength}"
             val poseChanged = PostureGlass.effectChanged(lens)
             if (key != effectKey || poseChanged) {
                 effectKey = key
@@ -276,7 +288,7 @@ internal class XhsVideoButtons {
                 lens.setFloatUniform("safeSampleBounds", maxOf(.5f, sx + .5f), maxOf(.5f, sy + .5f),
                     minOf(w - .5f, sx + root.width - .5f), minOf(h - .5f, sy + root.height - .5f))
                 lens.setFloatUniform("refractionHeight", 12f * dp)
-                lens.setFloatUniform("refractionAmount", -24f * dp)
+                lens.setFloatUniform("refractionAmount", -24f * dp * config.refractionScale)
                 lens.setFloatUniform("depthEffect", 0f)
                 lens.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
                 lens.setFloatUniformExact("flowingLiquidEnabled", 1f)
@@ -311,7 +323,9 @@ internal class XhsVideoButtons {
             paint.shader = null
             paint.color = if (config.solidBarEnabled) Color.rgb(30, 30, 34) else Color.argb(32, 28, 28, 32)
             canvas.drawPath(path, paint)
-            if (config.outlineEnabled) {
+            if (config.outlineEnabled && config.liquidGlassEnabled && !config.solidBarEnabled) {
+                glassEdge.draw(canvas, path, dp, true, .84f * config.darkBarHighlightStrength)
+            } else if (config.outlineEnabled) {
                 paint.style = Paint.Style.STROKE
                 paint.strokeWidth = .8f * dp
                 paint.shader = rim
@@ -369,6 +383,31 @@ internal class XhsVideoButtons {
         @Deprecated("Deprecated in Java") override fun getOpacity() = PixelFormat.TRANSLUCENT
     }
     companion object {
+        fun commentLayout(host: View): ViewGroup? {
+            val id = host.resources.getIdentifier("commentLayout", "id", host.context.packageName)
+            return if (id != 0) host.findViewById<View>(id) as? ViewGroup else null
+        }
+
+        fun commentPlate(layout: ViewGroup, width: Int): View? =
+            layout.children().singleOrNull { it is LinearLayout && it.isShown && it.isClickable &&
+                it.childCount == 0 && it.width > width * .6f && it.height > 0 }
+
+        private fun fullscreenPair(branch: View): Pair<View, View>? {
+            val group = (branch as? ViewGroup)?.children()?.filterIsInstance<android.widget.RelativeLayout>()
+                ?.singleOrNull() ?: return null
+            val icon = group.children().singleOrNull {
+                it is ImageView && it.javaClass.name == "com.airbnb.lottie.LottieAnimationView" &&
+                    it.isShown && it.isClickable && it.width > 0 && kotlin.math.abs(it.width - it.height) <= 2
+            } ?: return null
+            val plate = group.children().singleOrNull {
+                it.javaClass == View::class.java && it.isShown && !it.isClickable &&
+                    it.left == icon.left && it.top == icon.top && it.right == icon.right && it.bottom == icon.bottom
+            } ?: return null
+            return plate to icon
+        }
+
+        private fun ViewGroup.children(): List<View> = List(childCount, ::getChildAt)
+
         fun needsVideoPixels() = latestConfig.enabled && !latestConfig.solidBarEnabled
         @Volatile private var latestConfig = GlassConfig()
         private val reading = java.util.concurrent.atomic.AtomicBoolean(false)

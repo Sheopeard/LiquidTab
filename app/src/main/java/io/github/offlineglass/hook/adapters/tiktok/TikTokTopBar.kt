@@ -24,6 +24,7 @@ import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
+import io.github.offlineglass.hook.topbar.TopBarChannelHost
 import io.github.offlineglass.config.TikTokTopChannels
 
 import io.github.offlineglass.hook.GlassHostLayout
@@ -118,9 +119,8 @@ internal object TikTokTopBar {
         // For You in the capsule in English; every other native channel stays
         // reachable from the existing "more" menu instead of shrinking its font.
         private var compactEnglishTabs = false
-        private val channelMeasurePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
+        private var channelSizing: io.github.offlineglass.hook.topbar.TopBarTabLayout? = null
+        private var previousChannelSizing: io.github.offlineglass.hook.topbar.TopBarTabLayout? = null
         private var englishSlotWidths = emptyList<Float>()
         private var compactExtraSelected = false
         private var hostedSlotCount = -1
@@ -215,16 +215,18 @@ internal object TikTokTopBar {
             var ancestor = row.parent as? View
             var parentAlpha = 1f
             while (ancestor != null) { parentAlpha *= ancestor.alpha; ancestor = ancestor.parent as? View }
-            val navigation = TikTokNativeNavigation.find(content.rootView)
+            val root = content.rootView
+            val assistantVisible = TikTokAssistantVisibility.visible(root)
+            val navigation = TikTokNativeNavigation.find(root)
             val nativeSelected = navigation?.let { bar ->
                 (0 until bar.childCount).firstOrNull { bar.getChildAt(it).isSelected }
             }
-            val feedVisible = TikTokFeedVisibility.isVisible(content.rootView)
-            val commentsVisible = TikTokCommentVisibility.visible(content.rootView)
+            val feedVisible = TikTokFeedVisibility.isVisible(root)
+            val commentsVisible = TikTokCommentVisibility.visible(root)
             active = requested && row.isAttachedToWindow && content.windowVisibility == View.VISIBLE &&
                 (nativeSelected == null || nativeSelected in 0..1) &&
-                feedVisible != false && !commentsVisible
-            val pageState = "active=$active requested=$requested attached=${row.isAttachedToWindow} nativeTab=$nativeSelected feed=$feedVisible comments=$commentsVisible"
+                feedVisible != false && !commentsVisible && !assistantVisible
+            val pageState = "active=$active requested=$requested attached=${row.isAttachedToWindow} nativeTab=$nativeSelected feed=$feedVisible comments=$commentsVisible assistant=$assistantVisible"
             if (pageState != lastPageState) {
                 lastPageState = pageState
                 runCatching { java.io.File(row.context.getExternalFilesDir(null), "tiktok_topbar_page_state.txt").writeText(pageState) }
@@ -236,8 +238,8 @@ internal object TikTokTopBar {
             }
             if (!active) {
                 main.removeCallbacks(framePulse); framePulseScheduled = false
-                hosts.forEach { it.updateAnimatedVisibility(false) }
-                overlay.visibility = if (hosts.isEmpty()) View.INVISIBLE else View.VISIBLE
+                hosts.forEach { it.updateAnimatedVisibility(false, skipExitAnimation = assistantVisible) }
+                overlay.visibility = if (assistantVisible || hosts.isEmpty()) View.INVISIBLE else View.VISIBLE
                 closeMenu(animated = false); return
             }
             if (tabs.size >= 2) selectTabs(now, config)
@@ -250,10 +252,10 @@ internal object TikTokTopBar {
             if (hosts.isEmpty()) {
                 for (role in 0..2) {
                     val state = PanelState(this, role)
-                    val panel = GlassHostLayout(row.context, config, if (role == 1) visibleCount + 1 else 1,
+                    val panel = TopBarChannelHost.createPanel(row.context, config, if (role == 1) visibleCount + 1 else 1,
                         nonSelectableIndices = if (role == 1) setOf(0) else emptySet(),
                         nativeSelectionReliable = role == 1, navigationSource = row,
-                        sliderEnabled = role == 1 && selectedIndex() >= 1, adapterOverride = PanelAdapter(state)).apply {
+                        sliderEnabled = role == 1 && selectedIndex() >= 1, adapterOverride = PanelAdapter(state), isChannel = role == 1).apply {
                         elevation = 0f; clipChildren = false; clipToPadding = false
                         contentDescription = when(role) { 0 -> "直播"; 2 -> "搜索"; else -> "频道：更多、${shown.joinToString("、") { it.text.text }}" }
                     }
@@ -284,8 +286,7 @@ internal object TikTokTopBar {
             val size = (h * .92f).roundToInt()
             val gap = (12*d).roundToInt()
             val canvasWidth = content.width.takeIf { it > 0 } ?: row.resources.displayMetrics.widthPixels
-            englishSlotWidths = if (compactEnglishTabs) measureEnglishSlots(shown, d, row.resources.displayMetrics.scaledDensity)
-                else emptyList()
+            englishSlotWidths = measureChannelSlots(shown, d, row.resources.displayMetrics.scaledDensity, compactEnglishTabs)
             val desiredWidth = if (englishSlotWidths.isEmpty()) (visibleCount+1)*42*d
                 else englishSlotWidths.sum() + 8*d
             val pill = minOf(kotlin.math.ceil(desiredWidth).toInt(), canvasWidth - 2*size - 4*gap).coerceAtLeast(h)
@@ -537,44 +538,29 @@ internal object TikTokTopBar {
         private fun englishTitle(tab: Tab): String =
             NavigationLabelLocalization.toEnglish("tiktok", tab.text.text.toString())
 
-        private fun measureEnglishSlots(tabs: List<Tab>, density: Float, scaledDensity: Float): List<Float> {
-            channelMeasurePaint.textSize = 14f * scaledDensity
-            val titles = if (tabs.isEmpty()) listOf("Following", "For You") else tabs.map(::englishTitle)
-            return listOf(32f * density) + titles.map {
-                maxOf(36f * density, channelMeasurePaint.measureText(it) + 12f * density)
-            }
+        private val channelMeasure = io.github.offlineglass.hook.topbar.TopBarTabMeasure()
+        private val previousChannelMeasure = io.github.offlineglass.hook.topbar.TopBarTabMeasure()
+        private fun measureChannelSlots(tabs: List<Tab>, density: Float, scaledDensity: Float,
+            english: Boolean, previous: Boolean = false): List<Float> {
+            val titles = if (tabs.isEmpty()) {
+                if (english) listOf("Following", "For You") else listOf("关注", "推荐")
+            } else tabs.map { if (english) englishTitle(it) else it.text.text.toString() }
+            val measure = if (previous) previousChannelMeasure else channelMeasure
+            val sizing = measure.update(listOf<String?>(null) + titles, density, 14f * scaledDensity)
+            if (previous) previousChannelSizing = sizing else channelSizing = sizing
+            return sizing?.preferredWidths.orEmpty()
         }
 
         fun indicatorGeometry(center: Float, width: Float): Pair<Float, Float>? {
-            val widths = englishSlotWidths
             val host = hosts.getOrNull(1) ?: return null
-            if (widths.isEmpty() || width <= 0f) return null
+            val sizing = channelSizing ?: return null
+            if (sizing.size < 2 || width <= 0f) return null
             val pad = 4f * row.resources.displayMetrics.density
-            val scale = (host.width - 2f * pad).coerceAtLeast(1f) / widths.sum()
-            val position = ((center - pad) / width - .5f).coerceIn(1f, widths.lastIndex.toFloat())
-            val from = position.toInt()
-            val to = (from + 1).coerceAtMost(widths.lastIndex)
-            val fraction = position - from
-            val fromCenter = widths.take(from).sum() + widths[from] / 2f
-            val toCenter = widths.take(to).sum() + widths[to] / 2f
-            return (pad + scale * (fromCenter + (toCenter - fromCenter) * fraction)) to
-                (scale * (widths[from] + (widths[to] - widths[from]) * fraction))
+            return sizing.indicator(center.coerceAtLeast(pad + 1.5f * width), width, host.width, pad)
         }
 
         fun uniformTouchX(x: Float, hostWidth: Int, pad: Float): Float {
-            val widths = englishSlotWidths
-            val available = hostWidth - 2f * pad
-            if (widths.isEmpty() || available <= 0f) return x
-            val total = widths.sum()
-            val offset = ((x - pad) * total / available).coerceIn(0f, total)
-            var start = 0f
-            for ((index, width) in widths.withIndex()) {
-                if (offset <= start + width || index == widths.lastIndex) {
-                    return pad + available / widths.size * (index + (offset - start) / width)
-                }
-                start += width
-            }
-            return x
+            return channelSizing?.toUniform(x, hostWidth, pad) ?: x
         }
 
         fun draw(canvas: Canvas, frame: AdapterNavigationFrame, role: Int) {
@@ -593,9 +579,10 @@ internal object TikTokTopBar {
             }
             if (role != 1) { glyph(if (role == 0) 0 else 2, frame.width/2f); return }
             val slot = (frame.width-8*d)/(visibleCount+1)
-            val widths = if (frame.managerEnglishLabels) englishSlotWidths else emptyList()
+            val widths = englishSlotWidths
             val available = (frame.width - 8*d).coerceAtLeast(1f)
             val scale = if (widths.isEmpty()) 1f else available / widths.sum()
+            val fontScale = channelSizing?.fitScale(frame.width) ?: 1f
             fun center(index: Int, slots: List<Float>, factor: Float): Float =
                 if (slots.isEmpty()) 4*d + slot*(index+.5f)
                 else 4*d + factor*(slots.take(index).sum() + slots[index]/2f)
@@ -603,7 +590,7 @@ internal object TikTokTopBar {
             if (shown.isEmpty()) {
                 labelPaint.color = color; labelPaint.alpha = 255
                 labelPaint.typeface = android.graphics.Typeface.DEFAULT
-                labelPaint.textSize = 14f*frame.scaledDensity*scale.coerceAtMost(1f)
+                labelPaint.textSize = 14f*frame.scaledDensity*fontScale
                 val labels = if (frame.managerEnglishLabels) listOf("Following", "For You") else listOf("关注", "推荐")
                 val fm = labelPaint.fontMetrics
                 labels.forEachIndexed { i, value ->
@@ -611,11 +598,11 @@ internal object TikTokTopBar {
                 }
                 return
             }
-            fun drawTab(tab: Tab, i: Int, alpha: Float, slots: List<Float>, factor: Float) {
+            fun drawTab(tab: Tab, i: Int, alpha: Float, slots: List<Float>, factor: Float, fontFit: Float) {
                 labelPaint.color = color
                 labelPaint.alpha = (255 * alpha).roundToInt().coerceIn(0, 255)
                 labelPaint.typeface = if (tab.cell === selected?.cell) android.graphics.Typeface.DEFAULT_BOLD else android.graphics.Typeface.DEFAULT
-                labelPaint.textSize = 14f*frame.scaledDensity*factor.coerceAtMost(1f)
+                labelPaint.textSize = 14f*frame.scaledDensity*fontFit
                 val nativeValue = tab.text.text.toString()
                 val value = if (frame.managerEnglishLabels)
                     englishTitle(tab)
@@ -630,11 +617,13 @@ internal object TikTokTopBar {
             }
             val progress = ((SystemClock.uptimeMillis() - shownChangedAt) / 180f).coerceIn(0f, 1f)
             if (progress < 1f && previousShown.isNotEmpty()) {
-                val previousWidths = if (widths.isEmpty()) emptyList() else measureEnglishSlots(previousShown, d, frame.scaledDensity)
+                val previousWidths = measureChannelSlots(previousShown, d, frame.scaledDensity,
+                    frame.managerEnglishLabels, previous = true)
                 val previousScale = if (previousWidths.isEmpty()) 1f else available / previousWidths.sum()
-                previousShown.forEachIndexed { i, tab -> drawTab(tab, i, 1f-progress, previousWidths, previousScale) }
+                val previousFontFit = previousChannelSizing?.fitScale(frame.width) ?: 1f
+                previousShown.forEachIndexed { i, tab -> drawTab(tab, i, 1f-progress, previousWidths, previousScale, previousFontFit) }
             }
-            shown.forEachIndexed { i, tab -> drawTab(tab, i, progress, widths, scale) }
+            shown.forEachIndexed { i, tab -> drawTab(tab, i, progress, widths, scale, fontScale) }
             labelPaint.alpha = 255
         }
 

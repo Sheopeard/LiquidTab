@@ -48,19 +48,19 @@ internal object BilibiliCommentGlass {
         return (if (dark) Color.WHITE else Color.BLACK).toLong() shl 32
     }
 
-    fun viewport(view: View, modifier: Any, continueBehindInput: Boolean = true): Any {
+    fun viewport(view: View, modifier: Any, continueBehindInput: Boolean = true, listKey: Any? = null): Any {
         val api = bridge ?: return modifier
         val owner = owners.getOrPut(view) { Owner(view, api) }
         owner.continueBehindInput = continueBehindInput
-        return owner.decorateScene(modifier)
+        return owner.decorateScene(modifier, listKey)
     }
 
     fun replyViewport(view: View, modifier: Any, extent: Int,
-        wrapHeight: Method, requiredHeight: Method, top: Any): Any {
+        wrapHeight: Method, requiredHeight: Method, top: Any, listKey: Any? = null): Any {
         val api = bridge ?: return modifier
         val owner = owners.getOrPut(view) { Owner(view, api) }
         owner.continueBehindInput = false
-        return owner.decorateScene(modifier)
+        return owner.decorateScene(modifier, listKey)
     }
 
     fun viewportHeight(view: View, container: View): Int {
@@ -253,7 +253,13 @@ internal object BilibiliCommentGlass {
         val view = WeakReference(view)
         val text = Button(this, false)
         val emoji = Button(this, true)
-        val scene = RenderNode("BilibiliCommentScene")
+        private var scene = RenderNode("BilibiliCommentScene")
+        private val storyCommentScene = !api.international && generateSequence(view) { it.parent as? View }.any {
+            it.id != View.NO_ID && runCatching {
+                it.resources.getResourceEntryName(it.id)
+            }.getOrNull() == "story_comment_container"
+        }
+        private val storyScenes = ArrayList<StoryCommentScene>()
         val sceneBounds = RectF()
         var continueBehindInput = true
         private val replyNativeHeight = api.newState()
@@ -333,6 +339,10 @@ internal object BilibiliCommentGlass {
             ambientHost.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
                 override fun onPreDraw(): Boolean {
                     if (!view.isAttachedToWindow) {
+                        if (storyCommentScene) {
+                            storyScenes.clear()
+                            scene.discardDisplayList()
+                        }
                         viewportContainer?.get()?.removeOnLayoutChangeListener(viewportSizeListener)
                         view.removeOnLayoutChangeListener(replySizeReset)
                         ambientHost.overlay.remove(ambientLayer)
@@ -346,6 +356,7 @@ internal object BilibiliCommentGlass {
                             ambientVisible = view.isShown
                             ambientLayer.invalidate()
                         }
+                        if (ambientVisible && !api.international) refreshScenePosition()
                     }
                     return true
                 }
@@ -353,7 +364,9 @@ internal object BilibiliCommentGlass {
         }
         fun invalidateAmbient() { ambientLayer.invalidate() }
         private var configTime = 0L
-        private val recordScene = api.callback { scope ->
+        private val recordScene = api.callback { scope -> recordScene(scope, scene) }
+
+        private fun recordScene(scope: Any, target: RenderNode) {
             val context = api.context(scope)
             val original = XposedHelpers.callMethod(context, api.canvasName)
             val canvas = api.canvas.invoke(null, original) as Canvas
@@ -365,24 +378,54 @@ internal object BilibiliCommentGlass {
             } else {
                 // Record ONLY the list branch once, before its sibling input is drawn.
                 // No window capture, recursive View.draw(), or self-sampling feedback.
-                scene.setPosition(0, 0, width, height)
-                val recording = scene.beginRecording(width, height)
+                target.setPosition(0, 0, width, height)
+                val recording = target.beginRecording(width, height)
                 try {
                     recording.drawColor(sceneBaseColor)
                     XposedHelpers.callMethod(context, api.setCanvasName, api.wrapCanvas(recording))
                     XposedHelpers.callMethod(scope, api.drawContentName)
                 } finally {
                     XposedHelpers.callMethod(context, api.setCanvasName, original)
-                    scene.endRecording()
+                    target.endRecording()
                 }
-                canvas.drawRenderNode(scene)
+                canvas.drawRenderNode(target)
                 // The sibling input draw observer must follow the final scroll
                 // recording too, even when its own composition is unchanged.
-                XposedHelpers.callMethod(sceneRevision, "setValue", ++sceneVersion)
+                invalidateSceneReaders()
             }
         }
         private val sceneRevision = api.newState()
         private var sceneVersion = 0L
+        private fun invalidateSceneReaders() {
+            XposedHelpers.callMethod(sceneRevision, "setValue", ++sceneVersion)
+        }
+
+        private var sceneCoordinates: WeakReference<Any>? = null
+        private val scenePositionFrame = RectF()
+        private val windowOrigin = IntArray(2)
+        private var localToWindow: Method? = null
+
+        private fun refreshScenePosition() {
+            val coordinates = sceneCoordinates?.get() ?: return
+            val root = view.get()?.rootView ?: return
+            // Compose can move a graphics layer during overscroll without dispatching
+            // onGloballyPositioned. Read the actual layer origin on native frames.
+            val method = localToWindow?.takeIf { it.declaringClass.isInstance(coordinates) } ?:
+                coordinates.javaClass.methods.singleOrNull {
+                    it.name.startsWith("localToWindow-") &&
+                        it.parameterTypes.contentEquals(arrayOf(Long::class.javaPrimitiveType))
+                }?.also { localToWindow = it } ?: return
+            val packed = runCatching { method.invoke(coordinates, 0L) as Long }.getOrNull() ?: return
+            root.getLocationOnScreen(windowOrigin)
+            val x = Float.fromBits((packed ushr 32).toInt()) + windowOrigin[0]
+            val y = Float.fromBits(packed.toInt()) + windowOrigin[1]
+            if (!x.isFinite() || !y.isFinite() || sceneBounds.isEmpty) return
+            sceneBounds.offsetTo(x, y)
+            if (scenePositionFrame != sceneBounds) {
+                scenePositionFrame.set(sceneBounds)
+                invalidateSceneReaders()
+            }
+        }
         private val inputBounds = RectF()
         private val inputPosition = api.callback { coordinates -> updateBounds(coordinates, this.view, inputBounds, api.international) }
         private val continueScene = api.callback { scope ->
@@ -406,11 +449,47 @@ internal object BilibiliCommentGlass {
 
         private val scenePosition = api.callback { coordinates ->
             updateBounds(coordinates, this.view, sceneBounds, api.international)
+            if (!api.international) {
+                sceneCoordinates = WeakReference(coordinates)
+                if (scenePositionFrame != sceneBounds) {
+                    scenePositionFrame.set(sceneBounds)
+                    invalidateSceneReaders()
+                }
+            }
         }
-        fun decorateScene(modifier: Any): Any = requireNotNull(api.position.invoke(null,
-            api.draw.invoke(null, modifier, recordScene), scenePosition))
+        fun decorateScene(modifier: Any, listKey: Any? = null): Any {
+            if (!storyCommentScene) {
+                return requireNotNull(api.position.invoke(null, api.draw.invoke(null, modifier, recordScene), scenePosition))
+            }
+            if (listKey == null) return modifier
+            // Primary and replies can occupy the same AndroidComposeView
+            // during a native transition. A recorded draw references the node,
+            // so a node overwritten by replies also changes the primary draw.
+            storyScenes.removeAll { it.key.get() == null }
+            val list = storyScenes.firstOrNull { it.key.get() === listKey }
+                ?: StoryCommentScene(listKey).also { storyScenes.add(it) }
+            return requireNotNull(api.position.invoke(null, api.draw.invoke(null, modifier, list.draw), list.position))
+        }
+
+        private inner class StoryCommentScene(listKey: Any) {
+            val key = WeakReference(listKey)
+            private val node = RenderNode("BilibiliStoryCommentList")
+            private val bounds = RectF()
+            private var coordinates: WeakReference<Any>? = null
+            val position = api.callback {
+                updateBounds(it, view, bounds)
+                coordinates = WeakReference(it)
+            }
+            val draw = api.callback { scope ->
+                scene = node
+                sceneBounds.set(bounds)
+                sceneCoordinates = coordinates
+                recordScene(scope, node)
+            }
+        }
 
         fun capture(): RenderNode? {
+            if (!api.international) XposedHelpers.callMethod(sceneRevision, "getValue")
             val source = view.get() ?: return null
             if (SystemClock.uptimeMillis() - configTime > 1000) {
                 config = HookConfigReader.read(source.context, source.context.packageName)
@@ -430,6 +509,7 @@ internal object BilibiliCommentGlass {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val path = Path()
         private val outline = Path()
+        private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
         private val shape = RectF()
         private var down = false
         private var press = 0f
@@ -569,14 +649,14 @@ internal object BilibiliCommentGlass {
                         owner.config.liquidViscosity,
                         owner.config.flowHorizontalStrength, owner.config.flowVerticalStrength,
                     ) }
-                    val signature = "$w/$h/$pad/${owner.config.blurRadius}/${owner.config.liquidGlassEnabled}"
+                    val signature = "$w/$h/$pad/${owner.config.blurRadius}/${owner.config.liquidGlassEnabled}:${owner.config.refractionStrength}"
                     val postureChanged = io.github.offlineglass.rendering.PostureGlass.effectChanged(lens)
                     if (signature != effectSignature || postureChanged) {
                         lens.setFloatUniform("size", width, height)
                         lens.setFloatUniform("offset", -pad.toFloat(), -pad.toFloat())
                         lens.setFloatUniform("cornerRadii", radius, radius, radius, radius)
                         lens.setFloatUniform("refractionHeight", min(height / 2f, 24f * density))
-                        lens.setFloatUniform("refractionAmount", -24f * density)
+                        lens.setFloatUniform("refractionAmount", -24f * density * owner.config.refractionScale)
                         lens.setFloatUniform("depthEffect", 0f)
                         val blur = NativeBackdropBlur.effect(blurRadius)
                         node.setRenderEffect(if (owner.config.liquidGlassEnabled)
@@ -591,6 +671,9 @@ internal object BilibiliCommentGlass {
                 paint.color = if (dark) Color.argb((owner.config.darkAlpha * 255f).toInt(), 33, 31, 38)
                     else Color.argb((owner.config.lightAlpha * 255f).toInt(), 255, 255, 255)
                 canvas.drawPath(path, paint)
+                if (owner.config.liquidGlassEnabled && !owner.config.solidBarEnabled) {
+                    if (owner.config.outlineEnabled) glassEdge.draw(canvas, path, density, dark, (if (dark) .42f else .6f) * 2f * owner.config.darkBarHighlightStrength)
+                } else {
                 paint.style = Paint.Style.STROKE; paint.strokeWidth = density * .7f
                 paint.shader = LinearGradient(0f, 0f, width, height,
                     intArrayOf(0xB3FFFFFF.toInt(), 0x18FFFFFF, 0x60FFFFFF), null, Shader.TileMode.CLAMP)
@@ -599,6 +682,7 @@ internal object BilibiliCommentGlass {
                 else outline.setBottomBarSquircle(shape, radius - .35f * density, owner.config.cornerSmoothing)
                 canvas.drawPath(outline, paint)
                 paint.shader = null; paint.style = Paint.Style.FILL
+                }
                 if (press > 0f || glow > 0f) {
                     val highlight = ((max(press, 0f) * .20f + glow * .38f) * 255).toInt().coerceIn(0, 255)
                     paint.color = Color.WHITE

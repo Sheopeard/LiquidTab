@@ -33,7 +33,7 @@ internal fun verifyManagerBottomBarMotion(): android.os.Bundle {
                     check(kotlin.math.abs(motion.position - 2f) < 0.01f)
                     check(kotlin.math.abs(motion.scaleY - 1f) < 0.03f && motion.pressProgress < 0.03f) { "Release did not settle" }
                     check(motion.restingTintProgress > 0.99f) { "Release tint did not return" }
-                    motion.tap(0f, true)
+                    motion.followSelection(0f)
                     stage(800L) {
                         check(kotlin.math.abs(motion.position) < 0.01f && kotlin.math.abs(motion.scaleY - 1f) < 0.03f) { "Tap did not arrive and retract" }
                         motion.press(true); motion.dragTo(1f, 50f)

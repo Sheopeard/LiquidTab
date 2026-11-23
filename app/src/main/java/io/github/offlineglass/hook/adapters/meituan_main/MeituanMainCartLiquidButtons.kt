@@ -27,7 +27,7 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
     private val paths = Array(2) { Path() }
     private val highlightPaths = Array(2) { Path() }
     private val highlights = Array(2) {
-        runCatching { RuntimeShader(GlassHostLayout.BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
+        runCatching { io.github.offlineglass.rendering.GlassEdgeHighlight.shader() }.getOrNull()
     }
     private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val nodes = Array(2) { RenderNode("MeituanCartCapsule$it") }
@@ -127,8 +127,7 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
 
     override fun onDraw(canvas: Canvas) {
         val glass = host.get() ?: return
-        val cartIndex = MeituanMainNativeTabs.cartIndex(glass.adapterNavigationSource, glass.adapterSlotCount)
-        if (glass.adapterSelectedIndex != cartIndex) return
+        if (glass.adapterSelectedIndex != 3) return
         updateGeometry()
         if (rects.any { it.width() <= 0 || it.height() <= 0 }) return
         val density = resources.displayMetrics.density
@@ -167,7 +166,7 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
             if (glass.config.backdropCapture && !glass.config.solidBarEnabled &&
                 (glass.config.liquidGlassEnabled || blur > 0f) &&
                 canvas.isHardwareAccelerated && sceneNode?.hasDisplayList() == true) {
-                val pad = NativeBackdropBlur.padding(blur, 24f * density)
+                val pad = NativeBackdropBlur.padding(blur, 24f * density * glass.config.refractionPaddingScale)
                 val w = (rect.width() + pad * 2).toInt()
                 val h = (rect.height() + pad * 2).toInt()
                 val node = nodes[i]
@@ -186,7 +185,7 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
                     } finally { node.endRecording() }
                     recordings[i] = record
                 }
-                val effect = "$w:$h:$blur:$density:${glass.config.liquidGlassEnabled}"
+                val effect = "$w:$h:$blur:$density:${glass.config.liquidGlassEnabled}:${glass.config.refractionStrength}"
                 if (effects[i] != effect) {
                     val lens = lenses[i]
                     lens.setFloatUniform("size", rect.width(), rect.height())
@@ -194,7 +193,7 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
                     lens.setFloatUniform("cornerRadii", FloatArray(4) { rect.height() / 2f })
                     // Kyant LiquidButton reference: 48dp high, lens(12dp, 24dp).
                     lens.setFloatUniform("refractionHeight", 12f * density)
-                    lens.setFloatUniform("refractionAmount", -24f * density)
+                    lens.setFloatUniform("refractionAmount", -24f * density * glass.config.refractionScale)
                     lens.setFloatUniform("depthEffect", 0f)
                     val blurEffect = NativeBackdropBlur.effect(blur)
                     node.setRenderEffect(if (glass.config.liquidGlassEnabled)
@@ -216,10 +215,12 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
                 else if (dark) Color.argb(184, 28, 28, 30) else Color.argb(184, 255, 255, 255)
             canvas.drawRect(rect, paint)
             canvas.restoreToCount(save)
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = .6f * density
-            paint.color = Color.argb(if (dark) 30 else 90, 255, 255, 255)
-            canvas.drawPath(path, paint)
+            if (!glass.config.liquidGlassEnabled || glass.config.solidBarEnabled) {
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = .6f * density
+                paint.color = Color.argb(if (dark) 30 else 90, 255, 255, 255)
+                canvas.drawPath(path, paint)
+            }
             val light = canvas.save()
             canvas.clipPath(path)
             drawHighlight(canvas, i, glass, density)
@@ -270,7 +271,7 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
 
     /** UI-owned chrome: never touch the host's worker-owned shader, Paint or Path. */
     private fun drawHighlight(canvas: Canvas, index: Int, glass: GlassHostLayout, density: Float) {
-        if (!glass.config.liquidGlassEnabled || !glass.config.outlineEnabled) return
+        if (!glass.config.liquidGlassEnabled || !glass.config.outlineEnabled || glass.config.solidBarEnabled) return
         val shader = highlights[index] ?: return
         val rect = rects[index]
         var gx = if (glass.config.postureEffectsEnabled) BloomTiltTracker.gravityX else 0f
@@ -303,7 +304,9 @@ internal class MeituanMainCartLiquidButtons(context: Context, host: GlassHostLay
         highlightPaint.strokeWidth = density
         val saved = canvas.save()
         canvas.translate(rect.left, rect.top)
-        canvas.drawPath(highlightPaths[index], highlightPaint)
+        io.github.offlineglass.rendering.GlassEdgeHighlight.draw(
+            canvas, highlightPaths[index], highlightPaint, shader, density, glass.adapterContentOrSystemDark(),
+            glass.config.darkBarHighlightStrength > 0f)
         canvas.restoreToCount(saved)
         highlightPaint.shader = null
     }

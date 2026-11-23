@@ -106,7 +106,7 @@ internal class MiHomeNavigationState : AppNavigationState {
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
         if (frame.slotCount !in 4..5) return
         val iconSize = 26f * 1.265f * frame.density
-        val iconCenterY = 20f * frame.density
+        val iconCenterY = if (frame.iconOnly) frame.height / 2f else 20f * frame.density
         val labelBaseline = 45.5f * frame.density
         val horizontalPadding = 4f * frame.density
         val labels = if (frame.slotCount == 4) LABELS_FOUR else LABELS_FIVE
@@ -139,7 +139,7 @@ internal class MiHomeNavigationState : AppNavigationState {
             val text = item?.let { readField(it, "mText") } as? TextView
             val label = text?.text?.toString()?.trim().orEmpty().ifEmpty { labels.getOrElse(index) { "" } }
             labelPaint.color = text?.currentTextColor ?: if (index == frame.selectedIndex) 0xFF2587E8.toInt() else normalColor
-            canvas.drawText(frame.localizeNavigationLabel(label), centerX, labelBaseline, labelPaint)
+            if (!frame.iconOnly || icon == null) canvas.drawText(frame.localizeNavigationLabel(label), centerX, labelBaseline, labelPaint)
             canvas.restore()
         }
     }

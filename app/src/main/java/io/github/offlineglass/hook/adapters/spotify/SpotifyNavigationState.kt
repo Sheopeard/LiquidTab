@@ -524,7 +524,7 @@ internal class SpotifyNavigationState : AppNavigationState {
         }
         val labelHeight = if (frame.iconOnly) 0f else text.fontMetrics.descent - text.fontMetrics.ascent
         val gap = if (frame.iconOnly) 0f else 2f * frame.density
-        val top = (frame.height - size - gap - labelHeight) / 2f - 3f * frame.density
+        val top = (frame.height - size - gap - labelHeight) / 2f - if (frame.iconOnly) 0f else 3f * frame.density
         val names = listOf("主页", "搜索", "音乐库", "Premium", "创建")
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             strokeWidth = 1.9f

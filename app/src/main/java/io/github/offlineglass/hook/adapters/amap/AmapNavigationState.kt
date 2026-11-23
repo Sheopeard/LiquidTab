@@ -189,7 +189,7 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
             val viewport = 31.68f * density
             val gap = 3f * density
             val groupTop = height / 2f - (viewport + gap + labelHeight) / 2f
-            val iconCenterY = groupTop + viewport / 2f
+            val iconCenterY = if (iconOnly) height / 2f else groupTop + viewport / 2f
             val labelBaseline = groupTop + viewport + gap - fm.ascent
             for ((visualIndex, index) in enabledIndices.withIndex()) {
                 val selected = index == selectedIndex
@@ -208,7 +208,7 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
                 iconPaint.alpha = if (selected) 255 else 235
                 canvas.drawBitmap(bitmap, null, RectF(centerX - dw / 2f, iconCenterY - dh / 2f,
                     centerX + dw / 2f, iconCenterY + dh / 2f), iconPaint)
-                if (label != null) {
+                if (!iconOnly && label != null) {
                     labelPaint.color = color
                     labelPaint.alpha = if (selected) 255 else 235
                     canvas.drawText(frame.localizeNavigationLabel(label), centerX, labelBaseline, labelPaint)

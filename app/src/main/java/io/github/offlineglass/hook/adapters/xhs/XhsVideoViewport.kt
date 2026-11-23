@@ -46,6 +46,7 @@ internal object XhsVideoViewport {
         private val originals = WeakHashMap<View, ViewGroup.LayoutParams>()
         private val backgrounds = WeakHashMap<View, Drawable?>()
         private var lastScan = 0L
+        private var structureDirty = true
         private var listening = false
         private val visible = Rect()
         private val buttons = XhsVideoButtons()
@@ -54,11 +55,12 @@ internal object XhsVideoViewport {
             "topMargin" to 0, "bottomMargin" to 0)
         private data class Accessors(val constraints: Map<String, java.lang.reflect.Field>, val bias: java.lang.reflect.Field)
         private val fields = HashMap<Class<*>, Accessors>()
-        private val layoutListener = ViewTreeObserver.OnGlobalLayoutListener { lastScan = 0L }
+        private val layoutListener = ViewTreeObserver.OnGlobalLayoutListener { structureDirty = true }
         fun start() {
             if (listening) return
             listening = true
             lastScan = 0L
+            structureDirty = true
             root.viewTreeObserver.addOnPreDrawListener(this)
             root.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
             root.invalidate()
@@ -68,8 +70,9 @@ internal object XhsVideoViewport {
             val keyboard = root.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
             if (!portrait || keyboard) { restore(); return true }
             val now = SystemClock.uptimeMillis()
-            if (lastScan == 0L || now - lastScan >= 500L) {
+            if (lastScan == 0L || structureDirty && now - lastScan >= 100L || now - lastScan >= 500L) {
                 lastScan = now
+                structureDirty = false
                 players.clear(); bars.clear()
                 fun visit(view: View) {
                     if (!view.isShown) return
@@ -79,8 +82,8 @@ internal object XhsVideoViewport {
                 }
                 visit(root)
             }
-            var hasExtendedVideo = false
             var activePlayer: View? = null
+            var activeArea = 0L
             val visiblePlayers = ArrayList<View>()
             for (player in players) {
                 if (!player.isAttachedToWindow || !player.getGlobalVisibleRect(visible)) continue
@@ -92,13 +95,16 @@ internal object XhsVideoViewport {
                     "androidx.constraintlayout.widget.ConstraintLayout" ||
                     layer.width < item.width * .9f || item.height < root.height * .8f) continue
                 if (extend(layer, item.height) && extend(player, 0)) {
-                    hasExtendedVideo = true
-                    activePlayer = player
                     visiblePlayers.add(player)
+                    val area = visible.width().toLong() * visible.height()
+                    if (area > activeArea) {
+                        activeArea = area
+                        activePlayer = player
+                    }
                 }
             }
             for (bar in bars) {
-                if (!hasExtendedVideo) continue
+                if (activePlayer == null) continue
                 if (!backgrounds.containsKey(bar)) backgrounds[bar] = bar.background
                 if (bar.background != null) bar.background = null
             }

@@ -15,6 +15,7 @@ import kotlin.math.sqrt
 internal class XhsPressFeedback(
     private val row: ViewGroup,
     private val targets: List<View>,
+    private val groupTrailingActions: Boolean = true,
     private val changed: () -> Unit,
 ) : Choreographer.FrameCallback {
     private val values = FloatArray(targets.size)
@@ -41,18 +42,12 @@ internal class XhsPressFeedback(
         (48f * row.resources.displayMetrics.density).coerceAtLeast(1f) *
         values.getOrElse(index) { 0f }.coerceIn(-.2f, 1.2f)
 
-    // Three native actions share one glass button. Transform its plate and all
-    // artwork with the same spring and pivot, including the release undershoot.
+    // The shared glass plate and the three actions use the same spring,
+    // including the release undershoot.
     fun actionScale(): Float {
         val index = (1 until values.size).maxByOrNull { abs(values[it]) } ?: return 1f
         return scale(index)
     }
-    fun actionPivotX(): Float {
-        val first = targets.getOrNull(1) ?: return row.width / 2f
-        val last = targets.last()
-        return (first.left + 4f * row.resources.displayMetrics.density + last.right) / 2f
-    }
-
     fun observe(event: MotionEvent) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -110,7 +105,7 @@ internal class XhsPressFeedback(
     }
     /** Called within the capsule clip, with coordinates in the toolbar's space. */
     fun drawLight(canvas: Canvas, rect: RectF, index: Int) {
-        val progress = if (index == 0) progress(0) else
+        val progress = if (index == 0 || !groupTrailingActions) progress(index) else
             (1 until values.size).maxOfOrNull { progress(it) } ?: 0f
         if (progress <= 0f) return
         paint.blendMode = BlendMode.PLUS

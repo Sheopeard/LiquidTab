@@ -13,10 +13,12 @@ internal class XReplyHalo(private val anchor: View,private val bridge: XComposeB
     private val local=Path()
     private val outer=Path()
     private val matrix=Matrix()
+    private val matrixValues=FloatArray(9)
+    private val footprint=RectF()
+    private val dirtyBounds=Rect()
     private var coordinate=WeakReference<Any>(null)
     private var host: View?=null
     private var key=""
-    private var placement=""
     private var padding=0f
     private var width=0f
     private var height=0f
@@ -44,12 +46,12 @@ internal class XReplyHalo(private val anchor: View,private val bridge: XComposeB
                     color=if(dark) Color.argb(48,225,235,255) else Color.argb(88,0,0,0)
                 })
             } finally { node.endRecording() }
-            placement=""
+            visible=false
         }
         if(host!==root) {
             host?.overlay?.remove(this)
             host=root;root.overlay.add(this)
-            placement=""
+            visible=false
         }
         syncPosition()
     }
@@ -71,18 +73,21 @@ internal class XReplyHalo(private val anchor: View,private val bridge: XComposeB
             }
             if(rect.isEmpty || width<=0f || height<=0f) { suppress();return@runCatching true }
             val current=bridge.overlayTransform(position,anchor,root)
-            val values=FloatArray(9).also(current::getValues)
-            if(!values.all { it.isFinite() }) { suppress();return@runCatching true }
+            current.getValues(matrixValues)
+            if(!matrixValues.all { it.isFinite() }) { suppress();return@runCatching true }
             var opacity=1f
             var parent: View?=anchor
             while(parent!=null && parent!==root) { opacity*=parent.alpha;parent=parent.parent as? View }
-            val next="${values.joinToString()}/${root.width}/${root.height}/$opacity/$key"
-            if(next!=placement || !visible) {
-                placement=next;matrix.set(current)
+            val alpha=opacity.coerceIn(0f,1f)
+            if(!visible || current!=matrix || node.alpha!=alpha) {
+                matrix.set(current)
                 outer.set(local);outer.transform(matrix)
-                node.alpha=opacity.coerceIn(0f,1f)
+                node.alpha=alpha
                 visible=true
-                setBounds(0,0,root.width,root.height)
+                footprint.set(-padding,-padding,node.width-padding,node.height-padding)
+                matrix.mapRect(footprint)
+                footprint.roundOut(dirtyBounds)
+                setBounds(dirtyBounds)
                 invalidateSelf()
             }
             diagnostic="live ${nativeWidth}x${nativeHeight}"
@@ -90,7 +95,7 @@ internal class XReplyHalo(private val anchor: View,private val bridge: XComposeB
         }.getOrElse { suppress();true }
     }
     private fun suppress() {
-        if(visible) { visible=false;placement="";invalidateSelf() }
+        if(visible) { visible=false;invalidateSelf() }
     }
     override fun draw(canvas: Canvas) {
         // Compose's graphics layer may have moved after pre-draw; read its live
@@ -105,7 +110,7 @@ internal class XReplyHalo(private val anchor: View,private val bridge: XComposeB
             canvas.drawRenderNode(node)
         } finally { canvas.restoreToCount(save) }
     }
-    fun hide() { visible=false;diagnostic="hidden";host?.overlay?.remove(this);host=null;coordinate.clear();placement="" }
+    fun hide() { visible=false;diagnostic="hidden";host?.overlay?.remove(this);host=null;coordinate.clear() }
     fun close() { hide();node.discardDisplayList();key="" }
     override fun setAlpha(alpha: Int) { node.alpha=alpha/255f;invalidateSelf() }
     override fun setColorFilter(colorFilter: ColorFilter?) = Unit

@@ -2,27 +2,33 @@ package io.github.offlineglass.ui
 
 
 import androidx.compose.foundation.shape.CornerBasedShape
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.util.fastCoerceAtMost
 import top.yukonga.miuix.kmp.blur.BackdropEffectScope
 import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.runtimeShaderEffect
 
+internal var managerRefractionScale by androidx.compose.runtime.mutableFloatStateOf(1f)
+
 internal fun BackdropEffectScope.managerLens(
     refractionHeight: Float,
     refractionAmount: Float,
     depthEffect: Boolean = false,
     chromaticAberration: Float = 0f,
-    continuousIndicator: Boolean = false,
-    indicatorCurve: Float = io.github.offlineglass.rendering.BottomBarIndicatorStyle.CURVE,
+    insetIndicator: ManagerInsetIndicatorShape? = null,
     postureBlend: Float = 1f,
 ) {
-    if (!isRuntimeShaderSupported() || refractionHeight <= 0f || refractionAmount <= 0f) return
-    if (padding < refractionAmount) padding = refractionAmount
-    val cornerShape = shape as? CornerBasedShape ?: return
+    val amount = refractionAmount * managerRefractionScale
+    if (!isRuntimeShaderSupported() || refractionHeight <= 0f || amount <= 0f) return
+    val lensPadding = maxOf(refractionAmount, amount)
+    if (padding < lensPadding) padding = lensPadding
+    val cornerShape = shape as? CornerBasedShape
+    if (cornerShape == null && insetIndicator == null) return
     val maxRadius = size.minDimension / 2f
     val isLtr = layoutDirection == LayoutDirection.Ltr
-    val radii = floatArrayOf(
+    val radii = if (cornerShape == null) FloatArray(4) else floatArrayOf(
         (if (isLtr) cornerShape.topStart else cornerShape.topEnd).toPx(size, this),
         (if (isLtr) cornerShape.topEnd else cornerShape.topStart).toPx(size, this),
         (if (isLtr) cornerShape.bottomEnd else cornerShape.bottomStart).toPx(size, this),
@@ -39,7 +45,7 @@ internal fun BackdropEffectScope.managerLens(
         setFloatUniform("offset", -padding / sf, -padding / sf)
         setFloatUniform("cornerRadii", FloatArray(4) { radii[it].fastCoerceAtMost(maxRadius) / sf })
         setFloatUniform("refractionHeight", refractionHeight / sf)
-        setFloatUniform("refractionAmount", -refractionAmount / sf)
+        setFloatUniform("refractionAmount", -amount / sf)
         setFloatUniform("depthEffect", if (depthEffect) 1f else 0f)
         val pose = io.github.offlineglass.rendering.PostureCompose.current
         setFloatUniform("postureTilt", pose.x * postureBlend, pose.y * postureBlend)
@@ -49,11 +55,11 @@ internal fun BackdropEffectScope.managerLens(
             io.github.offlineglass.rendering.PostureGlass.isTracking(root)) postureBlend else 0f)
         setFloatUniform("flowRipple", pose.rippleAmplitude * postureBlend, pose.rippleAge, pose.rippleX, pose.rippleY)
         setFloatUniform("flowRebound", pose.reboundX * postureBlend, pose.reboundY * postureBlend)
-        setFloatUniform("continuousShape", if (continuousIndicator) 1f else 0f)
-        if (continuousIndicator) {
-            setFloatUniform("shapeOrientation", 1f)
-            setFloatUniform("shapePoints", io.github.offlineglass.rendering.BottomBarIndicatorStyle.contour(
-                size.width / sf, size.height / sf, radii[0].fastCoerceAtMost(maxRadius) / sf, indicatorCurve))
+        setFloatUniform("continuousShape", if (insetIndicator != null) 1f else 0f)
+        if (insetIndicator != null) {
+            val contour = insetIndicator.contour(size, sf)
+            setFloatUniform("shapeOrientation", contour.orientation)
+            setFloatUniform("shapePoints", contour.points)
         }
         if (dispersion) setFloatUniform("chromaticAberration", chromaticAberration)
     }

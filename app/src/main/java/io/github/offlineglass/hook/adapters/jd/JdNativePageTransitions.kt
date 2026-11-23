@@ -19,14 +19,10 @@ internal object JdNativePageTransitions {
 
     fun bindHiddenBar(source: ViewGroup, host: GlassHostLayout) {
         if (hiddenBars[source]?.get() === host) return
+        val row = JdNavigationBinding.resolve(source) ?: return
         hiddenBars[source] = java.lang.ref.WeakReference(host)
-        val stack = ArrayDeque<View>(); stack.add(source)
-        var visited = 0
-        while (stack.isNotEmpty() && visited++ < 80) {
-            val view = stack.removeLast()
-            if (view.javaClass.name == "com.jingdong.common.unification.navigationbar.newbar.NavigationIconView")
-                runCatching { XposedHelpers.callMethod(view, "pauseAnimation") }
-            if (view is ViewGroup) for (i in 0 until view.childCount) stack.add(view.getChildAt(i))
+        for (slot in row.slots) {
+            runCatching { XposedHelpers.callMethod(slot.icon, "pauseAnimation") }
         }
     }
 

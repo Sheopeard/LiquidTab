@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.os.Handler
 import android.os.Looper
+import android.view.ViewTreeObserver
 import io.github.offlineglass.hook.compat.XC_MethodHook
 import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
@@ -37,6 +38,7 @@ internal object XBottomBarHooks {
     private var postHookReady = false
     private var chatHookReady = false
     private var report = "not initialized"
+    private var diagnosticsFile: java.io.File? = null
     private val handler = Handler(Looper.getMainLooper())
     private val details = java.util.Collections.newSetFromMap(java.util.WeakHashMap<Any, Boolean>())
     private val restoreDetail = Runnable { if (details.isEmpty()) XAdapter.onDetailPageChanged(false) }
@@ -89,7 +91,8 @@ internal object XBottomBarHooks {
                 })
             } }
             optional("post-detail lifecycle") { installDetails(bindings) }
-            optional("drawer visibility") { installDrawerState(bindings) }
+            optional("drawer visibility") { installDrawerState(bindings, "drawer") }
+            optional("gesture drawer visibility") { installDrawerState(bindings, "gestureDrawer") }
             optional("reply composer") {
                 XReplyComposerGlass.install(bindings)
                 report += "; reply=native-Haze"
@@ -103,20 +106,30 @@ internal object XBottomBarHooks {
         }
         android.util.Log.i(TAG, diagnostic())
         // Small, bounded support record: no page text, account data, or credentials.
-        runCatching { java.io.File(context.getExternalFilesDir(null) ?: context.cacheDir,
-            "liquidtab-x-bindings.txt").writeText(diagnostic()) }
+        diagnosticsFile = java.io.File(context.getExternalFilesDir(null) ?: context.cacheDir, "liquidtab-x-bindings.txt")
+        writeDiagnostics()
     }
+
+    private fun writeDiagnostics() { runCatching { diagnosticsFile?.writeText(diagnostic()) } }
 
     private fun installNavigation(bindings: XBindingResolver.Bindings) {
             val landing = bindings.methods.getValue("landing")
             val bottom = bindings.methods.getValue("bottom")
-            val callbackIndex=landing.parameterTypes.indices.single { landing.parameterTypes[it].name=="kotlin.jvm.functions.Function1" }
+            val callbackIndices=landing.parameterTypes.indices.filter { landing.parameterTypes[it].name=="kotlin.jvm.functions.Function1" }
             val tabIndex=landing.parameterTypes.indices.single { landing.parameterTypes[it].isEnum && XApkIndex.TAB_NAMES.all { name -> runCatching { landing.parameterTypes[it].getField(name).type==landing.parameterTypes[it] }.getOrDefault(false) } }
-            val function1 = landing.parameterTypes[callbackIndex]
+            val function1 = landing.parameterTypes[callbackIndices.first()]
             val tabType = landing.parameterTypes[tabIndex]
             tabTypes = arrayOf("HOME", "EXPLORE", "GROK", "NOTIFICATIONS", "DM")
                 .map { tabType.getField(it).get(null)!! }.toTypedArray()
             tabInvoke = function1.getMethod("invoke", Any::class.java)
+            // A callable reference retains its source operation name even when its
+            // generated class and target member are renamed by the optimizer.
+            val referenceNames = if(callbackIndices.size>1) listOf(
+                "kotlin.jvm.internal.AdaptedFunctionReference", "kotlin.jvm.internal.CallableReference"
+            ).mapNotNull { name ->
+                runCatching { Class.forName(name,false,landing.declaringClass.classLoader)
+                    .getDeclaredField("name").apply { isAccessible=true } }.getOrNull()
+            } else emptyList()
             XposedBridge.hookAllMethods(Activity::class.java, "onCreate", object : XC_MethodHook() {
                 override fun beforeHookedMethod(p: MethodHookParam) {
                     val activity = p.thisObject as? Activity ?: return
@@ -125,12 +138,17 @@ internal object XBottomBarHooks {
             })
             hook(landing, object : XC_MethodHook() {
                 override fun beforeHookedMethod(p: MethodHookParam) {
-                    val callback = p.args[callbackIndex] ?: return
-                    val first = tabClick == null
-                    tabClick = callback
                     val index = tabTypes?.indexOfFirst { it === p.args[tabIndex] }?.takeIf { it >= 0 } ?: return
-                    if (selectedIndex != index || first) {
-                        selectedIndex = index
+                    val callback=if(callbackIndices.size==1) p.args[callbackIndices.single()]
+                    else callbackIndices.mapNotNull { p.args[it] }.singleOrNull { candidate ->
+                        referenceNames.any { it.declaringClass.isInstance(candidate) && it.get(candidate)=="onTabClicked" }
+                    }
+                    val bindingChanged = (tabClick == null) != (callback == null)
+                    val tabChanged = selectedIndex != index
+                    tabClick = callback
+                    selectedIndex = index
+                    if (bindingChanged) writeDiagnostics()
+                    if (tabChanged || bindingChanged) {
                         XAdapter.onSelectedTabChanged()
                     }
                 }
@@ -174,15 +192,27 @@ internal object XBottomBarHooks {
         }.onFailure { android.util.Log.w(TAG, "action hook unavailable chat=$chat", it) }.getOrDefault(false)
     }
 
-    private fun installDrawerState(bindings: XBindingResolver.Bindings) {
-        val container=bindings.methods["drawerContainer"] ?: return
-        val renderer=bindings.methods["drawerRenderer"] ?: return
-        val isOpen=bindings.methods["drawerOpen"] ?: return
+    private fun installDrawerState(bindings: XBindingResolver.Bindings, role: String) {
+        val container=bindings.methods["${role}Container"] ?: return
+        val renderer=bindings.methods["${role}Renderer"] ?: return
+        val isOpen=bindings.methods["${role}Open"] ?: return
         val stateIndex=renderer.parameterTypes.indices.single { renderer.parameterTypes[it]==isOpen.declaringClass }
         require(isOpen.parameterCount==0 && isOpen.returnType==Boolean::class.javaPrimitiveType)
         var depth=0
         var state=WeakReference<Any>(null)
         var owner=WeakReference<Activity>(null)
+        var observer: ViewTreeObserver?=null
+        fun syncDrawer() {
+            val nativeState=state.get() ?: return
+            (runCatching { isOpen.invoke(nativeState) }.getOrNull() as? Boolean)?.let(XAdapter::onDrawerChanged)
+        }
+        // The gesture drawer can animate a retained composition without
+        // calling the renderer or the state reader again from native code.
+        val onFrame=ViewTreeObserver.OnPreDrawListener { syncDrawer(); true }
+        fun detachObserver() {
+            observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(onFrame)
+            observer=null
+        }
         hook(container,object: XC_MethodHook() {
             override fun beforeHookedMethod(p: MethodHookParam) { if(Looper.myLooper()==Looper.getMainLooper()) depth++ }
             override fun afterHookedMethod(p: MethodHookParam) { if(Looper.myLooper()==Looper.getMainLooper()) depth-- }
@@ -194,9 +224,17 @@ internal object XBottomBarHooks {
                 if(depth>0) {
                     state=WeakReference(nativeState)
                     owner=WeakReference(activityRef?.get())
+                    if(role=="gestureDrawer") {
+                        val tree=owner.get()?.window?.decorView?.viewTreeObserver
+                        if(tree!==observer) {
+                            detachObserver()
+                            observer=tree
+                            tree?.addOnPreDrawListener(onFrame)
+                        }
+                    }
                 }
                 if(state.get()!==nativeState) return
-                (runCatching { isOpen.invoke(nativeState) }.getOrNull() as? Boolean)?.let(XAdapter::onDrawerChanged)
+                syncDrawer()
             }
         })
         hook(isOpen,object: XC_MethodHook() {
@@ -208,6 +246,7 @@ internal object XBottomBarHooks {
         XposedBridge.hookAllMethods(Activity::class.java,"onDestroy",object: XC_MethodHook() {
             override fun afterHookedMethod(p: MethodHookParam) {
                 if(owner.get()!==p.thisObject) return
+                detachObserver()
                 owner.clear(); state.clear()
                 XAdapter.onDrawerChanged(false)
             }

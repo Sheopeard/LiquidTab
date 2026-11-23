@@ -23,7 +23,7 @@ public final class BilibiliCommentIndex {
 
     public static Binding resolve(String apk,String cachePath) throws IOException {
         File source=new File(apk),cache=new File(cachePath);
-        String fingerprint="2:"+source.getAbsolutePath()+":"+source.length()+":"+source.lastModified();
+        String fingerprint="3:"+source.getAbsolutePath()+":"+source.length()+":"+source.lastModified();
         if(cache.isFile()) try(InputStream in=new FileInputStream(cache)) {
             Properties p=new Properties();p.load(in);
             if(fingerprint.equals(p.getProperty("fingerprint"))) return new Binding(
@@ -39,7 +39,7 @@ public final class BilibiliCommentIndex {
                 byte[] data;
                 try(InputStream in=zip.getInputStream(e)) { data=in.readAllBytes(); }
                 Dex dex=new Dex(data);
-                if(dex.hasPageTypes()) found.addAll(dex.find());
+                if(dex.hasPageTypes() || dex.hasInputTrace()) found.addAll(dex.find());
             }
         }
         if(found.size()!=1) throw new IOException("Comment semantic binding count="+found.size());
@@ -82,6 +82,16 @@ public final class BilibiliCommentIndex {
             int low=0,high=u4(64);
             while(low<high) { int m=(low+high)>>>1;if(type(m).compareTo(PREFIX)<0)low=m+1;else high=m; }
             return low<u4(64) && type(low).startsWith(PREFIX);
+        }
+        boolean hasInputTrace() {
+            String prefix="kntr.common.comment.page.ui.CommentInputBar (";
+            int low=0,high=u4(56);
+            while(low<high) {
+                int mid=(low+high)>>>1;
+                if(str(mid).compareTo(prefix)<0) low=mid+1;
+                else high=mid;
+            }
+            return low<u4(56) && str(low).startsWith(prefix);
         }
         Ref ref(int id) {
             int m=methods+id*8,p=protos+u2(m+2)*12,a=u4(p+8);
@@ -135,7 +145,10 @@ public final class BilibiliCommentIndex {
             int definitions=u4(100);
             for(int i=0;i<u4(96);i++) {
                 int def=definitions+i*32;
-                if(!type(u4(def)).startsWith(PREFIX)) continue;
+                String owner=type(u4(def));
+                boolean inPagePackage=owner.startsWith(PREFIX);
+                // R8 can repackage generated classes into the root namespace.
+                if(!inPagePackage && owner.indexOf('/')>=0) continue;
                 int start=u4(def+24);if(start==0)continue;
                 Cursor c=new Cursor(start);int statics=c.leb(),instances=c.leb(),direct=c.leb(),virtual=c.leb();
                 Set<String> fieldTypes=new HashSet<>();
@@ -147,7 +160,15 @@ public final class BilibiliCommentIndex {
                     int id=0;
                     for(int j=0;j<count;j++) {
                         id+=c.leb();c.leb();int code=c.leb();
-                        if(code!=0) { Body body=new Body(ref(id));body.fieldTypes=fieldTypes;inspect(body,code);bodies.add(body); }
+                        if(code==0) continue;
+                        Ref method=ref(id);
+                        boolean relocatedList=fieldTypes.containsAll(Set.of("Landroidx/compose/foundation/lazy/LazyListState;",
+                            "Landroidx/compose/foundation/layout/PaddingValues;","Ljava/util/List;"));
+                        if(!inPagePackage && !relocatedList && !method.args.contains(COM)) continue;
+                        Body body=new Body(method);
+                        body.fieldTypes=fieldTypes;
+                        inspect(body,code);
+                        if(inPagePackage || relocatedList || !body.anchors.isEmpty()) bodies.add(body);
                     }
                 }
             }

@@ -105,7 +105,7 @@ internal class MiCommunityNavigationState(private val context: Context) : AppNav
 
         val groupTop = (height - groupHeight) / 2f - MI_COMMUNITY_CONTENT_LIFT_DP * density
 
-        val iconCenterY = groupTop + iconSize / 2f
+        val iconCenterY = if (iconOnly) height / 2f else groupTop + iconSize / 2f
 
         val labelBaseline = groupTop + iconSize + contentGap - labelMetrics.top
 
@@ -247,7 +247,7 @@ internal class MiCommunityNavigationState(private val context: Context) : AppNav
 
             miCommunityLabelPaint.alpha = 255
 
-            canvas.drawText(
+            if (!iconOnly) canvas.drawText(
 
                 MiCommunityArtwork.labels[index],
 

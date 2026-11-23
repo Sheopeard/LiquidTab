@@ -509,6 +509,7 @@ internal class TaobaoPageChrome {
 
         (host as? GlassHostLayout)?.let { TaobaoCartInitialResource.prepareRoot(resolvedRoot, it) }
         if (TaobaoCartInitialResource.owns(resolvedRoot)) {
+            ((host as? GlassHostLayout)?.appNavigationState as? TaobaoNavigationState)?.bindCartScene(resolvedRoot)
             (host as? GlassHostLayout)?.let {
                 TaobaoCartInitialResource.bindNativeButtons(resolvedRoot, it)
             }

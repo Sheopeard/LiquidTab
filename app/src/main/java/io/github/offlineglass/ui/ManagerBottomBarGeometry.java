@@ -14,12 +14,11 @@ public final class ManagerBottomBarGeometry {
     }
     public final float slotWidth, lensWidth, lensHeight, left, top, contentScale;
     public ManagerBottomBarGeometry(float width, float height, float density,
-            int tabs, float position, float progress, float pressScale, float expansionGain,
-            float fontScale) {
+            int tabs, float position, float verticalScale, float fontScale) {
         float inset = 4f * density;
         slotWidth = Math.max(1f, width - 2f * inset) / Math.max(1, tabs);
         float innerHeight = Math.max(1f, height - 2f * inset);
-        float outset = innerHeight * .5f * (pressScale - 1f) * expansionGain * progress;
+        float outset = io.github.offlineglass.rendering.BottomBarDynamics.indicatorOutset(innerHeight, verticalScale);
         lensWidth = slotWidth + 2f * outset;
         lensHeight = innerHeight + 2f * outset;
         left = inset + Math.max(0f, Math.min(tabs - 1f, position)) * slotWidth - outset;

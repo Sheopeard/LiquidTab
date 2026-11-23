@@ -7,10 +7,8 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.ViewGroup
-import android.widget.TextView
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
-import io.github.offlineglass.hook.adapters.NavigationCaptureLabels
 import io.github.offlineglass.hook.adapters.OpticalSurfaceRenderQueue
 import io.github.offlineglass.hook.GlassHostLayout
 
@@ -24,21 +22,20 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     val chromeFinder = JdChromeFinder(host)
     val contentViewport = JdContentViewport()
     val backToTopController = JdBackToTopController()
-    val checkoutController = JdCheckoutController(chromeFinder, backToTopController)
+    val checkoutController = JdCheckoutController(chromeFinder, backToTopController) { lastNativeTab == 3 }
     val flashControlsController = JdFlashControlsController(chromeFinder)
     val layoutProbe = JdLayoutProbe(host, chromeFinder, checkoutController, flashControlsController)
     val surfaceRenderQueue = OpticalSurfaceRenderQueue()
-    private val frameCopyScheduler = JdFrameCopyScheduler()
+    private val gpuBackdrop = JdGpuBackdropCapture(host)
     private val pagePreview = JdPagePreview(host)
     private val tabTouch = JdTabTouch(host, pagePreview)
-    private var pixelCopyThread: HandlerThread? = null
-    private var pixelCopyHandler: Handler? = null
-    private var navigationGroupClass: Class<*>? = null
+    private var opticalThread: HandlerThread? = null
+    private var opticalHandler: Handler? = null
+    private var browseExitRow: java.lang.ref.WeakReference<ViewGroup>? = null
     private var lastSnapshotProbeAt = 0L
     private var lastSnapshotProbeSource: ViewGroup? = null
     private var lastUiBarAnimating = false
     private var lostWindowFocus = false
-    private var lastPageIndex = -1
     private var nativeBackdropScene: android.view.View? = null
     private var previewSceneRevision = -1
     private var backdropGeometry = Long.MIN_VALUE
@@ -48,6 +45,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     private var backdropOffsetY = Int.MIN_VALUE
     private val nativeSceneSelector = JdNativeSceneSelector()
     private var lastNativeTab = -1
+    private var frameListenerRoot: ViewGroup? = null
     private var interactionFrameRate = 0f
     private val releaseFrameRate = Runnable {
         if (android.os.Build.VERSION.SDK_INT >= 35 && interactionFrameRate != 0f) {
@@ -69,16 +67,29 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     override fun onBarGesture(phase: Int, host: android.view.View) = prioritizeInteractionFrames()
 
     override fun suppressNativeChromeEarly(source: ViewGroup?) {
+        if (!host.config.enabled) return
+        val row = JdNavigationBinding.resolve(source) ?: return
+        nativeChrome.hideBrowse(row)
         JdMessageClassLookup.bindHost(host)
         JdHomeColdBatch.bindHost(host)
-        if (source != null && artwork.jdStaticIconsPopulated)
-            JdNativePageTransitions.bindHiddenBar(source, host)
-        val nativeSelected = tabTouch.selected(source, 5)
+        if (artwork.jdStaticIconsPopulated) JdNativePageTransitions.bindHiddenBar(row.view, host)
+        val nativeSelected = row.selected()
+        if (nativeSelected == JdNavigationBinding.BROWSE) {
+            if (host.hasWindowFocus() && browseExitRow?.get() !== row.view) {
+                browseExitRow = java.lang.ref.WeakReference(row.view)
+                host.post {
+                    if (host.isAttachedToWindow && host.config.enabled && host.hasWindowFocus() &&
+                        host.navigationSource === row.view && row.isCurrent() && row.selected() == JdNavigationBinding.BROWSE)
+                        tabTouch.dispatch(row.view, JdNavigationBinding.HOME, row.slots.size)
+                }
+            }
+        } else browseExitRow = null
         val actual = nativeSelected ?: host.navigationIndex
-        if (actual == 3) checkoutController.ensureCartOverlay(host)
         if (nativeSelected != null && nativeSelected != lastNativeTab) {
             lastNativeTab = nativeSelected
             pageState.onNativeTabChanged(nativeSelected)
+            contentViewport.invalidateGeometry()
+            repairNativeChrome()
         }
         // Keep JD's page independent from its native nav BEFORE the first
         // destination draw, including the host's 240ms animation-priority phase.
@@ -94,48 +105,42 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     override fun onHostFrame(host: android.view.View) {
         val glassHost = host as? GlassHostLayout ?: return
-        updateBackdropRendererMode(glassHost)
-        // First-visit switching retains the actual page, not a screenshot.
-        // Do not keep producing/encoding unused historical preview frames.
-        if (lastPageIndex != glassHost.navigationIndex) {
-            lastPageIndex = glassHost.navigationIndex
-            contentViewport.invalidateGeometry()
-            repairNativeChrome()
-        }
+        // The host's direct-backdrop pre-draw listener already updates optics.
+        // Checkout is corrected in suppressNativeChromeEarly, before drawing.
         val root = glassHost.rootView as? ViewGroup ?: return
-        JdScrollSignals.bind(root, this)
-        layoutProbe.attach(
-            root,
-            selectedIndex = { glassHost.navigationIndex },
-            newProductsActive = { pageState.newProductsActive },
-            onContentScroll = glassHost::onAdapterContentScroll,
-            refreshNewProducts = { root, now -> refreshNewProducts(glassHost, root, now) },
-        )
-        checkoutController.correct(root, glassHost)
+        if (frameListenerRoot !== root) {
+            frameListenerRoot = root
+            JdScrollSignals.bind(root, this)
+            layoutProbe.attach(
+                root,
+                selectedIndex = { lastNativeTab.takeIf { it >= 0 } ?: glassHost.navigationIndex },
+                newProductsActive = { pageState.newProductsActive },
+                onContentScroll = glassHost::onAdapterContentScroll,
+                refreshNewProducts = ::refreshNewProducts,
+            )
+        }
         contentViewport.adjust(
             glassHost, glassHost.navigationSource, root, pageState.newProductsActive,
         ) { contentRoot, rootHeight ->
-            checkoutController.lift(contentRoot, rootHeight, glassHost)
-            if (!pageState.newProductsActive) flashControlsController.lift(contentRoot, rootHeight, glassHost)
+            if (!pageState.newProductsActive && lastNativeTab == JD_HOME_INDEX) {
+                flashControlsController.lift(contentRoot, rootHeight, glassHost)
+            }
         }
     }
-
-    override fun onOpticalBackdropChanged() = onContentScroll()
 
     override fun onContentScroll() {
         pageState.contentMotionUntil = android.os.SystemClock.uptimeMillis() +
             JdPageState.CONTENT_MOTION_HOLD_MS
         if (pageState.newProductsActive) pageState.newProductsSnapshotDirty = true
-        host.resetCompositorSamplingCadence()
     }
 
     override fun refreshNavigationSource(host: android.view.View): Boolean {
         val glassHost = host as? GlassHostLayout ?: return false
         val current = glassHost.navigationSource
-        if (current != null && current.isAttachedToWindow && current.width > 0) return false
+        if (current != null && current.isAttachedToWindow && current.isShown && current.width > 0 &&
+            JdNavigationBinding.resolve(current) != null) return false
         val content = glassHost.activityForAdapter()?.findViewById<ViewGroup>(android.R.id.content) ?: return false
-        val view = chromeFinder.findNavigationGroup(content, navigationGroupClass) ?: return false
-        navigationGroupClass = view.javaClass
+        val view = JdNavigationBinding.find(content)?.view ?: return false
         glassHost.navigationSource = view
         checkoutController.onNavigationRebound()
         flashControlsController.nextFindAt = 0L
@@ -150,9 +155,9 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         return true
     }
 
-    fun refreshNewProducts(host: GlassHostLayout, root: ViewGroup, now: Long) {
+    private fun refreshNewProducts(root: ViewGroup, now: Long) {
         val wasActive = pageState.newProductsActive
-        val probe = pageState.probeNewProducts(root, host.navigationIndex, now)
+        val probe = pageState.probeNewProducts(root, lastNativeTab.takeIf { it >= 0 } ?: host.navigationIndex, now)
         if (!probe.changed) return
         repairNativeChrome()
         if (probe.active && !wasActive) {
@@ -191,18 +196,6 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         }
         return touching || visualAnimating || !shouldProbeSnapshot(source, now)
     }
-
-    override fun inspectNavigationCaptureLabels(source: ViewGroup, hasSnapshot: Boolean): NavigationCaptureLabels {
-        val inspection = artwork.inspectCaptureLabels(source, hasSnapshot)
-        return NavigationCaptureLabels(
-            inspection.labels,
-            if (inspection.retryLater) LABEL_REBIND_BACKOFF_MS else 0L,
-        )
-    }
-
-    override fun temporarilyHideNavigationLabels(
-        labels: List<TextView>, selectedIndex: Int,
-    ): List<Pair<TextView, Int>> = artwork.labelsHiddenDuringHomeCapture(labels, selectedIndex)
 
     override fun acceptAndCommitNavigationSnapshot(
         source: ViewGroup?, target: Bitmap, selectedIndex: Int, slotCount: Int,
@@ -263,9 +256,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         opticalCache.indicatorCombinedDark = dark
     }
 
-    override fun drawHiddenTabsInIndicatorScene(hybridBackdrop: Boolean): Boolean = true
-
-    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean): Boolean = true
+    override fun drawHiddenTabsInIndicatorScene(hybridBackdrop: Boolean): Boolean = false
 
     override fun opticalBlurNodeNeedsRecord(
         prepared: Boolean, backdrop: Bitmap?, width: Int, height: Int,
@@ -295,39 +286,18 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         host.config.enabled && host.config.backdropCapture && !host.config.solidBarEnabled &&
             (host.config.liquidGlassEnabled || host.config.blurRadius > 0f)
 
-    override fun maintainsCompositorSamplingWithoutSurface(): Boolean =
-        requiresSampledBackdrop() && pageState.newProductsActive
-
     override fun allowsOpticalSurfacePipeline(): Boolean =
         nativeBackdropScene == null && requiresSampledBackdrop()
+    override fun preparesOpticalSurfaceForWindowCapture(): Boolean = true
     override fun opticalCaptureEpoch(): Long = opticalCache.backdropEpoch.toLong()
+    // Only the adapter-owned GPU capture can feed this Surface.
+    override fun pauseOpticalSurfaceProbe(): Boolean = true
 
     override fun opticalSurfaceCopyHandler(): Handler {
-        pixelCopyHandler?.let { return it }
-        val thread = HandlerThread("LiquidTab-JD-PixelCopy").also { it.start() }
-        pixelCopyThread = thread
-        return Handler(thread.looper).also { pixelCopyHandler = it }
-    }
-
-    override fun scheduleOpticalSurfaceCopy(root: android.view.View, copy: () -> Unit): Boolean =
-        frameCopyScheduler.schedule(root, copy)
-
-    override fun overlapsOpticalCopyAndRender(): Boolean = true
-
-    override fun onOpticalSurfaceCopyCompleted(root: android.view.View, nextCopy: () -> Unit) {
-        // Arm the next commit immediately after publication, before rendering the
-        // current glass frame. PixelCopy callbacks and renders share one worker,
-        // so publication stays serial while GPU readback can overlap submission.
-        // Only a moving page chains copies. Arm before the next
-        // UI traversal; idle probing backs off.
-        val epoch = opticalCache.backdropEpoch
-        root.post {
-            if (epoch == opticalCache.backdropEpoch && allowsOpticalSurfacePipeline() &&
-                host.isAttachedToWindow && host.hasWindowFocus() &&
-                android.os.SystemClock.uptimeMillis() < pageState.contentMotionUntil) {
-                frameCopyScheduler.schedule(root, nextCopy)
-            }
-        }
+        opticalHandler?.let { return it }
+        val thread = HandlerThread("LiquidTab-JD-Optics").also { it.start() }
+        opticalThread = thread
+        return Handler(thread.looper).also { opticalHandler = it }
     }
 
     override fun pageRequiresScrollStopHide(selectedIndex: Int): Boolean =
@@ -360,7 +330,8 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
         val nativeScene = pagePreview.scene ?: if (requiresSampledBackdrop()) nativeSceneSelector.pick(
-            host, host.navigationIndex, pageState.newProductsActive || pageState.fullscreenVideoActive,
+            host, lastNativeTab.takeIf { it >= 0 } ?: host.navigationIndex,
+            pageState.newProductsActive || pageState.fullscreenVideoActive,
         ) else null
         nativeScene?.getLocationInWindow(backdropSceneLocation)
         host.getLocationInWindow(backdropHostLocation)
@@ -377,7 +348,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
             backdropGeometry = geometry
             previewSceneRevision = pagePreview.sceneRevision
             nativeBackdropScene = nativeScene
-            frameCopyScheduler.cancel()
+            gpuBackdrop.cancel()
             // Preview and real pages can share the same tab and bitmap-copy
             // generation. None of the retained blur/indicator wrappers may
             // keep referencing the preview RenderNode after it becomes GONE.
@@ -402,7 +373,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
             return true
         }
         if (!requiresSampledBackdrop()) {
-            frameCopyScheduler.cancel()
+            gpuBackdrop.cancel()
             opticalCache.directBackdropActive = false
             opticalCache.surfaceFrameReady = false
             host.disableOpticalSurfaceNativeBlurForAdapter()
@@ -419,6 +390,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
             clearLiveHostState = host::clearLiveBackdropForAdapter,
             enableSurfaceRenderer = host::enableOpticalSurfaceRendererForAdapter,
         )
+        gpuBackdrop.request(opticalCaptureEpoch(), ::opticalSurfaceCopyHandler)
         return true
     }
 
@@ -451,16 +423,11 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     override fun enterDirectOpticalBackdrop(
         surface: android.view.SurfaceView, pipelineActive: Boolean,
     ): Boolean {
-        if (!requiresSampledBackdrop() || nativeBackdropScene != null) {
-            // This mode paints in the host. Keeping a transparent Surface alive
-            // and clearing it through lockCanvas can block every UI traversal.
-            if (!pipelineActive && surface.visibility == android.view.View.GONE) return false
-            surface.visibility = android.view.View.GONE
-            opticalCache.surfaceFrameReady = false
-            opticalCache.directBackdropActive = false
-            return true
-        }
-        return JdSurfaceModeController.enterDirectMode(surface, opticalCache, pipelineActive)
+        if (!pipelineActive && surface.visibility == android.view.View.GONE) return false
+        surface.visibility = android.view.View.GONE
+        opticalCache.surfaceFrameReady = false
+        opticalCache.directBackdropActive = false
+        return true
     }
 
     override fun onOpticalSurfaceFrameInvalidated() {
@@ -524,7 +491,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     }
 
     override fun suppressNativeChrome(source: ViewGroup?) {
-        nativeChrome.suppress(source)
+        JdNavigationBinding.resolve(source)?.let { nativeChrome.suppress(it.view) }
     }
 
     override val readyForDrawing: Boolean
@@ -548,8 +515,13 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
     override fun performTap(host: android.view.View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
         prioritizeInteractionFrames()
         val handled = tabTouch.dispatch(source, index, slotCount)
-        if (handled) onNavigationSelectionRequested(index, slotCount, android.os.SystemClock.uptimeMillis())
+        if (handled) finishNativeTap(index, slotCount)
         return handled
+    }
+
+    private fun finishNativeTap(index: Int, slotCount: Int) {
+        onNavigationSelectionRequested(index, slotCount, android.os.SystemClock.uptimeMillis())
+        host.postInvalidateOnAnimation()
     }
 
     override fun acceptNativeNavigationSelection(index: Int, now: Long): Boolean {
@@ -566,6 +538,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = artwork.draw(canvas, frame)
 
+
     override fun dispose() {
         pagePreview.clear(dispose = true)
         artwork.dispose()
@@ -576,26 +549,25 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     override fun onHostDetached() {
         lastNativeTab = -1
+        frameListenerRoot = null
         JdClassicLayout.release(host)
         host.removeCallbacks(releaseFrameRate)
         releaseFrameRate.run()
         tabTouch.cancel()
         JdScrollSignals.unbind(this)
         lostWindowFocus = false
-        lastPageIndex = -1
         nativeBackdropScene = null
         nativeSceneSelector.detach()
-        frameCopyScheduler.cancel()
+        gpuBackdrop.cancel()
         selectionFollow.reset()
-        navigationGroupClass = null
-        pixelCopyThread?.quitSafely()
-        pixelCopyThread = null
-        pixelCopyHandler = null
+        browseExitRow = null
+        opticalThread?.quitSafely()
+        opticalThread = null
+        opticalHandler = null
         pageState.reset()
         layoutProbe.detach()
         backToTopController.restore()
         checkoutController.restore()
-        checkoutController.discoveryExhausted = false
         flashControlsController.restore()
         nativeChrome.reset()
         nativeChrome.invalidateOuterEffect()
@@ -619,6 +591,7 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
         nativeSceneSelector.onFocusChanged(hasFocus)
         if (!hasFocus) pagePreview.clear()
         if (!hasFocus) {
+            gpuBackdrop.cancel()
             host.removeCallbacks(releaseFrameRate)
             releaseFrameRate.run()
             tabTouch.cancel()
@@ -634,7 +607,6 @@ internal class JdNavigationState(private val host: GlassHostLayout) : AppNavigat
 
     private companion object {
         const val SNAPSHOT_PROBE_INTERVAL_MS = 16L
-        const val LABEL_REBIND_BACKOFF_MS = 240L
         const val TAB_SWITCH_HOLD_MS = 180L
         const val JD_BROWSE_INDEX = 1
         const val JD_HOME_INDEX = 0

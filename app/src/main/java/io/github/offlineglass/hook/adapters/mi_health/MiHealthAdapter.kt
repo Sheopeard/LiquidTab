@@ -30,6 +30,8 @@ internal object MiHealthAdapter : TargetAdapter {
     override val drawsNavigationInOptics = true
     override val usesNavigationOpticalMix = true
     override val persistentNavigationOpticalMix = true
+    // Keep the artwork split aligned to the actual transformed inset lens.
+    override val foregroundUsesRenderedSelectionOutline = true
     override val foregroundMaskInsetDp = 0f
     // The baseline commits selectionInitialized after Tab.select(). Without it,
     // the first dispatchDraw snaps the spring to the target and skips the tap animation.

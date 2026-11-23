@@ -25,8 +25,7 @@ internal class XhsNavigationRenderer {
         val baseline = height / 2f - (metrics.ascent + metrics.descent) / 2f
         barLayout?.let { layout ->
             // The shared host already draws this action's own glass and shadow.
-            // Translucent tint preserves the host's live blur/refraction and
-            // leaves its optical rim exposed; never cover it with an opaque face.
+            // Match the glass radius so the untinted face does not form a ring.
             if (!hideSelectedForOptics) {
                 val cx = layout.actionLeft + layout.actionSize / 2f
                 actionPaint.style = Paint.Style.FILL
@@ -35,8 +34,7 @@ internal class XhsNavigationRenderer {
                 // the remaining transparency still exposes the live optics.
                 val tintAlpha = if (darkGlass) 70 else 190
                 actionPaint.color = (BRAND_RED and 0x00FFFFFF) or (tintAlpha shl 24)
-                canvas.drawCircle(cx, height / 2f,
-                    (layout.actionSize / 2f - .6f * density).coerceAtLeast(1f), actionPaint)
+                canvas.drawCircle(cx, height / 2f, layout.actionSize / 2f, actionPaint)
                 drawPlus(canvas, cx, height / 2f, 9f * density, density)
             }
         }

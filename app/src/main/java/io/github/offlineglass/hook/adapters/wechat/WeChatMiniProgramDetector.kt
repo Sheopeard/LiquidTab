@@ -8,6 +8,8 @@ import android.widget.TextView
 internal class WeChatMiniProgramDetector {
     private var titleAnchor = java.lang.ref.WeakReference<TextView>(null)
     private var contentAnchor = java.lang.ref.WeakReference<TextView>(null)
+    private var lastMissRoot = java.lang.ref.WeakReference<View>(null)
+    private var nextProbeAt = 0L
     private val titleBounds = android.graphics.Rect()
     private val contentBounds = android.graphics.Rect()
 
@@ -32,14 +34,14 @@ internal class WeChatMiniProgramDetector {
 
         val cachedTitle = titleAnchor.get()
         val cachedContent = contentAnchor.get()
-        // Only positive bindings are reused. A negative scan is never cached,
-        // so a newly-created mini-app page is detected in its first frame.
         if (cachedTitle != null && cachedContent != null &&
             cachedTitle.rootView === content.rootView && cachedContent.rootView === content.rootView &&
             cachedTitle.isShown && cachedContent.isShown && cachedTitle.alpha > .01f && cachedContent.alpha > .01f &&
             cachedTitle.text.toString().trim() == WECHAT_MINI_PANEL_RECENT_LABEL &&
             WECHAT_MINI_PANEL_CONTENT_LABELS.any { cachedContent.text.contains(it) } &&
             cachedTitle.getGlobalVisibleRect(titleBounds) && cachedContent.getGlobalVisibleRect(contentBounds)) return true
+        val now = android.os.SystemClock.uptimeMillis()
+        if (lastMissRoot.get() === content && now < nextProbeAt) return false
         var foundTitle: TextView? = null
         var foundContent: TextView? = null
         var hasRecentTitle = false
@@ -76,6 +78,7 @@ internal class WeChatMiniProgramDetector {
                 }
 
                 if (hasRecentTitle && hasMiniProgramContent) {
+                    nextProbeAt = 0L
                     titleAnchor = java.lang.ref.WeakReference(foundTitle)
                     contentAnchor = java.lang.ref.WeakReference(foundContent)
                     return true
@@ -86,7 +89,14 @@ internal class WeChatMiniProgramDetector {
 
             if (candidate is ViewGroup && depth < WECHAT_MINI_PANEL_MAX_DEPTH) {
 
-                for (index in candidate.childCount - 1 downTo 0) {
+                // ConversationListView registers the mini-app desktop as a
+                // ListView header. Conversation rows cannot own that desktop.
+                val childCount = if (candidate is android.widget.ListView &&
+                    candidate.javaClass.name == "com.tencent.mm.ui.conversation.ConversationListView") {
+                    (candidate.headerViewsCount - candidate.firstVisiblePosition)
+                        .coerceIn(0, candidate.childCount)
+                } else candidate.childCount
+                for (index in childCount - 1 downTo 0) {
 
                     stack += candidate.getChildAt(index) to (depth + 1)
 
@@ -96,6 +106,8 @@ internal class WeChatMiniProgramDetector {
 
         }
 
+        if (lastMissRoot.get() !== content) lastMissRoot = java.lang.ref.WeakReference(content)
+        nextProbeAt = now + 48L
         return false
 
     }

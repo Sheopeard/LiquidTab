@@ -60,8 +60,6 @@ internal object NavigationLabelLocalization {
             "列表" to "Lists", "书签" to "Bookmarks", "我" to "Profile", "个人资料" to "Profile",
         ),
         "chatgpt" to mapOf("新聊天" to "New chat", "历史记录" to "History", "项目" to "Projects", "设置" to "Settings"),
-        "eudic" to mapOf("词典" to "Dict", "AI" to "AI", "生词笔记" to "Vocab", "学习" to "Study", "账号" to "Account"),
-        "share" to mapOf("首页" to "Home", "消息" to "Inbox", "发现" to "Explore"),
     )
 
     fun toEnglish(targetKey: String, label: String): String =

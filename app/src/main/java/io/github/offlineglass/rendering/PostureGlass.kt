@@ -2,7 +2,9 @@ package io.github.offlineglass.rendering
 
 import android.graphics.*
 import android.view.View
+import android.view.ViewTreeObserver
 import io.github.offlineglass.hook.BloomTiltTracker
+import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import kotlin.math.*
 
@@ -19,6 +21,10 @@ internal object PostureGlass {
         var wanted = false
         var referenceX = Float.NaN
         var referencePitch = Float.NaN
+        // A root observer can outlive this control. Neither the observer callback
+        // nor this weak-map value may retain the control (or its old window).
+        var focusObserver = WeakReference<ViewTreeObserver>(null)
+        var focusListener: ViewTreeObserver.OnWindowFocusChangeListener? = null
     }
     private val owners = WeakHashMap<View, Owner>()
     private val uniforms = WeakHashMap<RuntimeShader, String>()
@@ -33,23 +39,49 @@ internal object PostureGlass {
     private val flowingShaders = WeakHashMap<RuntimeShader, EffectPose>()
     fun isTracking(view: View) = owners[view]?.active == true
     fun track(view: View, enabled: Boolean = true) {
+        if (!enabled && !owners.containsKey(view)) return
         val owner = owners.getOrPut(view) {
             val value = Owner()
+            val target = WeakReference(view)
+            value.focusListener = ViewTreeObserver.OnWindowFocusChangeListener { focused ->
+                target.get()?.let { current ->
+                    visibilityChanged(current)
+                    if (focused && value.wanted && current.isShown) current.postInvalidateOnAnimation()
+                }
+            }
             view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-                override fun onViewAttachedToWindow(v: View) = Unit
+                override fun onViewAttachedToWindow(v: View) {
+                    bindFocusObserver(v, value)
+                    visibilityChanged(v)
+                }
                 override fun onViewDetachedFromWindow(v: View) {
+                    unbindFocusObserver(value)
                     value.active = false
                     BloomTiltTracker.unregister(v)
                 }
             })
-            view.viewTreeObserver.addOnWindowFocusChangeListener { focused ->
-                visibilityChanged(view)
-                if (focused && value.wanted && view.isShown) view.postInvalidateOnAnimation()
-            }
             value
         }
         owner.wanted = enabled
+        bindFocusObserver(view, owner)
         visibilityChanged(view)
+    }
+    private fun bindFocusObserver(view: View, owner: Owner) {
+        if (!view.isAttachedToWindow) return
+        val current = view.viewTreeObserver
+        if (owner.focusObserver.get() === current) return
+        unbindFocusObserver(owner)
+        if (current.isAlive) {
+            owner.focusListener?.let(current::addOnWindowFocusChangeListener)
+            owner.focusObserver = WeakReference(current)
+        }
+    }
+    private fun unbindFocusObserver(owner: Owner) {
+        val previous = owner.focusObserver.get()
+        if (previous?.isAlive == true) {
+            owner.focusListener?.let(previous::removeOnWindowFocusChangeListener)
+        }
+        owner.focusObserver.clear()
     }
     fun visibilityChanged(view: View) {
         val owner = owners[view] ?: return

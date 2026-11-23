@@ -98,21 +98,22 @@ internal class TaobaoArtwork(private val context: Context) {
     }
 
     @Synchronized fun drawFixedSlot(canvas: Canvas, index: Int, selectedIndex: Int, dark: Boolean,
-                      centerX: Float, centerY: Float, boxSize: Float): Boolean {
+                      centerX: Float, centerY: Float, boxSize: Float, iconOnly: Boolean = false): Boolean {
         val artwork = load(index) ?: return false
         if (artwork.width <= 0 || artwork.height <= 0 || boxSize <= 0f) return false
         val scale = boxSize / artwork.width
         val split = bands[index] ?: findBands(artwork).also { bands[index] = it }
         val iconHeight = split.icon.height() * scale * 1.2f
-        val labelHeight = (split.label?.height() ?: 0) * scale
-        val gap = split.label?.let { (it.top - split.icon.bottom).coerceAtLeast(0) * scale } ?: 0f
+        val caption = split.label.takeUnless { iconOnly }
+        val labelHeight = (caption?.height() ?: 0) * scale
+        val gap = caption?.let { (it.top - split.icon.bottom).coerceAtLeast(0) * scale } ?: 0f
         val top = centerY - (iconHeight + gap + labelHeight) / 2f
         copyPaint.alpha = 255
         copyPaint.colorFilter = if(selectedIndex==index) accentFilter else if(dark) darkFilter else lightFilter
         val iconWidth = split.icon.width() * scale * 1.2f
         destination.set(centerX - iconWidth / 2f, top, centerX + iconWidth / 2f, top + iconHeight)
         canvas.drawBitmap(artwork, split.icon, destination, copyPaint)
-        split.label?.let { label ->
+        caption?.let { label ->
             val labelWidth = label.width() * scale
             destination.set(centerX - labelWidth / 2f, top + iconHeight + gap,
                 centerX + labelWidth / 2f, top + iconHeight + gap + labelHeight)

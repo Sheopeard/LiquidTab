@@ -95,6 +95,7 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
     private var panel: GlassHostLayout? = null
     private val backdrop = MiMarketNavigationState(activity)
     private val backgrounds = WeakHashMap<View, Drawable?>()
+    private val footerForegrounds = WeakHashMap<View, Drawable>()
     private val alphas = WeakHashMap<View, Float>()
     private val progressDrawables = WeakHashMap<ProgressBar, Drawable?>()
     private val oldParams = WeakHashMap<View, ViewGroup.LayoutParams>()
@@ -172,6 +173,15 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
         materialOwners[view] = java.lang.ref.WeakReference(this)
         if (view.background != null) view.background = null
     }
+
+    private fun clearFooterDecoration(view: View?) {
+        view ?: return
+        clearBackground(view)
+        view.foreground?.let {
+            footerForegrounds[view] = it
+            view.foreground = null
+        }
+    }
     override fun onPreDraw(): Boolean {
         if (disposing) return true
         val config = panel?.config ?: HookConfigReader.read(activity, "com.xiaomi.market")
@@ -180,8 +190,9 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
         val button = find("update_all_button")
         // The controller owns update_all_panel (mNoUpdateHideView). Its outer
         // visibility frame can remain VISIBLE after all updates have completed.
-        footerVisible = find("update_all_panel")?.isShown == true &&
-            find("update_all_visibility_frame")?.isShown == true
+        val footerPanel = find("update_all_panel")
+        val footerFrame = find("update_all_visibility_frame")
+        footerVisible = footerPanel?.isShown == true && footerFrame?.isShown == true
         // The controller hides one native child before showing the other.
         // Preserve the optical surface through that handoff; the footer owns
         // visibility, not either replaceable source control.
@@ -229,8 +240,15 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
                 ancestor = ancestor.parent as? ViewGroup
             }
         }
-        clearBackground(find("update_all_panel"))
-        clearBackground(find("update_all_visibility_frame"))
+        clearFooterDecoration(footerPanel)
+        clearFooterDecoration(footerFrame)
+        // The legacy upgrade layout puts bottom_tab_bg_div on an unnamed
+        // LinearLayout between these two semantic containers. The V2 panel
+        // is a direct child and owns its background itself.
+        val footerShell = footerPanel?.parent as? android.widget.LinearLayout
+        if (footerShell != null && footerShell.parent === footerFrame) {
+            clearFooterDecoration(footerShell)
+        }
         clearBackground(button); clearBackground(progress)
         for (view in listOfNotNull(button, progress)) {
             if (!alphas.containsKey(view)) alphas[view] = view.alpha
@@ -242,7 +260,7 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
             if (it.progressDrawable !== transparentProgress) it.progressDrawable = transparentProgress
         }
         // The native list frame reserves the footer height. Remove that reservation;
-        // preserve a scrollable inset so the final item can still clear the button.
+        // preserve the list's native padding.
         find("list_view_marge_bottom_frame")?.let { list ->
             layoutOwners[list] = java.lang.ref.WeakReference(this)
             val p = list.layoutParams
@@ -264,9 +282,8 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
             }
             for (reference in scrollers) reference.get()?.let { view ->
                     val old = padding.getOrPut(view) { intArrayOf(view.paddingLeft, view.paddingTop, view.paddingRight, view.paddingBottom, if(view.clipToPadding) 1 else 0) }
-                    // Native footer height also changes during button/progress
-                    // handoff. It must not reflow the feed under stable glass.
-                    val bottom = maxOf(old[3], buttonHeight + gap)
+                    // Avoid adding an empty footer-sized band to the viewport.
+                    val bottom = old[3]
                     if (view.paddingBottom != bottom) view.setPadding(old[0], old[1], old[2], bottom)
                     view.clipToPadding = false
             }
@@ -338,10 +355,12 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
         override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) = Unit
         override fun refreshNavigationSource(host: View) = false
         override fun retainNavigationWhenNativeRowHidden(selectedIndex: Int) = true
-        override fun allowsOpticalSurfacePipeline() = panel?.config?.let {
-            it.enabled && it.backdropCapture && !it.solidBarEnabled
-        } ?: true
-        override fun maintainsCompositorSamplingWithoutSurface() = allowsOpticalSurfacePipeline()
+        override fun allowsOpticalSurfacePipeline() = false
+        override fun maintainsCompositorSamplingWithoutSurface() = false
+        override fun resolveBackdropScene(host: View): View? = listRoot?.takeIf(::isSafeMarketBackdrop)
+        override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<View> =
+            listOfNotNull(listRoot?.takeIf(::isSafeMarketBackdrop))
+        override fun skipLiveBackdrop(selectedIndex: Int) = listRoot?.let(::isSafeMarketBackdrop) != true
         override fun contentMotionHoldUntil() = motionUntil
         // PixelCopy callbacks already run on UI: publish and render in that same
         // callback instead of waiting for another traversal of a busy update list.
@@ -491,6 +510,8 @@ internal class MiMarketUpgradeGlass private constructor(private val activity: Ac
         alphas.keys.forEach { sourceOwners.remove(it) }
         oldParams.keys.forEach { layoutOwners.remove(it) }
         backgrounds.forEach { (v, bg) -> v.background = bg }; backgrounds.clear()
+        footerForegrounds.forEach { (view, drawable) -> view.foreground = drawable }
+        footerForegrounds.clear()
         alphas.forEach { (v, a) -> v.alpha = a }; alphas.clear()
         progressDrawables.forEach { (v, d) -> v.progressDrawable = d }; progressDrawables.clear()
         oldParams.forEach { (v, p) -> v.layoutParams = p }; oldParams.clear()

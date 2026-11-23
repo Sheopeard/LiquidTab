@@ -18,12 +18,17 @@ import android.widget.FrameLayout
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
+import io.github.offlineglass.hook.topbar.TopBarChannelHost
+import io.github.offlineglass.hook.topbar.TopBarTabMeasure
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.HookConfigReader
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.adapters.TargetAdapter
+import io.github.offlineglass.hook.adapters.bilibili.BILIBILI_HOME_TOP_CLEARANCE_DP
+import io.github.offlineglass.hook.adapters.bilibili.BilibiliHomeGlassScene
+import io.github.offlineglass.hook.adapters.bilibili.BilibiliSearchFeedback
 import io.github.offlineglass.hook.adapters.home_glass.ComposeHomeBinding
 import io.github.offlineglass.hook.adapters.home_glass.HomeEdgeColorGradient
 import io.github.offlineglass.hook.adapters.home_glass.HomePanelHalo
@@ -33,7 +38,7 @@ import io.github.offlineglass.hook.compat.XC_MethodHook
 import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.glassHostBottomMarginPx
 import io.github.offlineglass.hook.glassHostHeightPx
-import io.github.offlineglass.hook.symmetricGlassSideMarginPx
+import io.github.offlineglass.hook.glassHostWidthPx
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 import java.util.WeakHashMap
@@ -46,6 +51,7 @@ internal object BilibiliInHomeLayoutHooks {
     private val blockedChrome = WeakHashMap<View, Session>()
     private val refreshFeeds = WeakHashMap<View, WeakReference<View>>()
     private val refreshQueries = HashSet<Method>()
+    private val channelMeasure = TopBarTabMeasure()
     private val channels = listOf("推荐", "热门")
     private val semantics = HomeSemanticSpec(channels, listOf("avatar", "头像"), listOf("个人主页", "个人中心"),
         listOf("Search Icon", "搜索图标"), listOf("搜索"))
@@ -56,6 +62,8 @@ internal object BilibiliInHomeLayoutHooks {
 
     fun install(loader: ClassLoader) {
         BilibiliInFrameInsets.install()
+        runCatching { BilibiliInHotListPadding.install(loader) }
+            .onFailure { XposedBridge.log("LiquidTab international Hot list hook: $it") }
         XposedBridge.hookAllMethods(ViewGroup::class.java, "dispatchTouchEvent", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 // One identity lookup, only for this adapter's verified hidden native header.
@@ -138,7 +146,13 @@ internal object BilibiliInHomeLayoutHooks {
         private var queryRefresh: View? = null
         private var refreshIndicator: BilibiliInRefreshIndicator? = null
         private var cachedFeed: ViewGroup? = null
+        private var pagerCandidate: View? = null
+        private var pagerProbeAt = 0L
+        private var pager: ViewGroup? = null
+        private var pagerCurrentItem: Method? = null
+        private var selectedChannel = -1
         private var bottomHost: GlassHostLayout? = null
+        private val searchFeedback = BilibiliSearchFeedback(wholeView = true)
         private var foreground = true
         private var listening = false
         private var ready = false
@@ -174,6 +188,7 @@ internal object BilibiliInHomeLayoutHooks {
             content.invalidate()
         }
         fun pause() {
+            searchFeedback.reset()
             foreground = false; active = false; overlay.visibility = View.GONE
             panels.forEach { it.animate().cancel(); it.scaleX = 1f; it.scaleY = 1f }
             top.release()
@@ -244,12 +259,13 @@ internal object BilibiliInHomeLayoutHooks {
                     if (panels.isEmpty()) return
                 }
             }
+            updateSelectedChannel(native)
             if (panels.isEmpty()) {
                 repeat(3) { role ->
                     val state = PanelState(this, role)
-                    val host = GlassHostLayout(activity, config, if (role == 1) 2 else 1,
+                    val host = TopBarChannelHost.createPanel(activity, config, if (role == 1) 2 else 1,
                         nativeSelectionReliable = true, navigationSource = page, sliderEnabled = role == 1,
-                        adapterOverride = PanelAdapter(state)).apply {
+                        adapterOverride = PanelAdapter(state), isChannel = role == 1).apply {
                         elevation = 0f; clipChildren = false; clipToPadding = false
                         contentDescription = listOf("个人中心", "推荐、热门", "搜索")[role]
                     }
@@ -266,11 +282,12 @@ internal object BilibiliInHomeLayoutHooks {
             if (bottomHost?.isAttachedToWindow != true) bottomHost = (0 until content.childCount)
                 .map { content.getChildAt(it) }.filterIsInstance<GlassHostLayout>().firstOrNull()
             val bar = bottomHost?.takeIf { it.width > 0 && it.height > 0 }
-            val side: Int; val width: Int; val barTop: Int
+            val searchWidth = glassHostWidthPx(content, 5, config, d).coerceAtMost(content.width)
+            val searchLeft = (content.width - searchWidth) / 2
+            val barTop: Int
             if (bar != null) {
-                bar.getLocationInWindow(location); side = location[0] - origin[0]; width = bar.width; barTop = location[1] - origin[1]
+                bar.getLocationInWindow(location); barTop = location[1] - origin[1]
             } else {
-                side = symmetricGlassSideMarginPx(content, d); width = content.width - side*2
                 barTop = content.height - glassHostBottomMarginPx(content, config) - glassHostHeightPx(d, config, activity.packageName)
             }
             // Freeform captions own their own input region even when statusBars
@@ -278,22 +295,30 @@ internal object BilibiliInHomeLayoutHooks {
             val systemTop = content.rootWindowInsets?.getInsets(WindowInsets.Type.statusBars() or
                 WindowInsets.Type.displayCutout() or WindowInsets.Type.captionBar())?.top ?: 0
             val y = (systemTop-origin[1]).coerceAtLeast(0)
-            val tabWidth = minOf((180*d).roundToInt(), width-2*(circle+gap)).coerceAtLeast(1)
+            val sizing = channelMeasure.update(channels, d, 14f * activity.resources.displayMetrics.scaledDensity)
+            panels[1].updateTopBarTabs(sizing)
+            val maxChannelWidth = (content.width - 2 * (circle + gap)).coerceAtLeast(1)
+            val tabWidth = minOf(sizing?.desiredWidth?.roundToInt() ?: (180*d).roundToInt(), maxChannelWidth)
+            val channelLeft = (content.width - tabWidth) / 2
+            val avatarLeft = (channelLeft - gap - circle).coerceAtLeast(0)
             top.setAppearance(config.bilibiliSolidTopGradient, dark()); fade.setDark(dark())
             place(top, 0, 0, content.width, y+h+((if (config.bilibiliSolidTopGradient) 64 else 12)*d).roundToInt())
-            place(panels[0], side, y+(h-circle)/2, circle, circle)
-            place(panels[1], (content.width-tabWidth)/2, y, tabWidth, h)
+            place(panels[0], avatarLeft, y+(h-circle)/2, circle, circle)
+            place(panels[1], channelLeft, y, tabWidth, h)
             val searchTop = if (config.bilibiliInDetachedSearch) barTop else barTop-gap-h
+            if (config.bilibiliInDetachedSearch) searchFeedback.reset()
             panels[2].visibility = if (config.bilibiliInDetachedSearch) View.GONE else View.VISIBLE
-            place(panels[2], side, searchTop, width, h)
+            place(panels[2], searchLeft, searchTop, searchWidth, h)
             val fadeTop = (searchTop-h/2-gap).coerceAtLeast(0)
             bottom.visibility = if (config.bilibiliBottomColorGradient) View.VISIBLE else View.GONE
             place(bottom, 0, fadeTop, content.width, content.height-fadeTop)
             halo.bind(panels, config.cornerSmoothing, dark(), config.liquidGlassEnabled)
-            val feed = safeInsets(y+h+(24*d).roundToInt()+origin[1], searchTop+origin[1], d)
+            val topBarBottom = origin[1] + y + h
+            val feedTop = topBarBottom + (BILIBILI_HOME_TOP_CLEARANCE_DP * d).roundToInt()
+            val feed = safeInsets(feedTop, searchTop+origin[1], d)
             feed?.let {
                 top.bindFeed(it); bindRefresh(it)
-                refreshIndicator?.update(y+h+(24*d).roundToInt()+origin[1], d)
+                refreshIndicator?.update(topBarBottom + (24f * d).roundToInt(), d)
             }
             top.updateFrame()
         }
@@ -320,9 +345,10 @@ internal object BilibiliInHomeLayoutHooks {
         private fun safeInsets(topWindow: Int, bottomWindow: Int, density: Float): ViewGroup? {
             fun pagerRecycler(view: View): Boolean {
                 val parent = view.parent as? View ?: return false
-                val name = runCatching { parent.resources.getResourceEntryName(parent.id) }.getOrNull()
-                return name == "pager" || generateSequence(parent.javaClass as Class<*>?) { it.superclass }.any {
-                    it.name == "androidx.viewpager2.widget.ViewPager2" || it.name == "androidx.viewpager.widget.ViewPager"
+                // ViewPager2 owns an internal RecyclerView. A RecyclerView
+                // placed directly in the original ViewPager is a content page.
+                return generateSequence(parent.javaClass as Class<*>?) { it.superclass }.any {
+                    it.name == "androidx.viewpager2.widget.ViewPager2"
                 }
             }
             fun resolve(view: View): ViewGroup? {
@@ -331,11 +357,12 @@ internal object BilibiliInHomeLayoutHooks {
                 // An outer pager RecyclerView is not the vertical feed. Prefer its nested native list.
                 if (view !is AbsListView && view is ViewGroup)
                     for (i in 0 until view.childCount) resolve(view.getChildAt(i))?.let { return it }
-                if (list && view is ViewGroup && !pagerRecycler(view) && view.width >= content.width*.8f && view.height > 0 && view.getGlobalVisibleRect(visible)) return view
+                if (list && view is ViewGroup && !pagerRecycler(view) && view.height > 0 &&
+                    view.getGlobalVisibleRect(visible) && visible.width() >= content.width*.8f) return view
                 return null
             }
             val feed = cachedFeed?.takeIf { !pagerRecycler(it) && it.isAttachedToWindow && it.isShown && it.getGlobalVisibleRect(visible) && visible.width() >= content.width*.8f }
-                ?: resolve(page)?.also { cachedFeed = it }
+                ?: resolve(pager ?: page)?.also { cachedFeed = it }
             // Only one native feed may own the safe area. A retained pager or
             // a previous channel must never keep padding around the new list.
             val stale = paddings.entries.iterator()
@@ -348,18 +375,9 @@ internal object BilibiliInHomeLayoutHooks {
                 stale.remove()
             }
             if (feed == null) { cachedFeed = null; return null }
-            // Same policy as domestic: layout coordinates exclude transient ancestor translations.
-            var layoutTop = origin[1]
-            var cursor: View = feed
-            while (cursor !== content) {
-                val parent = cursor.parent as? View ?: break
-                layoutTop += cursor.top-parent.scrollY
-                cursor = parent
-            }
-            val state = paddings.getOrPut(feed) { ListPadding(feed.paddingTop, feed.paddingBottom, feed.clipToPadding, feed.paddingTop, feed.paddingBottom) }
-            val t = maxOf(state.top, topWindow-layoutTop); val b = maxOf(state.bottom, layoutTop+feed.height-bottomWindow+(8*density).roundToInt())
-            if (feed.paddingTop != t || feed.paddingBottom != b) feed.setPadding(feed.paddingLeft, t, feed.paddingRight, b)
-            state.appliedTop = t; state.appliedBottom = b
+            val layoutTop = layoutTopInWindow(feed)
+            val bottomInset = layoutTop + feed.height - bottomWindow + (8*density).roundToInt()
+            applyListPadding(feed, topWindow - layoutTop, bottomInset)
             if (feed.clipToPadding) feed.clipToPadding = false
             var parent = feed.parent
             while (parent is ViewGroup) {
@@ -369,6 +387,26 @@ internal object BilibiliInHomeLayoutHooks {
                 parent = parent.parent
             }
             return feed
+        }
+        private fun layoutTopInWindow(view: View): Int {
+            var top = origin[1]
+            var child = view
+            while (child !== content) {
+                val parent = child.parent as? View ?: break
+                top += child.top - parent.scrollY
+                child = parent
+            }
+            return top
+        }
+        private fun applyListPadding(view: ViewGroup, top: Int, bottom: Int) {
+            val state = paddings.getOrPut(view) {
+                ListPadding(view.paddingTop, view.paddingBottom, view.clipToPadding, view.paddingTop, view.paddingBottom)
+            }
+            val t = maxOf(state.top, top)
+            val b = maxOf(state.bottom, bottom)
+            if (view.paddingTop != t || view.paddingBottom != b) view.setPadding(view.paddingLeft, t, view.paddingRight, b)
+            state.appliedTop = t
+            state.appliedBottom = b
         }
         private fun bindRefresh(feed: View) {
             if (refresh?.feed === feed && refresh?.view?.isAttachedToWindow == true) return
@@ -486,7 +524,54 @@ internal object BilibiliInHomeLayoutHooks {
             (overlay.parent as? ViewGroup)?.removeView(overlay)
         }
         fun search(): Boolean = binding?.takeIf { it.header.isAttachedToWindow }?.search?.performClick() == true
-        fun selected(): Int = binding?.tabs?.indexOfFirst { it.cell.isSelected || it.title.isSelected } ?: -1
+        private fun updateSelectedChannel(native: ComposeHomeBinding) {
+            val pagerId = ids.getOrPut("pager") { content.resources.getIdentifier("pager", "id", activity.packageName) }
+            val candidate = pagerCandidate?.takeIf { it.isAttachedToWindow } ?: run {
+                val now = SystemClock.uptimeMillis()
+                if (now - pagerProbeAt < 250L) null else {
+                    pagerProbeAt = now
+                    findUniqueDescendant(page) {
+                        it is ViewGroup && it.accessibilityClassName == "androidx.viewpager.widget.ViewPager" &&
+                            (it.id == pagerId || runCatching { it.resources.getResourceEntryName(it.id) }.getOrNull() == "pager")
+                    }
+                }
+            }
+            if (candidate !== pagerCandidate) {
+                pagerCandidate = candidate
+                pager = candidate as? ViewGroup
+                pagerCurrentItem = pager?.let {
+                    runCatching { it.javaClass.getMethod("getCurrentItem") }.getOrNull()
+                        ?.takeIf { method -> method.returnType == Int::class.javaPrimitiveType }
+                }
+            }
+            val tabs = native.tabs
+            val nativeIndex = pagerCurrentItem?.let { method -> method.invoke(pager) as? Int }
+            val fromPager = if (tabs.size == channels.size && tabs.all { it.title.text.toString() in channels })
+                tabs.getOrNull(nativeIndex ?: -1) else null
+            val tab = fromPager ?: tabs.singleOrNull { it.cell.isSelected || it.title.isSelected }
+            val index = tab?.let { channels.indexOf(it.title.text.toString()) } ?: -1
+            if (index >= 0 && selectedChannel != index) {
+                selectedChannel = index
+                panels.getOrNull(1)?.invalidate()
+            }
+        }
+        private fun findUniqueDescendant(root: ViewGroup, accepts: (View) -> Boolean): View? {
+            val pending = ArrayDeque<View>()
+            pending.add(root)
+            var match: View? = null
+            var remaining = 128
+            while (pending.isNotEmpty() && remaining-- > 0) {
+                val view = pending.removeFirst()
+                if (accepts(view)) {
+                    if (match != null) return null
+                    match = view
+                } else if (view is ViewGroup) {
+                    for (i in 0 until view.childCount) pending.add(view.getChildAt(i))
+                }
+            }
+            return match.takeIf { pending.isEmpty() }
+        }
+        fun selected(): Int? = selectedChannel.takeIf { it >= 0 }
         fun tap(role: Int, index: Int): Boolean {
             if (!active || !ready) return false
             return when (role) {
@@ -510,13 +595,14 @@ internal object BilibiliInHomeLayoutHooks {
                 val save = canvas.save(); canvas.translate((frame.width-source.width*scale)/2, (frame.height-source.height*scale)/2)
                 canvas.scale(scale, scale); source.draw(canvas); canvas.restoreToCount(save)
             } else if (role == 1) {
-                paint.style = Paint.Style.FILL; paint.textAlign = Paint.Align.CENTER; paint.textSize = 14*frame.scaledDensity
+                paint.style = Paint.Style.FILL; paint.textAlign = Paint.Align.CENTER
+                paint.textSize = 14*frame.scaledDensity * (frame.topBarTabs?.fitScale(frame.width) ?: 1f)
                 channels.forEachIndexed { index, label ->
-                    val chosen = binding?.tabs?.firstOrNull { it.title.text.toString() == label }?.cell?.isSelected == true
+                    val chosen = index == selectedChannel
                     paint.color = if (chosen) BilibiliInAdapter.ACCENT_COLOR else if (dark()) Color.WHITE else 0xFF202020.toInt()
                     paint.typeface = if (chosen) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
                     val fm = paint.fontMetrics
-                    canvas.drawText(label, (index+.5f)*frame.width/2f, frame.height/2f-(fm.ascent+fm.descent)/2, paint)
+                    canvas.drawText(label, frame.channelCenter(index), frame.height/2f-(fm.ascent+fm.descent)/2, paint)
                 }
             } else {
                 drawSearchGlyph(canvas, 25*d, frame.height/2f, d, dark())
@@ -534,29 +620,24 @@ internal object BilibiliInHomeLayoutHooks {
             }
         }
 
-        private class PanelState(val session: Session, val role: Int) : AppNavigationState {
-            override val allowsSoftwareBackdropCapture = false
-            override val backdropSceneViewsAreDescendants = true
-            private val scenePosition = IntArray(2)
-            private var sceneSignature = Long.MIN_VALUE
-            private var sceneHost: View? = null
-            override fun resolveBackdropScene(host: View): View { sceneHost = host; return session.page }
-            override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<View> = listOf(session.page)
-            override fun retainHomeBackdrop(selectedIndex: Int): Boolean {
-                val scene = session.page
-                scene.getLocationInWindow(scenePosition)
-                var key = System.identityHashCode(scene).toLong()
-                key = key*31 + scene.width; key = key*31 + scene.height
-                key = key*31 + scenePosition[0]; key = key*31 + scenePosition[1]
-                key = key*31 + session.content.width; key = key*31 + session.content.height
-                val host = sceneHost
-                key = key*31 + (host?.left ?: 0); key = key*31 + (host?.top ?: 0)
-                key = key*31 + (host?.width ?: 0); key = key*31 + (host?.height ?: 0)
-                key = key*31 + (host?.translationX?.toBits() ?: 0)
-                key = key*31 + (host?.translationY?.toBits() ?: 0)
-                val stable = key == sceneSignature && scene.isAttachedToWindow && scene.isShown
-                sceneSignature = key
-                return stable
+        private class PanelState(
+            val session: Session,
+            val role: Int,
+            val scene: BilibiliHomeGlassScene = BilibiliHomeGlassScene(session.page),
+        ) : AppNavigationState by scene {
+            override fun interceptNavigationTouch(host: View, event: android.view.MotionEvent): Boolean? {
+                if (role == 2) session.searchFeedback.touch(host, event)
+                return null
+            }
+            override fun onHostDetached() {
+                scene.onHostDetached()
+                if (role == 2) session.searchFeedback.reset()
+            }
+            override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+                if (!hasFocus && role == 2) session.searchFeedback.reset()
+            }
+            override fun drawPanelEdgeGlow(canvas: Canvas, path: android.graphics.Path, density: Float) {
+                if (role == 2) session.searchFeedback.drawLight(canvas, path)
             }
             override fun forceDarkMode(selectedIndex: Int) = session.dark()
             override fun setNativeBarTouchable(view: View?, touchable: Boolean) = true
@@ -567,13 +648,6 @@ internal object BilibiliInHomeLayoutHooks {
             override fun forceNavigationBarImmersed(host: GlassHostLayout) = true
             override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int) = session.tap(role, index)
             override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = session.draw(canvas, frame, role)
-            override fun onBarGesture(phase: Int, host: View) {
-                if (role != 2 || phase == 1) return
-                val down = phase == 0
-                host.animate().cancel()
-                host.animate().scaleX(if (down) 1.035f else 1f).scaleY(if (down) 1.035f else 1f)
-                    .setDuration(if (down) 100L else 240L).setInterpolator(if (down) android.view.animation.DecelerateInterpolator() else android.view.animation.OvershootInterpolator(1.1f)).start()
-            }
         }
         private class PanelAdapter(val state: PanelState) : TargetAdapter {
             private val material = TopBarMaterialPolicy(
@@ -584,15 +658,15 @@ internal object BilibiliInHomeLayoutHooks {
             override val ownsNavigationDrawing = true
             override val ownsNavigationTap = true
             override val managesHostSiblingOrder = true
+            override val ownsHostLayout = true
             override val skipNavigationSnapshot = true
             override val keepNavigationSourceVisible = true
             override val preserveNativeSourceMetrics = true
             override val managesNativeTabVisibility = true
             override val hasPerFrameScene = true
             override val skipBackdropStableDelay = true
-            // Reuse Android's live display lists. Each accessory must not recursively
-            // record the same full native homepage again during its backdrop pass.
-            override val allowRenderNodeRefresh = false
+            override fun liveBackdropTransform(parent: View, host: View, out: android.graphics.Matrix) =
+                state.scene.transform(parent, host, out)
             override val panelHighlightFollowsAllThemes = true
             override val actionOnlyIndices get() = if (state.role == 1) emptySet() else setOf(0)
             override fun createNavigationState(context: Context): AppNavigationState = state

@@ -42,7 +42,7 @@ internal object BilibiliRenderer {
         typeface = Typeface.create("sans-serif", Typeface.NORMAL)
     }
 
-    fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
+    fun draw(canvas: Canvas, frame: AdapterNavigationFrame, searchPress: Float = 0f) {
         with(frame) {
             if (slotCount != 5 || width <= 0 || height <= 0) return
             val horizontalPadding = 4f * density
@@ -54,20 +54,30 @@ internal object BilibiliRenderer {
             val groupTop = baseIconCenterY - iconSize / 2f
             val groupBottom = baseLabelBaseline + labelPaint.fontMetrics.bottom
             val groupOffsetY = height / 2f - (groupTop + groupBottom) / 2f
-            val iconCenterY = baseIconCenterY + groupOffsetY
+            val iconCenterY = if (iconOnly) height / 2f else baseIconCenterY + groupOffsetY
             val labelBaseline = baseLabelBaseline + groupOffsetY
             val detached = barLayout
             if (detached != null && !hideSelectedForOptics) {
                 val cx = detached.actionLeft + detached.actionSize / 2f
                 val cy = height / 2f
-                // The adapter supplies native pink as the sole surface tint.
                 iconPaint.color = if (darkGlass) Color.WHITE else Color.rgb(44, 44, 44)
                 iconPaint.style = Paint.Style.STROKE
-                iconPaint.strokeWidth = 2.6f * density
                 iconPaint.strokeCap = Paint.Cap.ROUND
-                val half = minOf(9f * density, detached.actionSize * 0.17f)
-                canvas.drawLine(cx - half, cy, cx + half, cy, iconPaint)
-                canvas.drawLine(cx, cy - half, cx, cy + half, iconPaint)
+                if (detached.actionIndex == BilibiliAdapter.SEARCH_INDEX) {
+                    val save = canvas.save()
+                    val scale = 1f + .08f * searchPress
+                    canvas.scale(scale, scale, cx, cy)
+                    val d = density * 1.15f
+                    iconPaint.strokeWidth = 1.8f * d
+                    canvas.drawCircle(cx - 1.25f*d, cy - 1.25f*d, 6.5f*d, iconPaint)
+                    canvas.drawLine(cx + 3.4f*d, cy + 3.4f*d, cx + 8.2f*d, cy + 8.2f*d, iconPaint)
+                    canvas.restoreToCount(save)
+                } else {
+                    iconPaint.strokeWidth = 2.6f * density
+                    val half = minOf(9f * density, detached.actionSize * 0.17f)
+                    canvas.drawLine(cx - half, cy, cx + half, cy, iconPaint)
+                    canvas.drawLine(cx, cy - half, cx, cy + half, iconPaint)
+                }
                 iconPaint.style = Paint.Style.FILL
             }
             for ((visualIndex, index) in enabledIndices.withIndex()) {

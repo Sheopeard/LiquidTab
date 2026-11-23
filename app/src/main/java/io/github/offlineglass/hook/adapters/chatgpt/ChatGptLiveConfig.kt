@@ -26,7 +26,9 @@ internal object ChatGptLiveConfig {
         }, IntentFilter(ConfigContract.ACTION_CONFIG_RESPONSE), ConfigContract.CONFIG_SYNC_PERMISSION,
             null, Context.RECEIVER_EXPORTED)
         app.registerReceiver(object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) { ChatGptComposerGlass.refreshConfig() }
+            override fun onReceive(context: Context?, intent: Intent?) {
+                ChatGptComposerGlass.refreshConfig(appearanceChanged = true)
+            }
         }, IntentFilter(Intent.ACTION_CONFIGURATION_CHANGED), Context.RECEIVER_EXPORTED)
         installed = true
         HookConfigReader.requestConfigSync(app, "com.openai.chatgpt") { ChatGptComposerGlass.refreshConfig() }

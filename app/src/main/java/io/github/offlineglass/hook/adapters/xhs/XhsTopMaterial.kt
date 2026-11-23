@@ -1,14 +1,13 @@
 package io.github.offlineglass.hook.adapters.xhs
 
 import android.content.Context
-import android.graphics.Color
 import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
-import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
+import io.github.offlineglass.hook.topbar.TopBarChannelHost
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.adapters.TargetAdapter
 
@@ -41,6 +40,11 @@ internal object XhsTopMaterial {
             cornerRadiusPercent = if (panel) panelCorners else 50f,
             iconOnly = true, selectedAccent = slots > 1, accentColor = 0xFFFF2442.toInt(),
         )
+        if (slots > 1 && !panel && onSelect != null) {
+            return TopBarChannelHost.create(context, config, material, slots, state, selected, onSelect).apply {
+                contentDescription = "小红书顶栏液态玻璃"
+            }
+        }
         val adapter = object : TargetAdapter {
             override val key = "xhs-top-material"
             override val ownsNavigationDrawing = true

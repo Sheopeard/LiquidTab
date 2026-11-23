@@ -35,6 +35,11 @@ internal object ChatGptComposerOptics {
         val tangent = FloatArray(2)
         val weights = FloatArray(1025)
         var lastX = 0f; var lastY = 0f
+        val bounds = RectF().also { path.computeBounds(it, true) }
+        var topMin = Float.POSITIVE_INFINITY
+        var topMax = Float.NEGATIVE_INFINITY
+        var bottomMin = Float.POSITIVE_INFINITY
+        var bottomMax = Float.NEGATIVE_INFINITY
         for (i in 0..1024) {
             measure.getPosTan(length*i/1024f, pos, tangent)
             if (i > 0) {
@@ -42,6 +47,16 @@ internal object ChatGptComposerOptics {
                 weights[i] = weights[i-1] + length/1024f + radius * 3f * angle
             }
             lastX = tangent[0]; lastY = tangent[1]
+            if (abs(tangent[1]) < .00001f) {
+                if (pos[1] <= bounds.top + .01f) {
+                    topMin = minOf(topMin, pos[0])
+                    topMax = maxOf(topMax, pos[0])
+                }
+                if (pos[1] >= bounds.bottom - .01f) {
+                    bottomMin = minOf(bottomMin, pos[0])
+                    bottomMax = maxOf(bottomMax, pos[0])
+                }
+            }
         }
         val points = FloatArray(128)
         val normals = FloatArray(128)
@@ -61,24 +76,10 @@ internal object ChatGptComposerOptics {
         }
         val orientation = if (area >= 0f) 1f else -1f
         for (i in normals.indices) normals[i] *= orientation
-        val bounds = RectF().also { path.computeBounds(it,true) }
-        var leftFlat = bounds.left
-        var rightFlat = bounds.right
-        // Exact straight-edge extent from the original curve tangents.
-        val top = ArrayList<Float>()
-        val bottom = ArrayList<Float>()
-        for (i in 0..1024) {
-            measure.getPosTan(length*i/1024f,pos,tangent)
-            if (abs(tangent[1]) < .00001f) {
-                if (pos[1] <= bounds.top+.01f) top.add(pos[0])
-                if (pos[1] >= bounds.bottom-.01f) bottom.add(pos[0])
-            }
-        }
-        if (top.isNotEmpty() && bottom.isNotEmpty()) {
-            leftFlat = maxOf(top.min(),bottom.min())+.5f
-            rightFlat = minOf(top.max(),bottom.max())-.5f
-        } else { leftFlat = bounds.right; rightFlat = bounds.left }
-        shader.setFloatUniform("contourFlatBounds",leftFlat,rightFlat)
+        val hasFlatBounds = topMin.isFinite() && bottomMin.isFinite()
+        val leftFlat = if (hasFlatBounds) maxOf(topMin, bottomMin) + .5f else bounds.right
+        val rightFlat = if (hasFlatBounds) minOf(topMax, bottomMax) - .5f else bounds.left
+        shader.setFloatUniform("contourFlatBounds", leftFlat, rightFlat)
         shader.setFloatUniform("shapePoints", points)
         shader.setFloatUniform("shapeNormals", normals)
         shader.setFloatUniform("shapeOrientation", orientation)

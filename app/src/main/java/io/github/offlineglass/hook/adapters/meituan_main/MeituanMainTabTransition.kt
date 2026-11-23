@@ -22,8 +22,9 @@ internal class MeituanMainTabTransition(
     val pendingTarget: Int? get() = requested.takeIf { it >= 0 && preview.target >= 0 }
 
     fun dispatch(row: ViewGroup?, index: Int, count: Int): Boolean {
-        if (row == null || count !in 4..5 || row.childCount != count || index !in 0 until count) return false
-        val target = MeituanMainNativeTabs.bind(row)?.cells?.getOrNull(index)?.button
+        if (row == null || count != MeituanMainTabContract.SLOT_COUNT ||
+            index !in 0 until count || index == MeituanMainTabContract.VIDEO) return false
+        val target = MeituanMainNativeTabs.bind(row)?.cells?.firstOrNull { it.role == index }?.button
             ?.takeIf { it.isAttachedToWindow && it.isEnabled } ?: return false
         cancel()
         if (!preview.begin(index)) return false

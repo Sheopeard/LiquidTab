@@ -52,17 +52,18 @@ internal object BilibiliCommentViewportHooks {
                         }
                         val density = view.resources.displayMetrics.density
                         val modifier = param.args[0] ?: return
+                        val listKey = param.args[1] ?: param.args[9]
                         if (container != null) {
                             val height = BilibiliCommentGlass.viewportHeight(view, container)
                             if (height <= 0) return
                             val wrapped = wrapHeight.invoke(null, modifier, top, true)
                             val extended = requireNotNull(requiredHeight.invoke(null, wrapped, height / density))
-                            param.args[0] = BilibiliCommentGlass.viewport(view, extended)
+                            param.args[0] = BilibiliCommentGlass.viewport(view, extended, listKey = listKey)
                         } else {
                             // Replies: retain native constraints and scroll range.
                             // A full-window LocalView is NOT the list viewport.
                             val extent = (44f * density).toInt() + io.github.offlineglass.hook.glassHostBottomMarginPx(view)
-                            param.args[0] = BilibiliCommentGlass.replyViewport(view, modifier, extent, wrapHeight, requiredHeight, top)
+                            param.args[0] = BilibiliCommentGlass.replyViewport(view, modifier, extent, wrapHeight, requiredHeight, top, listKey)
                         }
                         // Preserve every native padding edge; reserve a complete input
                         // row, the shared bottom gap and 8dp breathing room at list end.

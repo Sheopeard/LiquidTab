@@ -8,8 +8,7 @@ import io.github.offlineglass.hook.adapters.AppNavigationState
 /** Mutable WeChat resources belong to one host, not the process-wide adapter. */
 internal class WeChatNavigationState : AppNavigationState {
     override val persistentRestingIndicatorFill = true
-    override val retainHiddenSourceFillWhileExpanded = true
-    override fun hostPanelWidth(defaultWidth: Int): Int = foldController.panelWidth(defaultWidth)
+    override val retainHiddenSourceFillWhileExpanded = false
     private val tabsRenderer = WeChatTabsRenderer()
     private var managerEnglishLabels = false
     private var selectedArtwork = false
@@ -38,8 +37,8 @@ internal class WeChatNavigationState : AppNavigationState {
             try {
                 selectedArtwork = true
                 canvas.clipPath(selectionPath)
-                canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
-                    ((1f - opticalMix.coerceIn(0f, 1f)) * 255f).toInt())
+                if (opticalMix > 0f) canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+                    ((1f - opticalMix) * 255f).toInt())
                 drawSource()
             } finally {
                 selectedArtwork = false
@@ -59,11 +58,13 @@ internal class WeChatNavigationState : AppNavigationState {
     private var recentBackdropHeld = false
     private var recordedIndicatorDark: Boolean? = null
     private var recentVisible = false
+    private var recentVisibleFraction = 0f
+    private var recentGeometryMoving = false
     private var refreshBackdropUntil = 0L
     private var usePanelBackdrop = false
 
     override fun beforeHostDraw(host: View, source: ViewGroup?): Boolean {
-        artworkHost = java.lang.ref.WeakReference(host as? io.github.offlineglass.hook.GlassHostLayout)
+        if (artworkHost.get() !== host) artworkHost = java.lang.ref.WeakReference(host as? io.github.offlineglass.hook.GlassHostLayout)
         currentNavigationSource = source
         // The taskbar header retains a visible sliver at list top. Its 2%
         // theme guard must not replace the resting lens's material input.
@@ -97,15 +98,18 @@ internal class WeChatNavigationState : AppNavigationState {
         }
         // Hold theme classification before the 25% threshold starts the exit.
         // Native taskbar colours change as soon as the pull-down begins.
-        recentBackdropHeld = recentDrawerDetector.isVisible(context as? android.app.Activity, 0.02f)
-        val open = recentDrawerDetector.isVisible(context as? android.app.Activity)
+        val visibleFraction = recentDrawerDetector.visibleHeightFraction(context as? android.app.Activity)
+        recentBackdropHeld = visibleFraction >= 0.02f
+        val open = visibleFraction >= 0.25f
+        recentGeometryMoving = visibleFraction != recentVisibleFraction
+        recentVisibleFraction = visibleFraction
         val now = android.os.SystemClock.uptimeMillis()
         if (open != recentVisible) {
             recentVisible = open
             refreshBackdropUntil = now + 800L
         }
-        if ((recentBackdropHeld || now < refreshBackdropUntil) && host.isShown) host.postInvalidateOnAnimation()
-        foldController.adjust(host, source, selected(), density)
+        if (now < refreshBackdropUntil && host.isShown) host.postInvalidateOnAnimation()
+        foldController.adjust(host, source, selected(), density, recentVisible)
         visualOrchestrator.update(
             host, source, selected, enabled, density,
             foldController, contentTargetProbe, veilController, surfaceColor,
@@ -136,7 +140,7 @@ internal class WeChatNavigationState : AppNavigationState {
         if (recentBackdropHeld) recordedIndicatorDark else null
 
     override fun forceLiveBackdropFrame(selectedIndex: Int): Boolean =
-        recentBackdropHeld || foldController.layoutMoving() || android.os.SystemClock.uptimeMillis() < refreshBackdropUntil
+        recentGeometryMoving || android.os.SystemClock.uptimeMillis() < refreshBackdropUntil
 
 
     // Record both optical scenes from the same live backdrop throughout entry
@@ -169,13 +173,17 @@ internal class WeChatNavigationState : AppNavigationState {
 
     override fun drawNativeNavigation(canvas: Canvas, source: ViewGroup, density: Float): Boolean {
         tabsRenderer.draw(canvas, source, density, selectedArtwork = selectedArtwork, dark = artworkDark,
-            managerEnglishLabels = managerEnglishLabels, maxTotalHeightPx = maxTabsHeightInSourceSpace())
+            managerEnglishLabels = managerEnglishLabels,
+            maxTotalHeightPx = maxTabsHeightInSourceSpace(),
+            iconOnly = artworkHost.get()?.config?.let { it.bottomBarIconOnly || it.iconOnly } == true)
         return true
     }
 
     override fun drawNativeNavigation(canvas: Canvas, source: ViewGroup, density: Float, forOptics: Boolean): Boolean {
         tabsRenderer.draw(canvas, source, density, selectedArtwork = forOptics || selectedArtwork, dark = artworkDark,
-            managerEnglishLabels = managerEnglishLabels, maxTotalHeightPx = maxTabsHeightInSourceSpace())
+            managerEnglishLabels = managerEnglishLabels,
+            maxTotalHeightPx = maxTabsHeightInSourceSpace(),
+            iconOnly = artworkHost.get()?.config?.let { it.bottomBarIconOnly || it.iconOnly } == true)
         return true
     }
 
@@ -190,7 +198,8 @@ internal class WeChatNavigationState : AppNavigationState {
         canvas.scale(frame.extraScale, frame.extraScale, frame.width / 2f, frame.height / 2f)
         tabsRenderer.draw(canvas, source, frame.density, frame.iconScale * 1.15f,
             frame.hideSelectedForOptics || selectedArtwork, frame.darkGlass, frame.managerEnglishLabels,
-            maxTotalHeightPx = maxTabsHeightInSourceSpace())
+            maxTotalHeightPx = maxTabsHeightInSourceSpace(),
+            iconOnly = frame.iconOnly, hostHeight = frame.height.toFloat(), hostWidth = frame.width)
         canvas.restore()
     }
 }

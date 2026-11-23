@@ -28,6 +28,7 @@ internal class MiHealthIosNavigation {
     private val labelPaint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
     private val relative = Matrix()
     private val inverse = Matrix()
+    private val iconCenter = FloatArray(2)
     private val red = PorterDuffColorFilter(0xFFFF3B30.toInt(), PorterDuff.Mode.SRC_IN)
 
     fun update(host: GlassHostLayout) {
@@ -92,7 +93,8 @@ internal class MiHealthIosNavigation {
 
     fun draw(canvas: Canvas, host: GlassHostLayout, frame: AdapterNavigationFrame) {
         val native = source?.get()
-        if (!host.config.miHealthIosIcons || native == null || native !== host.navigationSource || cells.size != 4) {
+        val useIosArtwork = host.config.miHealthIosIcons
+        if ((!useIosArtwork && !frame.iconOnly) || native == null || native !== host.navigationSource || cells.size != 4) {
             host.drawOriginalNavigationForAdapter(canvas, frame.extraScale)
             return
         }
@@ -104,6 +106,15 @@ internal class MiHealthIosNavigation {
             val cx = 4f * frame.density + (visual + .5f) * frame.slotWidth
             val saved = canvas.save()
             canvas.scale(frame.extraScale, frame.extraScale, cx, frame.height / 2f)
+            if (frame.iconOnly) {
+                relative.reset(); cell.icon.transformMatrixToGlobal(relative)
+                relative.setConcat(inverse, relative)
+                iconCenter[0] = cell.icon.width / 2f
+                iconCenter[1] = cell.icon.height / 2f
+                relative.mapPoints(iconCenter)
+                // Move the artwork and its unread dot together in host pixels.
+                canvas.translate(0f, frame.height / 2f - (transform[2] + iconCenter[1] * transform[0]))
+            }
             canvas.translate(transform[1], transform[2]); canvas.scale(transform[0], transform[0])
             // Both complete scenes have identical native geometry. The shared
             // final lens mask chooses selected/idle per pixel, never per page.
@@ -113,13 +124,17 @@ internal class MiHealthIosNavigation {
                 else if (frame.darkGlass) 0xFFB2B2B7.toInt() else 0xFF68686E.toInt()
             val iconSave = canvas.save()
             concatView(canvas, cell.icon)
-            val shape = MiHealthIosSymbols.shape(cell.index, selected)
-            val scale = minOf(cell.icon.width / shape.width, cell.icon.height / shape.height)
-            canvas.translate((cell.icon.width - shape.width * scale) / 2f, (cell.icon.height - shape.height * scale) / 2f)
-            canvas.scale(scale, scale)
-            shape.parts.forEach { part ->
-                ink.color = color; ink.alpha = (part.opacity * 255f).toInt()
-                canvas.drawPath(part.path, ink)
+            if (useIosArtwork) {
+                val shape = MiHealthIosSymbols.shape(cell.index, selected)
+                val scale = minOf(cell.icon.width / shape.width, cell.icon.height / shape.height)
+                canvas.translate((cell.icon.width - shape.width * scale) / 2f, (cell.icon.height - shape.height * scale) / 2f)
+                canvas.scale(scale, scale)
+                shape.parts.forEach { part ->
+                    ink.color = color; ink.alpha = (part.opacity * 255f).toInt()
+                    canvas.drawPath(part.path, ink)
+                }
+            } else {
+                cell.icon.draw(canvas)
             }
             canvas.restoreToCount(iconSave)
             if (!frame.iconOnly) {

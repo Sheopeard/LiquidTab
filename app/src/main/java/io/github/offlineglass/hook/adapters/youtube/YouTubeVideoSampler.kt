@@ -9,7 +9,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
-import android.view.PixelCopy
 import android.view.SurfaceControl
 import android.view.SurfaceView
 import android.view.TextureView
@@ -72,8 +71,6 @@ internal class YouTubeVideoSampler {
         return best
     }
 
-    val hasSnapshot: Boolean get() = snapshots.isNotEmpty()
-
     fun request(host: GlassHostLayout, allowed: Boolean) {
         if (!allowed || !host.isAttachedToWindow) {
             clear()
@@ -132,14 +129,12 @@ internal class YouTubeVideoSampler {
             if (right > left && bottom > top) regions += YouTubeCaptureRegions.Region(left, top, right, bottom)
         }
         include(host)
-        YouTubeBackdropRegistry.forEachVisible(host.rootView, ::include)
         if (regions.isEmpty()) {
             // A feed/mini-player video away from the glass cannot contribute
-            // pixels. Avoid full TextureView/PixelCopy buffers in that case.
+            // pixels. Avoid full TextureView buffers in that case.
             if (snapshots.isNotEmpty()) {
                 retireSnapshot()
                 host.postInvalidateOnAnimation()
-                YouTubeBackdropRegistry.invalidate(host.rootView)
             }
             main.removeCallbacks(wakeup)
             return
@@ -186,10 +181,10 @@ internal class YouTubeVideoSampler {
                 captureLayer(video, ticket, crop) { frame ->
                     if (frame == null && ticket == generation) {
                         layerCaptureFailed = true
-                        copyBuffer(video, width, height, crop, result)
+                        result(null)
                     } else result(frame)
                 }
-            } else copyBuffer(video, width, height, crop, result)
+            } else result(null)
         }
         // At most two sequential regions, one batch in flight. Publish both
         // together so top and bottom never consume partially replaced input.
@@ -197,7 +192,7 @@ internal class YouTubeVideoSampler {
     }
 
     private fun captureLayer(video: SurfaceView, ticket: Int, crop: Rect, result: (Bitmap?) -> Unit) {
-        // The decoder's queue may not support PixelCopy on HyperOS. Capture its
+        // Capture the decoder's
         // own compositor layer, restricted to this process, as in the proven
         // Douyin path. Do not sample the window or duplicate its SurfaceView hole.
         val control = runCatching { video.surfaceControl }.getOrNull()
@@ -256,30 +251,6 @@ internal class YouTubeVideoSampler {
         }
     }
 
-    private fun copyBuffer(video: SurfaceView, width: Int, height: Int, crop: Rect, result: (Bitmap?) -> Unit) {
-        val frame = video.holder.surfaceFrame
-        val bufferWidth = frame.width().takeIf { it > 0 } ?: width
-        val bufferHeight = frame.height().takeIf { it > 0 } ?: height
-        // PixelCopy rectangles use decoder-buffer coordinates, not View pixels.
-        // Preserve the previous half-buffer pixel density and round outwards.
-        val sourceCrop = Rect(
-            (crop.left.toLong() * bufferWidth / width).toInt(),
-            (crop.top.toLong() * bufferHeight / height).toInt(),
-            ((crop.right.toLong() * bufferWidth + width - 1) / width).toInt(),
-            ((crop.bottom.toLong() * bufferHeight + height - 1) / height).toInt())
-        val target = Bitmap.createBitmap((sourceCrop.width() / 2).coerceAtLeast(1),
-            (sourceCrop.height() / 2).coerceAtLeast(1), Bitmap.Config.ARGB_8888)
-        runCatching {
-            PixelCopy.request(video, sourceCrop, target, { status ->
-                if (status != PixelCopy.SUCCESS) target.recycle()
-                result(target.takeIf { status == PixelCopy.SUCCESS })
-            }, main)
-        }.onFailure {
-            target.recycle()
-            result(null)
-        }
-    }
-
     private fun complete(host: GlassHostLayout, video: View, ticket: Int, frames: List<AppVideoBackdrop>?) {
         if (ticket == generation) pendingFrames = null
         if (ticket != generation || source !== video || !host.isAttachedToWindow || !video.isShown) {
@@ -291,7 +262,7 @@ internal class YouTubeVideoSampler {
         if (frames == null) {
             if (!loggedFailure) {
                 loggedFailure = true
-                XposedBridge.log("[OfflineGlass][YouTubeVideo] decoder layer and PixelCopy unavailable")
+                XposedBridge.log("[OfflineGlass][YouTubeVideo] decoder layer unavailable")
             }
             main.removeCallbacks(wakeup)
             main.postDelayed(wakeup, 250L)
@@ -303,7 +274,6 @@ internal class YouTubeVideoSampler {
         val nextEpoch = ++epoch
         snapshots = frames.map { it.copy(epoch = nextEpoch) }
         host.postInvalidateOnAnimation()
-        YouTubeBackdropRegistry.invalidate(host.rootView)
     }
 
     private fun findVideo(root: View, host: View): View? {
@@ -323,7 +293,6 @@ internal class YouTubeVideoSampler {
             panels += bounds
         }
         (host as? GlassHostLayout)?.let(::include)
-        YouTubeBackdropRegistry.forEachVisible(root, ::include)
         val bounds = Rect()
         var visited = 0
         val candidates = ArrayList<View>()
@@ -374,7 +343,7 @@ internal class YouTubeVideoSampler {
     }
 
     private fun clear() {
-        val previousRoot = currentHost?.rootView
+        val visibleHost = currentHost?.takeIf { snapshots.isNotEmpty() }
         lastCopyDuration = 0L
         lastCopy = 0L
         main.removeCallbacks(wakeup)
@@ -386,7 +355,7 @@ internal class YouTubeVideoSampler {
         hasVideo = false
         captureListener = null
         retireSnapshot()
-        previousRoot?.let(YouTubeBackdropRegistry::invalidate)
+        visibleHost?.postInvalidateOnAnimation()
     }
 
     fun pause() {

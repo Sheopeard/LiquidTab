@@ -5,6 +5,8 @@ import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.SLOT_COUNT
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.VIDEO
 
 /** Cart geometry and native tab artwork belong exclusively to Meituan main. */
 internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout? = null) : AppNavigationState {
@@ -32,17 +34,17 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         nativeSelected(source, slotCount)
 
     private fun nativeSelected(source: ViewGroup?, slotCount: Int): Int? {
-        if (slotCount !in 4..5) return null
+        if (slotCount != SLOT_COUNT) return null
         val native = MeituanMainNativeTabs.bind(source) ?: return null
-        return native.cells.withIndex().filter { it.value.glyph.isSelected }.singleOrNull()?.index
+        return native.cells.singleOrNull { it.glyph.isSelected }?.role
     }
 
     override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean =
         dispatchLive(source, index, slotCount)
 
     private fun dispatchLive(source: ViewGroup?, index: Int, count: Int): Boolean {
-        if (count !in 4..5 || index !in 0 until count || (count == 5 && index == 1)) return false
-        val button = MeituanMainNativeTabs.bind(source)?.cells?.getOrNull(index)?.button
+        if (count != SLOT_COUNT || index !in 0 until count || index == VIDEO) return false
+        val button = MeituanMainNativeTabs.bind(source)?.cells?.firstOrNull { it.role == index }?.button
             ?.takeIf { it.isAttachedToWindow && it.isEnabled } ?: return false
 
         val handled = button.performClick()
@@ -138,7 +140,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) return false
         // Feed relayout is not a user disable. Keep ownership and the last
         // verified artwork while waiting for a replacement source.
-        if (source == null) return false
+        if (source == null || MeituanMainNativeTabs.bind(source) == null) return false
         takeoverRow = source
         MeituanMainNativeTabs.activate(source, true)
         return tabs.prepare(source)
@@ -187,7 +189,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         }
         currentSelection = selected()
         val changed = prepareTakeover(source)
-        profileSafety.update(host, enabled && tabs.ready && currentSelection == MeituanMainNativeTabs.profileIndex(source, (host as? GlassHostLayout)?.adapterSlotCount ?: 5))
+        profileSafety.update(host, enabled && tabs.ready && currentSelection == 4)
         if (changed) (host as? GlassHostLayout)?.invalidateProjectionCache()
     }
     override fun forceNavigationBarImmersed(host: GlassHostLayout): Boolean? {
@@ -196,7 +198,7 @@ internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout?
         val committed = nativeSelected(host.adapterNavigationSource, host.adapterSlotCount)
             ?: host.adapterSelectedIndex
         val profile = host.config.enabled && tabs.ready &&
-            committed == MeituanMainNativeTabs.profileIndex(host.adapterNavigationSource, host.adapterSlotCount)
+            committed == 4
         profileWindow.update(host, profile)
         return if (profile) true else null
     }

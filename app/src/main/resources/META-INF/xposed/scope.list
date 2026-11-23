@@ -1,6 +1,5 @@
 com.autonavi.minimap
 tv.danmaku.bili
-com.android.systemui
 com.bilibili.app.in
 com.sankuai.meituan.takeoutnew
 com.sankuai.meituan
@@ -11,6 +10,7 @@ com.xiaomi.market
 com.netease.cloudmusic
 com.tencent.qqmusic
 com.spotify.music
+com.apple.android.music
 com.xingin.xhs
 com.xunmeng.pinduoduo
 com.taobao.taobao
@@ -29,6 +29,7 @@ com.openai.chatgpt
 com.huawei.health
 com.twitter.android
 com.instagram.android
+com.reddit.frontpage
 com.quora.android
 com.eusoft.eudic
 com.hengye.share

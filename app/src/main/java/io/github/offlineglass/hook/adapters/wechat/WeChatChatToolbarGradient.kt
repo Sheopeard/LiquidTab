@@ -71,7 +71,12 @@ internal object WeChatChatToolbarGradient {
         var lastConfigCheck = 0L
         var layoutLogged = false
         var evidenceWritten = false
-        var gradientGeometry: List<Int>? = null
+        val gradientOrigin = IntArray(2)
+        val gradientPosition = IntArray(2)
+        var gradientTop = Int.MIN_VALUE
+        var gradientHeight = 0
+        var gradientStatusHeight = 0
+        var gradientColor = 0
 
         fun updateColor(color: Int) {
             if (Color.alpha(color) < 224 || baseColor == color) return
@@ -94,14 +99,17 @@ internal object WeChatChatToolbarGradient {
     private fun updateGradientGeometry(state: State) {
         val container = state.container.get() ?: return
         val window = state.root.get() ?: return
-        val origin = IntArray(2).also(window::getLocationInWindow)
-        val position = IntArray(2).also(container::getLocationInWindow)
-        val top = (position[1] - origin[1]).coerceAtLeast(0)
+        window.getLocationInWindow(state.gradientOrigin)
+        container.getLocationInWindow(state.gradientPosition)
+        val top = (state.gradientPosition[1] - state.gradientOrigin[1]).coerceAtLeast(0)
         val bottom = (top + container.height).coerceAtLeast(1)
         val statusHeight = WeChatStatusGradientSurface.statusHeight(window)
-        val key = listOf(top, container.height, statusHeight, state.baseColor)
-        if (state.gradientGeometry == key) return
-        state.gradientGeometry = key
+        if (state.gradientTop == top && state.gradientHeight == container.height &&
+            state.gradientStatusHeight == statusHeight && state.gradientColor == state.baseColor) return
+        state.gradientTop = top
+        state.gradientHeight = container.height
+        state.gradientStatusHeight = statusHeight
+        state.gradientColor = state.baseColor
         val fraction = top.toFloat() / bottom
         state.gradient.colors = colors(state.baseColor, fraction, 1f)
         state.statusGradient.colors = colors(state.baseColor, 0f, statusHeight.toFloat() / bottom)

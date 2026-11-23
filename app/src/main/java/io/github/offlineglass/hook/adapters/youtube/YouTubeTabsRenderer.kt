@@ -6,7 +6,6 @@ import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.os.SystemClock
 import android.view.View
-import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
 import io.github.offlineglass.config.GlassConfig
@@ -14,61 +13,47 @@ import io.github.offlineglass.config.GlassConfig
 /** Retains native artwork, without replaying recycled/hidden native Views. */
 internal class YouTubeTabsRenderer {
     var opticalSelected: Boolean? = null
-    private data class Artwork(val drawable: Drawable, val label: String, val typeface: Typeface?, val selected: Boolean, val badge: String?)
+    private data class Artwork(val drawable: Drawable, val label: String, val typeface: Typeface?, val state: IntArray, val badge: String?)
     private val artwork = HashMap<Int, Artwork>()
     private var nextRefresh = 0L
-    private var sourceIdentity: ViewGroup? = null
+    private var bindingIdentity: YouTubePivotBinding? = null
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val avatarClip = android.graphics.Path()
+    private val selectedState = intArrayOf(android.R.attr.state_enabled, android.R.attr.state_selected, android.R.attr.state_activated)
+    private val normalState = intArrayOf(android.R.attr.state_enabled)
 
-    fun clear() { artwork.clear(); nextRefresh = 0L; sourceIdentity = null }
-    private fun name(view: View) = runCatching { view.resources.getResourceEntryName(view.id) }.getOrNull()
-    private fun find(root: View, id: String): View? {
-        if (name(root) == id) return root
-        if (root is ViewGroup) for (i in 0 until root.childCount) find(root.getChildAt(i), id)?.let { return it }
-        return null
-    }
-    private fun image(root: View?): ImageView? {
-        if (root is ImageView && root.drawable != null) return root
-        if (root is ViewGroup) for (i in 0 until root.childCount) image(root.getChildAt(i))?.let { return it }
-        return null
-    }
-    private fun refresh(source: ViewGroup, count: Int) {
+    fun clear() { artwork.clear(); nextRefresh = 0L; bindingIdentity = null }
+
+    private fun refresh(binding: YouTubePivotBinding) {
         val now = SystemClock.uptimeMillis()
-        if (sourceIdentity === source && now < nextRefresh) return
-        sourceIdentity = source; nextRefresh = now + 250L
-        val queue = ArrayDeque<ViewGroup>(); queue += source
-        while (queue.isNotEmpty()) {
-            val group = queue.removeFirst()
-            val children = (0 until group.childCount).map(group::getChildAt)
-            if (children.size == count && children.all { it is ViewGroup &&
-                (find(it, "thumbnail_layout") != null || find(it, "image") != null) }) {
-                children.forEachIndexed { index, cell ->
-                    val icon = image(find(cell, "thumbnail_layout") ?: find(cell, "image")) ?: return@forEachIndexed
-                    val native = icon.drawable ?: return@forEachIndexed
-                    val copy = native.constantState?.newDrawable(source.resources)?.mutate() ?: return@forEachIndexed
-                    icon.imageTintList?.let(copy::setTintList)
-                    val label = find(cell, "text") as? TextView
-                    val countView = find(cell, "new_content_count") as? TextView
-                    val dot = find(cell, "new_content_dot")
-                    val badge = countView?.takeIf { it.visibility == View.VISIBLE && it.text.isNotBlank() }
-                        ?.text?.toString() ?: dot?.takeIf { it.visibility == View.VISIBLE }?.let { "" }
-                    artwork[index] = Artwork(copy, label?.text?.toString().orEmpty(), label?.typeface,
-                        icon.isSelected || cell.isSelected, badge)
-                }
-                return
-            }
-            children.filterIsInstance<ViewGroup>().forEach(queue::addLast)
+        if (bindingIdentity !== binding) {
+            artwork.clear()
+            bindingIdentity = binding
+        } else if (now < nextRefresh) return
+        nextRefresh = now + 250L
+        for (index in 0..4) {
+            val entry = binding.entry(index) ?: continue
+            val native = entry.icon.drawable ?: continue
+            val copy = native.constantState?.newDrawable(entry.icon.resources, entry.icon.context.theme)?.mutate() ?: continue
+            entry.icon.imageTintList?.let(copy::setTintList)
+            native.colorFilter?.let(copy::setColorFilter)
+            val countView = YouTubePivotBinding.child(entry.cell, "new_content_count") as? TextView
+            val dot = YouTubePivotBinding.child(entry.cell, "new_content_dot")
+            val badge = countView?.takeIf { it.visibility == View.VISIBLE && it.text.isNotBlank() }
+                ?.text?.toString() ?: dot?.takeIf { it.visibility == View.VISIBLE }?.let { "" }
+            artwork[index] = Artwork(copy, entry.text?.text?.toString()?.takeIf(String::isNotBlank) ?: entry.label,
+                entry.text?.typeface, native.state.copyOf(), badge)
         }
-        // Missing native cells are a transient rebind. Retain the last valid
-        // drawables and text rather than replacing them with an empty frame.
     }
-    fun drawSlot(canvas: Canvas, source: ViewGroup, count: Int, index: Int,
+
+    fun drawSlot(canvas: Canvas, binding: YouTubePivotBinding, index: Int,
                  centerX: Float, centerY: Float, iconScale: Float, config: GlassConfig,
                  opticalSelected: Boolean? = null, dark: Boolean = true,
+                 iconOnly: Boolean = config.iconOnly,
                  localizeLabel: (String) -> String = { it }): Boolean {
-        refresh(source, count)
+        refresh(binding)
         val item = artwork[index] ?: return false
+        val source = binding.source
         val d = source.resources.displayMetrics.density
         val sd = source.resources.displayMetrics.scaledDensity
         val size = 24f * d * 1.08f * iconScale
@@ -76,13 +61,15 @@ internal class YouTubeTabsRenderer {
         textPaint.textSize = labelSize; textPaint.typeface = item.typeface
         textPaint.color = if (dark) android.graphics.Color.WHITE else android.graphics.Color.BLACK
         val fm = textPaint.fontMetrics
-        val labelHeight = if (config.iconOnly) 0f else fm.descent - fm.ascent
-        val gap = if (config.iconOnly) 0f else 2f*d
+        val labelHeight = if (iconOnly) 0f else fm.descent - fm.ascent
+        val gap = if (iconOnly) 0f else 2f*d
         val top = centerY - (size + gap + labelHeight)/2f
         val drawable = item.drawable
-        drawable.state = if (opticalSelected ?: item.selected)
-            intArrayOf(android.R.attr.state_enabled, android.R.attr.state_selected)
-        else intArrayOf(android.R.attr.state_enabled)
+        drawable.state = when (opticalSelected) {
+            true -> selectedState
+            false -> normalState
+            null -> item.state
+        }
         drawable.alpha = 255
         drawable.setBounds((centerX-size/2f).toInt(), top.toInt(), (centerX+size/2f).toInt(), (top+size).toInt())
         if (index == 4) {
@@ -98,7 +85,7 @@ internal class YouTubeTabsRenderer {
         } else {
             drawable.draw(canvas)
         }
-        if (!config.iconOnly) canvas.drawText(localizeLabel(item.label), centerX, top+size+gap-fm.ascent, textPaint)
+        if (!iconOnly) canvas.drawText(localizeLabel(item.label), centerX, top+size+gap-fm.ascent, textPaint)
         item.badge?.let { badge ->
             val x = centerX + size*.42f; val y = top + size*.08f
             textPaint.color = 0xFFFF0033.toInt()

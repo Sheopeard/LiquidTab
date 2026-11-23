@@ -139,7 +139,9 @@ internal object LiquidMotion {
         val state = states.getOrPut(root) { State() }
         val target = scalePose(view, PostureGlass.pose(view.display?.rotation ?: 0, state.targetScratch))
         state.advance(android.os.SystemClock.uptimeMillis(), target[0], target[1], target[2], viscosity)
-        if (state.active && view.isAttachedToWindow && view.isShown && view.hasWindowFocus())
+        val focused = (view as? io.github.offlineglass.hook.GlassHostLayout)?.hasOpticalWindowFocus()
+            ?: view.hasWindowFocus()
+        if (state.active && view.isAttachedToWindow && view.isShown && focused)
             view.postInvalidateOnAnimation()
         return state
     }
@@ -187,6 +189,9 @@ float flowingMotionCurve(float x) {
 }
 float2 flowingReboundOffset(float2 p, float2 halfSize) {
     if (flowMotionEnabled < 0.5) return float2(0.0);
+    // Uniform rest state: the original positive scale factors multiply zero.
+    // Keep its signed-zero direction without evaluating the spatial envelope.
+    if (flowRebound.x == 0.0 && flowRebound.y == 0.0) return flowingDownhill(flowRebound);
     float h = min(halfSize.x, halfSize.y);
     float edge = 0.35 + 0.65 * smoothstep(0.25, 0.9, max(abs(p.x), abs(p.y)));
     return flowingDownhill(flowRebound) * float2(min(halfSize.x, h * 2.0), h * 0.30) * 0.9 * edge;
@@ -203,6 +208,10 @@ float flowingRipple(float2 p) {
 }
 float flowingRippleGain(float gain, float2 p) {
     if (flowMotionEnabled < 0.5) return gain;
+    // Use the ripple function's existing cutoff, not a new motion threshold.
+    // Preserve the original clamp even for a caller outside the usual rim range.
+    if (flowRipple.x <= 0.0001 && flowRebound.x == 0.0 && flowRebound.y == 0.0)
+        return clamp(gain, 0.15, 4.5);
     // The uphill film retains a stable band instead of pulsating into a
     // subpixel optical edge. Ripple remains visible on the thicker liquid.
     float influence = smoothstep(0.55, 1.25, gain);

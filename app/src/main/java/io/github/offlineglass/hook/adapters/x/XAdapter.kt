@@ -33,6 +33,7 @@ internal object XAdapter : TargetAdapter {
     override val nativeSelectionReliable: Boolean = false
     override val usesCommittedSelection = true
     override val ownsNavigationTap = true
+    override val managesHostSiblingOrder = true
     override val commitSelectionAfterTap = true
     override val usesOpticalSurfacePipeline = true
     override fun isOpticalSurfaceTab(selectedIndex: Int) = selectedIndex == 2
@@ -92,7 +93,11 @@ internal object XAdapter : TargetAdapter {
                 } else host.disableOpticalSurfaceRendererForAdapter()
                 return true
             }
-            override fun onHostFrame(host: View) { collapse.refresh(); XGrokViewport.update(host) }
+            override fun onHostFrame(host: View) {
+                syncChromeOrder(host)
+                collapse.refresh()
+                XGrokViewport.update(host)
+            }
             override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int) =
                 dispatchNavigationTap(source, index, slotCount)
             override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) =
@@ -149,6 +154,18 @@ internal object XAdapter : TargetAdapter {
         fabRef?.get()?.takeIf { it.parent === host.parent }?.setCollapseGeometry(host, progress, fullWidth, panelHeight)
     }
 
+    private fun syncChromeOrder(host: View) {
+        val parent = host.parent as? ViewGroup ?: return
+        val compose = composeViewRef?.get()?.takeIf { it.parent === parent } ?: return
+        val shim = shimRef?.get()?.takeIf { it.parent === parent } ?: return
+        val fab = fabRef?.get()?.takeIf { it.parent === parent }
+        // Repair relative order only. Promoting both controls to the last
+        // position independently would make every pre-draw request layout.
+        if (parent.indexOfChild(shim) < parent.indexOfChild(compose)) shim.bringToFront()
+        if (parent.indexOfChild(host) < parent.indexOfChild(shim)) host.bringToFront()
+        if (fab != null && parent.indexOfChild(fab) < parent.indexOfChild(host)) fab.bringToFront()
+    }
+
     /** 页面级显示所有权；信息流滚动只改变收拢程度，不再撤销 sourceReady。 */
     private val chromeVisible: Boolean
         get() = XBottomBarHooks.replacesCurrentPage && isPortrait() &&
@@ -190,8 +207,8 @@ internal object XAdapter : TargetAdapter {
      * 若回调早于 shim 创建，仅记录状态，由新 host 读取并对齐。
      */
     fun onNativeOverlaysVisibility(visible: Boolean) {
-        android.util.Log.i("OfflineGlassX", "overlays -> $visible (shim=${shimRef?.get() != null} fab=${fabRef?.get() != null})")
         if (nativeOverlaysVisible == visible) return
+        android.util.Log.i("OfflineGlassX", "overlays -> $visible (shim=${shimRef?.get() != null} fab=${fabRef?.get() != null})")
         nativeOverlaysVisible = visible
         applyChromeVisibility()
     }
@@ -353,11 +370,12 @@ internal object XAdapter : TargetAdapter {
             }
         }
         if (alive != null) {
+            alive.setBackdropSource(compose)
             fabRef = WeakReference(alive)
             return
         }
         runCatching {
-            val fab = XFloatingFab(compose.context, WeakReference(compose)).apply {
+            val fab = XFloatingFab(compose.context, compose).apply {
                 onClickAction = {
                     if (XBottomBarHooks.selectedIndex == 4) XBottomBarHooks.chatClick?.invoke()
                     else XBottomBarHooks.fabClick?.invoke()

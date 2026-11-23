@@ -135,8 +135,8 @@ internal fun symmetricGlassHostWidthPx(
     config: GlassConfig,
     slots: Int,
 ): Int {
-    val referenceSlots = TargetAdapterRegistry.forPackage(view.context.packageName)
-        ?.hostWidthSlotCount(slots, config) ?: slots
+    val adapter = TargetAdapterRegistry.forPackage(view.context.packageName)
+    val referenceSlots = adapter?.hostWidthSlotCount(slots, config) ?: slots
     if (referenceSlots != slots) {
         // Install-time and live configuration updates enter this path for
         // fewer tabs. Honor the adapter's five-tab reference before the
@@ -151,12 +151,16 @@ internal fun symmetricGlassHostWidthPx(
     val fullWidth = (screenWidth - 2 * symmetricGlassSideMarginPx(view, density))
         .coerceAtLeast((4 * config.tabWidth * density).toInt().coerceAtMost(screenWidth))
         .coerceAtMost(screenWidth)
-    if (slots >= 4) return fullWidth
-    val slotWidth = (fullWidth - 8f * density) / 4f
-    return (8f * density + slotWidth * slots)
-        .toInt()
-        .coerceAtLeast((slots * config.tabWidth * density).toInt().coerceAtMost(screenWidth))
-        .coerceAtMost(screenWidth)
+    fun tabRowWidth(count: Int): Int {
+        if (count >= 4) return fullWidth
+        val slotWidth = (fullWidth - 8f * density) / 4f
+        return (8f * density + slotWidth * count)
+            .toInt()
+            .coerceAtLeast((count * config.tabWidth * density).toInt().coerceAtMost(screenWidth))
+            .coerceAtMost(screenWidth)
+    }
+    return adapter?.compactHostWidth(config, density, glassHostHeightPx(density, config), ::tabRowWidth)
+        ?: tabRowWidth(slots)
 }
 
 object GlassInstaller {
@@ -437,6 +441,7 @@ object GlassInstaller {
         val originalParentBackground = parent.background
         val originalNavigationAlpha = navigation.alpha
         val originalNavigationBackground = navigation.background
+        val managesSourceAppearance = TargetAdapterRegistry.forSpec(spec)?.managesNavigationSourceAppearance == true
         val originalPadding = intArrayOf(
             navigation.paddingLeft,
             navigation.paddingTop,
@@ -520,7 +525,7 @@ object GlassInstaller {
             val looksLikeBottomShell = parent !== content &&
                 parent.height in 1..(196f * density).toInt() &&
                 parent.width >= content.width * 0.5f
-            if (looksLikeBottomShell || parent.height <= (196f * density).toInt()) {
+            if (!managesSourceAppearance && (looksLikeBottomShell || parent.height <= (196f * density).toInt())) {
                 parent.background = ColorDrawable(Color.TRANSPARENT)
             }
             // WeChat: preserve the original parent background so Xiaomi's
@@ -531,6 +536,8 @@ object GlassInstaller {
             }
             val nonSelectable = when {
                 spec.supportsPostButton -> setOf(slots / 2)
+                // The rightmost gallery entry is the standalone search button:
+                // it stays a plain tap target and never receives the slider.
                 // The file manager's main tab bar mirrors the gallery: 最近/浏览
                 // tabs plus a standalone circular search key on the right.
                 // The multi-select action bar (split_action_bar) is all plain
@@ -551,14 +558,16 @@ object GlassInstaller {
             content.clipChildren = false
             content.clipToPadding = false
             TargetAdapterRegistry.forSpec(spec)?.prepareContentForInstall(content)
-            navigation.background = ColorDrawable(Color.TRANSPARENT)
-            clearNavigationSurfaces(navigation)
-            TargetAdapterRegistry.forSpec(spec)?.suppressNativeBottomChrome(navigation)
-            if (spec.key == "qq" || TargetAdapterRegistry.forSpec(spec)?.clearSourceSelectionSurfaces == true) {
-                clearTabSelectionSurfaces(navigation, slots)
+            if (!managesSourceAppearance) {
+                navigation.background = ColorDrawable(Color.TRANSPARENT)
+                clearNavigationSurfaces(navigation)
+                TargetAdapterRegistry.forSpec(spec)?.suppressNativeBottomChrome(navigation)
+                if (spec.key == "qq" || TargetAdapterRegistry.forSpec(spec)?.clearSourceSelectionSurfaces == true) {
+                    clearTabSelectionSurfaces(navigation, slots)
+                }
+                navigation.setPadding(originalPadding[0], originalPadding[1], originalPadding[2], 0)
+                applyGlassOptions(navigation, slots, config, spec, density, hostWidth, hostHeight)
             }
-            navigation.setPadding(originalPadding[0], originalPadding[1], originalPadding[2], 0)
-            applyGlassOptions(navigation, slots, config, spec, density, hostWidth, hostHeight)
             if (spec.key == "mi_theme") {
                 // The theme store pill paints its moving selection indicator on
                 // a dedicated OverlayView that sits above the four tab rows.
@@ -590,7 +599,7 @@ object GlassInstaller {
             if (existingHost != null) {
                 existingHost.rebindNavigationSource(navigation, qqBottomChrome, config)
                 qqBottomChrome.forEach { it.visibility = View.INVISIBLE }
-                navigation.alpha = 0f
+                if (!managesSourceAppearance) navigation.alpha = 0f
                 if (TargetAdapterRegistry.forSpec(spec)?.navigationImmersionOverride != null) {
                     updateAdapterNavigationBarForPage(activity)
                 } else {
@@ -616,8 +625,9 @@ object GlassInstaller {
                 // search key as a plain tap target.
                 sliderEnabled = spec.key != "mi_file_manager" ||
                     resourceEntryName(navigation) != FILE_MANAGER_ACTION_BAR_ID,
-                // First visits now dispatch immediately, just like warm visits.
-                primaryNavigationHost = false,
+                // Only installed main bottom bars own cold-tab scheduling.
+                primaryNavigationHost = TargetAdapterRegistry.forSpec(spec)
+                    ?.defersColdTapUntilMotionSettles == true,
             ).apply {
                 // WeChat uses the same explicit tight shadow drawn by the
                 // manager bar. Do not stack Android's strongly downward-biased
@@ -697,7 +707,7 @@ object GlassInstaller {
                 ensureNavigationBarImmersion(activity)
             }
             qqBottomChrome.forEach { it.visibility = View.INVISIBLE }
-            if (TargetAdapterRegistry.forSpec(spec)?.keepNavigationSourceVisible != true) {
+            if (!managesSourceAppearance && TargetAdapterRegistry.forSpec(spec)?.keepNavigationSourceVisible != true) {
                 navigation.alpha = 0f
             }
             installed += navigation

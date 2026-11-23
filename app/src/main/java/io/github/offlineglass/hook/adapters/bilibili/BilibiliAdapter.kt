@@ -3,6 +3,7 @@ package io.github.offlineglass.hook.adapters.bilibili
 import android.graphics.Canvas
 import android.view.View
 import android.view.ViewGroup
+import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
@@ -35,9 +36,14 @@ internal object BilibiliAdapter : TargetAdapter {
             "story video viewport" to { BilibiliStoryVideoViewport.install(lpparam.classLoader) },
             "playlist glass" to { BilibiliPlaylistGlassHooks.install() },
             "home layout" to { BilibiliHomeLayoutHooks.install(lpparam.classLoader) },
+            "home feed edges" to { BilibiliHomeFeedEdges.install(lpparam.classLoader, spec.packageName) },
         ).forEach { (name, install) ->
             runCatching(install).onFailure { XposedBridge.log("LiquidTab Bilibili $name: $it") }
         }
+    }
+    override fun acceptPushedConfig(config: GlassConfig): Boolean {
+        BilibiliHomeFeedEdges.configChanged("tv.danmaku.bili", config)
+        return false
     }
     override val ownsNavigationFinding = true
     override val recheckNavigationBindingOnLayout = true
@@ -66,10 +72,22 @@ internal object BilibiliAdapter : TargetAdapter {
     override fun createNavigationState(context: android.content.Context): io.github.offlineglass.hook.adapters.AppNavigationState =
         BilibiliNavigationState()
     override val foregroundNavigationOverSelection = true
+    override fun compactHostWidth(config: GlassConfig, density: Float, height: Int, tabRowWidth: (Int) -> Int) =
+        twoTabCompoundWidth(config, 5, density, height, tabRowWidth)
     override val usesNavigationOpticalMix = true
     override val persistentNavigationOpticalMix = true
     override fun barLayout(config: io.github.offlineglass.config.GlassConfig, width: Int,
         height: Int, density: Float, slots: Int): io.github.offlineglass.hook.adapters.AdapterBarLayout? {
+        if (config.bilibiliTopBar && config.bilibiliDetachedSearch && slots == 5 &&
+            config.hiddenMask and 31 != 0 && height > 0 && width > height + 12f * density) {
+            val navigation = (0 until slots).filter { config.hiddenMask and (1 shl it) == 0 }
+            if (navigation.isEmpty()) return null
+            val actionLeft = width - height.toFloat()
+            return io.github.offlineglass.hook.adapters.AdapterBarLayout(
+                mainWidth = actionLeft - 12f * density, actionLeft = actionLeft,
+                actionSize = height.toFloat(), actionIndex = SEARCH_INDEX, navigationIndices = navigation,
+            )
+        }
         if (!config.detachedPublish || slots != 5 || config.hiddenMask and 4 != 0 ||
             height <= 0 || width <= height + 12f * density) return null
         val navigation = listOf(0, 1, 3, 4).filter { config.hiddenMask and (1 shl it) == 0 }
@@ -120,6 +138,7 @@ internal object BilibiliAdapter : TargetAdapter {
         maxOf(rootHeight ?: 0, displayHeight)
 
     const val PUBLISH_INDEX = 2
+    const val SEARCH_INDEX = 5
     const val SHOP_INDEX = 3
     override fun drawNavigation(canvas: Canvas, frame: AdapterNavigationFrame) =
         BilibiliRenderer.draw(canvas, frame)

@@ -34,8 +34,7 @@ Copyright 2025 Kyant, Apache-2.0. Upstream:
 https://github.com/Kyant0/AndroidLiquidGlass (backdrop/internal/Shaders.kt).
 The adaptation exposes the shader to Android RenderEffect instead of Compose.
 
-The Xposed declarations in `xposed-stubs/` are minimal compile-time API
-signatures and are excluded from the APK. The module relies on the runtime
+The module compiles against the modern libxposed API and relies on the runtime
 provided by the user's LSPosed installation; LSPosed itself is not bundled.
 
 The optional iOS-style manager controls in `ui/ios/` adapt the upstream
@@ -52,6 +51,4 @@ Miuix Backdrop; LiquidTab adds bounded background Root checks and a same-window
 modal overlay. Preserve its attribution when modifying or redistributing it.
 
 Dependency versions are declared in `app/build.gradle.kts`. Their upstream
-license texts and notices remain authoritative. Apart from the attributed
-shader and catalog-control adaptations above, no dependency source tree or binary archive is
-redistributed in this repository.
+license texts and notices remain authoritative.

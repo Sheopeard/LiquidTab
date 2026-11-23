@@ -14,6 +14,10 @@ import android.widget.FrameLayout
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
+import io.github.offlineglass.hook.topbar.TopBarChannelHost
+import io.github.offlineglass.hook.topbar.HomeChannelProjection
+import io.github.offlineglass.hook.topbar.TopBarTabLayout
+import io.github.offlineglass.hook.topbar.TopBarTabMeasure
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.*
 import io.github.offlineglass.hook.compat.XposedHelpers
@@ -57,6 +61,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
     private val barPosition = IntArray(2)
     private val fields = HashMap<Pair<Class<*>, String>, java.lang.reflect.Field?>()
     private val pagerCache = WeakHashMap<Any, java.lang.ref.WeakReference<Pager>>()
+    private val fragmentAccessors = HashMap<Class<*>, java.lang.reflect.Method?>()
     private val panels = HashMap<Int, GlassHostLayout>()
     private var overlay: Overlay? = null
     private var edgeVeil: MiMarketEdgeVeil? = null
@@ -64,6 +69,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
     private var main: GlassHostLayout? = null
     private var primary: Pager? = null
     private var secondary: Pager? = null
+    private val channelMeasure = TopBarTabMeasure()
     private var pinned = emptyList<Int>()
     private var menuEntries = emptyList<Pair<Pager, Int>>()
     private var search: View? = null
@@ -77,22 +83,61 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
     private var chromeShown = false
     private var chromeAnimationGeneration = 0L
     private var chromeAnimator: android.animation.ValueAnimator? = null
-    private var headerSlots = 0
+    private var trackedHeaderChannels = emptyList<Int>()
+    private var channelWidthFrom: Int? = null
+    private var channelWidthTarget = 0
+    private var incomingChannel: Int? = null
+    private var channelWidthsFrom: Map<Int, Float>? = null
+    private var channelTabsTarget: TopBarTabLayout? = null
+    private var channelTabsDisplayed: TopBarTabLayout? = null
     private var presentedSlider: Pair<Float,Float>? = null
     private var sliderFrom: Pair<Float,Float>? = null
     private var sliderProgress = 1f
     private var sliderAnimator: android.animation.ValueAnimator? = null
 
-    private fun morphSlider() {
+    private fun morphSlider(animateChannelWidth: Boolean = false) {
+        val panel = panels[0] ?: return
         sliderAnimator?.cancel()
-        sliderFrom = presentedSlider ?: return
+        sliderFrom = presentedSlider
+        channelWidthFrom = if (animateChannelWidth) panel.width.takeIf { it > 0 } else null
+        if (sliderFrom == null && channelWidthFrom == null) return
         sliderProgress = 0f
         sliderAnimator = android.animation.ValueAnimator.ofFloat(0f,1f).apply {
             duration=240L
             interpolator=android.view.animation.DecelerateInterpolator(1.5f)
-            addUpdateListener { sliderProgress=it.animatedValue as Float; panels[0]?.postInvalidateOnAnimation() }
+            addUpdateListener {
+                sliderProgress = it.animatedValue as Float
+                val lp = panel.layoutParams as? FrameLayout.LayoutParams
+                if (lp != null && channelWidthFrom != null && channelWidthTarget > 0) {
+                    placeHomeHeader(lp.topMargin, displayedChannelWidth(channelWidthTarget), lp.height)
+                }
+                publishChannelTabs()
+                panel.postInvalidateOnAnimation()
+            }
             start()
         }
+    }
+
+    private fun displayedChannelWidth(target: Int): Int = channelWidthFrom?.let { from ->
+        (from + (target - from) * sliderProgress).roundToInt().coerceAtLeast(1)
+    } ?: target
+
+    private fun publishChannelTabs() {
+        val target = channelTabsTarget
+        val from = channelWidthsFrom
+        val display = if (target != null && from != null && sliderProgress < 1f && target.size == pinned.size) {
+            val widths = FloatArray(target.size) { index ->
+                val end = target.preferredWidths[index]
+                val start = from[pinned[index]] ?: 1f
+                start + (end - start) * sliderProgress
+            }
+            TopBarTabLayout.fromWidths(widths, 4f * d, widths.sum() / TopBarTabLayout.TITLE_SLOT_WIDTH_SCALE)
+        } else {
+            if (sliderProgress >= 1f) channelWidthsFrom = null
+            target
+        }
+        channelTabsDisplayed = display
+        panels[0]?.updateTopBarTabs(display)
     }
 
     private fun transitionChrome(target: Int, shown: Boolean) {
@@ -144,9 +189,13 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
     private var presentation = ""
     private var channelIdentity = ""
     private var menuOpen = false
+    private var menuProgress = 0f
+    private var menuAnimator: android.animation.ValueAnimator? = null
+    private var displayedMenuEntries = emptyList<Pair<Pager, Int>>()
     private var menuOffset = 0f
     private var lastTouchY = 0f
     private var touchStartY = 0f
+    private var menuDragging = false
     private val paints = Array(5) { Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER } }
     private val d get() = context.resources.displayMetrics.density
     private fun dp(value: Float) = (value * d).roundToInt()
@@ -184,6 +233,46 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         return Pager(owner, root, adapter, pager, titles).also { pagerCache[owner] = java.lang.ref.WeakReference(it) }
     }
     private fun selected(pager: Pager): Int = (call(pager.pager, "getCurrentItem") as? Number)?.toInt() ?: 0
+
+    private fun channelFragment(model: Pager, index: Int): Any? {
+        if (index !in model.labels.indices) return null
+        val type = model.adapter.javaClass
+        if (!fragmentAccessors.containsKey(type)) {
+            val accessor = runCatching {
+                type.getMethod("getFragment", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+                    .takeIf { method ->
+                        !java.lang.reflect.Modifier.isStatic(method.modifiers) &&
+                            method.returnType.methods.any {
+                                it.name == "getView" && it.parameterCount == 0 &&
+                                    View::class.java.isAssignableFrom(it.returnType)
+                            }
+                    }
+            }.getOrNull()
+            fragmentAccessors[type] = accessor
+            if (accessor == null) android.util.Log.w("LiquidTabMarketBinding", "Missing native channel fragment accessor")
+        }
+        // false limits lookup to pages already created by the native pager.
+        return runCatching { fragmentAccessors[type]?.invoke(model.adapter, index, false) }.getOrNull()
+    }
+
+    internal fun selectedBackdropRoot(owner: Any): View? {
+        var model = primary?.takeIf { it.owner === owner && it.view.isAttachedToWindow } ?: return null
+        repeat(3) {
+            val index = (call(model.pager, "getCurrentItem") as? Number)?.toInt() ?: return null
+            val fragment = channelFragment(model, index) ?: return null
+            val root = (call(fragment, "getView") as? View)?.takeIf {
+                it.isAttachedToWindow && it.isShown && generateSequence(it.parent) { parent -> parent.parent }
+                    .any { parent -> parent === model.pager }
+            } ?: return null
+            val nested = pager(fragment)?.takeIf { it.pager !== model.pager } ?: return root
+            model = nested
+        }
+        return null
+    }
+
+    internal fun invalidateBackdropPanels() {
+        panels.values.forEach { if (it.isShown && it.alpha > 0f) it.postInvalidateOnAnimation() }
+    }
     private fun choose(pager: Pager, index: Int) {
         if (index !in pager.labels.indices) return
         call(pager.pager, "setCurrentItem", index, true)
@@ -265,7 +354,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
                 overlay?.visibility=View.GONE; chromeShown=false; chromeTarget=-1
                 restore()
             } else transitionChrome(index,false)
-            closeMenu(); edgeToEdge(false); page = null; return
+            closeMenu(animate = host.config.enabled); edgeToEdge(false); page = null; return
         }
         if (nativePage == null) { bindingPending = true; return }
         edgeToEdge(true)
@@ -283,21 +372,34 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         }
         val model = pager(nativePage) ?: run { bindingPending = true; return }
         val wanted = when (index) {
-            0 -> listOf("推荐", "榜单", "金米奖")
+            0 -> listOf("推荐", "金米奖")
             1 -> listOf("推荐", "榜单", "上新", "分类")
             else -> listOf("游戏榜", "软件榜")
         }
         val nextPinned = wanted.mapNotNull { title -> model.labels.indexOfFirst { it == title }.takeIf { it >= 0 } }
         // Do not replace unfamiliar server data with invented destinations.
         if (nextPinned.size != wanted.size) { bindingPending = true; return }
-        if (page !== nativePage || visualPage != index) {
+        val samePage = page === nativePage && visualPage == index
+        if (!samePage) {
             closeMenu(); page = nativePage; visualPage = index; sceneEpoch++
         }
         bindingPending = false
-        val nextChannel = "$index:${selected(model)}"
+        val currentNative = (call(model.pager, "getCurrentItem") as? Number)?.toInt()
+            ?.takeIf { it in model.labels.indices }
+        val nextChannel = "$index:$currentNative"
         if (channelIdentity != nextChannel) { channelIdentity = nextChannel; sceneEpoch++ }
         primary = model
-        pinned = nextPinned
+        val shownChannels = if (index == 0)
+            HomeChannelProjection.visible(model.labels.size, nextPinned, currentNative) else nextPinned
+        if (trackedHeaderChannels != shownChannels || !samePage) {
+            incomingChannel = if (samePage && index == 0)
+                shownChannels.firstOrNull { it !in trackedHeaderChannels } else null
+            channelWidthsFrom = if (samePage && index == 0 && chromeShown) channelTabsDisplayed
+                ?.takeIf { it.size == pinned.size }?.let { pinned.zip(it.preferredWidths).toMap() } else null
+            if (chromeShown && trackedHeaderChannels.isNotEmpty()) morphSlider(samePage && index == 0)
+            trackedHeaderChannels = shownChannels
+        }
+        pinned = shownChannels
         for (name in listOf("page_header_gradient_bg", "header_normal_full_bg", "native_home_page_bg")) {
             hide(find(model.view, name), false)
         }
@@ -315,11 +417,11 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         hide(field(model.owner, "basePagerTabContainer") as? View, false)
         hide(field(model.owner, "tabContainer") as? View, false)
         secondary = if (index == 2) {
-            val child = call(model.adapter, "getFragment", selected(model), false)
+            val child = channelFragment(model, selected(model))
             pager(child)
         } else null
         secondary?.let { hide(find(it.view, "pager_tab_container"), true) }
-        val entries = if (index == 0) model.labels.indices.filter { it !in pinned }.map { model to it }
+        val entries = if (index == 0) model.labels.indices.filter { it !in nextPinned }.map { model to it }
             else secondary?.let { nested -> nested.labels.indices.map { nested to it } }.orEmpty()
         if (menuEntries.map { it.first.owner to it.second } != entries.map { it.first.owner to it.second }) closeMenu()
         menuEntries = entries
@@ -335,17 +437,29 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         val insets = host.rootWindowInsets?.getInsets(android.view.WindowInsets.Type.statusBars())
         root.getLocationInWindow(overlayPosition)
         host.getLocationInWindow(barPosition)
-        val top = ((insets?.top ?: dp(28f)) - overlayPosition[1]).coerceAtLeast(0) + dp(6f)
+        val statusBarBottom = ((insets?.top ?: dp(28f)) - overlayPosition[1]).coerceAtLeast(0)
+        val topGap = dp(if (index == 0) 2f else 6f)
+        val top = statusBarBottom + topGap
         prepareViewport(model, top + dp(48f) + overlayPosition[1], parent.height - host.top + dp(12f))
-        val margin = dp(16f); val circle = dp(40f); val gap = dp(8f)
+        val margin = if (index == 0) 0 else dp(16f)
+        val circle = dp(40f); val gap = dp(8f)
         val hasMenu = index == 0 || index == 2
         val available = parent.width - margin * 2
-        val capsuleWidth = available - circle - gap - if (hasMenu) circle + gap else 0
-        place(0, margin + if (hasMenu) circle + gap else 0, top, capsuleWidth, circle)
-        place(1, parent.width - margin - circle, top, circle, circle)
+        val capsuleLimit = available - circle - gap - if (hasMenu) circle + gap else 0
+        val channelTabs = channelMeasure.update(pinned.map(model.labels::get), d,
+            15f * context.resources.displayMetrics.scaledDensity)
+        val capsuleWidth = channelTabs?.wrapWidth(capsuleLimit) ?: capsuleLimit
+        channelWidthTarget = capsuleWidth
+        channelTabsTarget = channelTabs
+        publishChannelTabs()
         panels[2]?.visibility = if (hasMenu) View.VISIBLE else View.GONE
-        if (hasMenu) place(2, margin, top, circle, circle)
-        if (menuOpen) placeMenu(top + circle + gap)
+        if (index == 0) {
+            placeHomeHeader(top, displayedChannelWidth(capsuleWidth), circle)
+        } else {
+            place(0, margin + if (hasMenu) circle + gap else 0, top, displayedChannelWidth(capsuleWidth), circle)
+            place(1, parent.width - margin - circle, top, circle, circle)
+            if (hasMenu) place(2, margin, top, circle, circle)
+        }
         val nextPresentation = "$sceneEpoch:${selected(model)}:${secondary?.let(::selected)}:$menuOpen:${context.resources.configuration.uiMode}"
         if (presentation != nextPresentation) {
             presentation = nextPresentation
@@ -400,7 +514,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
                 topMargin = 0; bottomMargin = 0; height = ViewGroup.LayoutParams.MATCH_PARENT
             }
         }
-        val child = call(model.adapter,"getFragment",selected(model),false)
+        val child = channelFragment(model, selected(model))
         val pageRoot = call(child,"getView") as? View ?: return
         // 4.129 NativeHomePagePagerFragment.childFragmentLifecycleCallbacks:
         // non-feed / assemble roots get pager_web_tab_height - 5.59dp padding;
@@ -514,15 +628,11 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         fun materialConfig(config: GlassConfig, role: Int) = materials[role].apply(config)
     }
     private fun ensurePanel(role: Int, count: Int, slider: Boolean): GlassHostLayout {
-        if (role == 0 && headerSlots != count) {
-            if (headerSlots > 0 && chromeShown) morphSlider()
-            headerSlots=count
-        }
         panels[role]?.let { panel -> panel.updateAdapterSlotCount(count, selection(role)); return panel }
         val state = MaterialState(role)
-        val panel = GlassHostLayout(context, materialConfig(main!!.config, role), count,
+        val panel = TopBarChannelHost.createPanel(context, materialConfig(main!!.config, role), count,
             nativeSelectionReliable = true, navigationSource = content, sliderEnabled = slider,
-            adapterOverride = MaterialAdapter(state, role)).apply {
+            adapterOverride = MaterialAdapter(state, role), isChannel = role == 0).apply {
             tag = role; contentDescription = when (role) { 0 -> "频道"; 1 -> "下载管理"; 2 -> "更多频道"; 3 -> "搜索"; else -> "频道菜单" }
             elevation = 0f
             forceHasOverlappingRendering(false)
@@ -539,6 +649,16 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
             params.gravity = Gravity.TOP or Gravity.LEFT; params.leftMargin = x; params.topMargin = y
             panel.layoutParams = params
         }
+        if (role == 2 && menuOpen) placeMenu()
+    }
+    private fun placeHomeHeader(top: Int, width: Int, circle: Int) {
+        val screenWidth = content?.width ?: return
+        val gap = dp(8f)
+        val capsuleWidth = width.coerceIn(1, (screenWidth - 2 * (circle + gap)).coerceAtLeast(1))
+        val centerLeft = (screenWidth - capsuleWidth) / 2
+        place(0, centerLeft, top, capsuleWidth, circle)
+        place(2, centerLeft - gap - circle, top, circle, circle)
+        place(1, centerLeft + capsuleWidth + gap, top, circle, circle)
     }
     private fun selection(role: Int): Int = if (role == 0) primary?.let { pinned.indexOf(selected(it)).coerceAtLeast(0) } ?: 0 else 0
     private fun clickNative(view: View?) { view?.performClick() }
@@ -574,49 +694,118 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         when (role) {
             0 -> primary?.let { pinned.getOrNull(index)?.let { slot -> choose(it, slot) } }
             1 -> clickNative(download)
-            2 -> if (menuOpen) closeMenu() else if (menuEntries.isNotEmpty()) {
-                menuOpen = true; menuOffset = 0f
-                val panel = ensurePanel(4, 1, false)
-                panel.visibility = View.VISIBLE
-                panel.setOnTouchListener { _, event ->
-                    when (event.actionMasked) {
-                        MotionEvent.ACTION_DOWN -> { lastTouchY = event.y; touchStartY = event.y; true }
-                        MotionEvent.ACTION_MOVE -> {
-                            val limit = (menuEntries.size * dp(48f) + dp(16f) - panel.height).coerceAtLeast(0).toFloat()
-                            menuOffset = (menuOffset + lastTouchY - event.y).coerceIn(0f, limit)
-                            lastTouchY = event.y; panel.postInvalidateOnAnimation(); true
-                        }
-                        MotionEvent.ACTION_UP -> {
-                            if (kotlin.math.abs(event.y - touchStartY) < dp(8f)) {
-                                val y = event.y + menuOffset - dp(8f)
-                                if (y >= 0f) {
-                                    val slot = (y / dp(48f)).toInt()
-                                    menuEntries.getOrNull(slot)?.let { choose(it.first, it.second) }
-                                }
-                            }
-                            true
-                        }
-                        else -> true
-                    }
-                }
-                lastScan = 0L
-            }
+            2 -> if (menuOpen) closeMenu() else openMenu()
             3 -> clickNative(search)
         }
         return true
     }
-    private fun placeMenu(top: Int) {
-        val parent = content ?: return
-        val width = minOf(dp(188f), parent.width - dp(32f))
-        val height = minOf((parent.height - top - dp(144f)).coerceAtLeast(dp(48f)), menuEntries.size * dp(48f) + dp(16f))
-        place(4, dp(16f), top, width, height)
+    private fun openMenu() {
+        if (menuEntries.isEmpty()) return
+        val panel = ensurePanel(4, 1, false)
+        displayedMenuEntries = menuEntries
+        if (panel.visibility != View.VISIBLE || menuProgress == 0f) menuOffset = 0f
+        menuOpen = true
+        placeMenu()
+        animateMenu(panel, 1f, 220L)
     }
-    private fun closeMenu() { menuOpen = false; panels[4]?.visibility = View.GONE }
+
+    private fun placeMenu() {
+        val parent = content ?: return
+        val button = panels[2]?.layoutParams as? FrameLayout.LayoutParams ?: return
+        val left = button.leftMargin
+        val top = button.topMargin + button.height + dp(8f)
+        val width = minOf(dp(188f), parent.width - left - dp(16f))
+        val height = minOf((parent.height - top - dp(144f)).coerceAtLeast(dp(48f)),
+            displayedMenuEntries.size * dp(48f) + dp(16f))
+        place(4, left, top, width, height)
+    }
+
+    internal fun dismissMenu(): Boolean {
+        if (!menuOpen) return false
+        closeMenu()
+        return true
+    }
+
+    private fun closeMenu(animate: Boolean = true) {
+        if (animate && !menuOpen) return
+        menuOpen = false
+        val panel = panels[4] ?: return
+        animateMenu(panel, 0f, if (animate) 160L else 0L)
+    }
+
+    private fun animateMenu(panel: GlassHostLayout, target: Float, durationMs: Long) {
+        menuAnimator?.apply {
+            removeAllListeners()
+            cancel()
+        }
+        menuAnimator = null
+        fun showProgress(progress: Float) {
+            menuProgress = progress
+            panel.alpha = progress
+            panel.pivotY = 0f
+            panel.scaleY = 0.88f + 0.12f * progress
+            panel.syncOpticalVisibilityCompanions()
+            panel.postInvalidateOnAnimation()
+        }
+        fun finish() {
+            if (target == 0f) {
+                panel.visibility = View.GONE
+                displayedMenuEntries = emptyList()
+            }
+            showProgress(target)
+            menuAnimator = null
+        }
+        if (durationMs == 0L || menuProgress == target) {
+            finish()
+            return
+        }
+        showProgress(menuProgress)
+        panel.visibility = View.VISIBLE
+        menuAnimator = android.animation.ValueAnimator.ofFloat(menuProgress, target).apply {
+            duration = durationMs
+            interpolator = android.view.animation.DecelerateInterpolator()
+            addUpdateListener { showProgress(it.animatedValue as Float) }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) = finish()
+            })
+        }
+        menuAnimator?.start()
+    }
+
+    private fun touchMenu(host: View, event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastTouchY = event.y
+                touchStartY = event.y
+                menuDragging = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!menuDragging && kotlin.math.abs(event.y - touchStartY) >= dp(8f)) menuDragging = true
+                if (menuDragging) {
+                    val limit = (displayedMenuEntries.size * dp(48f) + dp(16f) - host.height).coerceAtLeast(0)
+                    menuOffset = (menuOffset + lastTouchY - event.y).coerceIn(0f, limit.toFloat())
+                    host.postInvalidateOnAnimation()
+                }
+                lastTouchY = event.y
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!menuDragging && kotlin.math.abs(event.y - touchStartY) < dp(8f) &&
+                    event.x >= 0f && event.x < host.width && event.y >= 0f && event.y < host.height) {
+                    val rowY = event.y + menuOffset - dp(8f)
+                    if (rowY >= 0f) {
+                        displayedMenuEntries.getOrNull((rowY / dp(48f)).toInt())?.let { choose(it.first, it.second) }
+                    }
+                }
+            }
+        }
+        return true
+    }
     private fun draw(canvas: Canvas, frame: AdapterNavigationFrame, role: Int) = synchronized(paints[role]) {
         val ink = paints[role]
         val color = if (frame.darkGlass) Color.WHITE else 0xFF242424.toInt()
         ink.color = color; ink.style = Paint.Style.FILL
         ink.textSize = (when (role) { 0 -> 15f; 4 -> 16f; else -> 13f }) * frame.scaledDensity
+        if (role == 0) ink.textSize *= frame.topBarTabs?.fitScale(frame.width) ?: 1f
         ink.textAlign = if (role == 4) Paint.Align.LEFT else Paint.Align.CENTER
         fun label(text: String, x: Float, y: Float) {
             val fm = ink.fontMetrics; canvas.drawText(text, x, y - (fm.ascent + fm.descent) / 2f, ink)
@@ -624,7 +813,14 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         when (role) {
             0 -> primary?.let { model -> pinned.forEachIndexed { visual, native ->
                 ink.color = if (selected(model) == native) 0xFFFF6900.toInt() else color
-                label(model.labels[native], 4f*d + (visual + .5f)*frame.slotWidth, frame.height/2f)
+                if (native == incomingChannel && sliderProgress < 1f)
+                    ink.alpha = (255f * sliderProgress).roundToInt().coerceIn(0, 255)
+                if (sliderProgress < 1f && frame.topBarTabs != null) {
+                    val save = canvas.save()
+                    canvas.clipRect(frame.channelEdge(visual), 0f, frame.channelEdge(visual + 1), frame.height.toFloat())
+                    label(model.labels[native], frame.channelCenter(visual), frame.height/2f)
+                    canvas.restoreToCount(save)
+                } else label(model.labels[native], frame.channelCenter(visual), frame.height/2f)
             } }
             1 -> {
                 val x=frame.width/2f; val y=frame.height/2f
@@ -642,7 +838,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
             }
             4 -> {
                 canvas.clipRect(0,0,frame.width,frame.height)
-                menuEntries.forEachIndexed { i, (model, slot) ->
+                displayedMenuEntries.forEachIndexed { i, (model, slot) ->
                     ink.color=if (selected(model)==slot) 0xFFFF6900.toInt() else color
                     label(model.labels[slot],22*d,8*d+(i+.5f)*dp(48f)-menuOffset)
                 }
@@ -662,7 +858,8 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         private var opticalDirty = true
         override fun onOpticalBackdropChanged() { blurFrames.captured(); opticalDirty = true }
         override fun shouldQueueOpticalRenderFromUi(animating: Boolean): Boolean? =
-            if (animating || opticalDirty || !ready || (role == 0 && sliderAnimator?.isRunning == true)) null else false
+            if (animating || opticalDirty || !ready || (role == 0 && sliderAnimator?.isRunning == true) ||
+                (role == 4 && menuAnimator?.isRunning == true)) null else false
         override fun indicatorHorizontalGeometry(center: Float, width: Float): Pair<Float,Float>? {
             if (role != 0) return null
             val from=sliderFrom
@@ -699,18 +896,13 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         override fun deferOpticalCopyRenderToUi() = true
         private fun active() = overlay?.visibility == View.VISIBLE &&
             (chromeShown || chromeAnimator?.isRunning == true) &&
-            (role != 4 || menuOpen) && (role != 2 || visualPage != 1)
+            (role != 4 || panels[4]?.visibility == View.VISIBLE) && (role != 2 || visualPage != 1)
         override val allowsSoftwareBackdropCapture get() = backdropState.allowsSoftwareBackdropCapture
         override fun skipLiveBackdrop(selectedIndex: Int) = backdropState.skipLiveBackdrop(selectedIndex)
-        override fun resolveBackdropScene(host: View): View? {
-            // The accessory host is nested in Overlay, unlike the bottom bar.
-            // Resolve the native content sibling explicitly; sampling its own
-            // parent would find only glass controls and produce an empty scene.
-            val root = this@MiMarketChrome.content ?: return null
-            return backdropState.backdropSceneViews(root, root.childCount)?.firstOrNull {
-                it.visibility == View.VISIBLE && it.alpha > 0f
-            }
+        override fun onLiveBackdropRecorded(selectedIndex: Int) {
+            renderer?.postInvalidateOnAnimation()
         }
+        override fun resolveBackdropScene(host: View): View? = backdropState.resolveBackdropScene(host)
         override fun backdropSceneViews(content: ViewGroup, hostIndex: Int) =
             backdropState.backdropSceneViews(content, content.childCount)
         override fun hostPageAllowsNavigation(host: GlassHostLayout, root: View?) =
@@ -756,7 +948,9 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int) = selection(role)
         override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = this@MiMarketChrome.draw(canvas, frame, role)
         override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int) = tap(role, index)
-        override fun allowsHostTouch() = active() && role != 4 && !bindingPending
+        override fun allowsHostTouch() = active() && !bindingPending && (role != 4 || menuOpen)
+        override fun interceptNavigationTouch(host: View, event: MotionEvent): Boolean? =
+            if (role == 4) touchMenu(host, event) else null
         override fun onOpticalSurfaceFrameInvalidated() {
             resetRenderer()
         }
@@ -783,7 +977,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         // PixelCopy would capture our own white panel and glyphs indefinitely.
         // onOpticalBackdropCaptured queues the first render after publication.
         override fun holdDirectBackdropUntilOpticalFrame(liveBackdropActive: Boolean, hasDisplayList: Boolean) = false
-        override fun handleSystemBack(host: View): Boolean { if (!menuOpen) return false; closeMenu(); return true }
+        override fun handleSystemBack(host: View) = dismissMenu()
     }
     private class MaterialAdapter(private val state: AppNavigationState, private val role: Int) : TargetAdapter {
         override val key = "mi-market-chrome-$role"
@@ -796,6 +990,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         override val skipNavigationSnapshot = true
         override val managesNativeTabVisibility = true
         override val allowsSystemBackgroundBlur = false
+        override val skipBackdropStableDelay = true
         override val reuseOpticalBlur = true
         override val reuseSurfaceBlurDuringBarAnimation = true
         override val usesDirectOpticalBackdropMode = true
@@ -816,8 +1011,12 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         override fun createNavigationState(context: Context) = state
     }
     fun dispose(deferRemoval: Boolean = false) {
+        closeMenu(animate = false)
+        menuEntries = emptyList()
         sliderAnimator?.cancel(); sliderAnimator=null; sliderFrom=null; presentedSlider=null
-        headerSlots=0; sliderProgress=1f
+        trackedHeaderChannels = emptyList(); incomingChannel = null
+        channelWidthFrom = null; channelWidthTarget = 0; sliderProgress=1f
+        channelWidthsFrom = null; channelTabsTarget = null; channelTabsDisplayed = null
         ++chromeAnimationGeneration; chromeAnimator?.cancel(); chromeAnimator=null
         chromeShown=false; chromeTarget=-1
         edgeToEdge(false)
@@ -837,6 +1036,7 @@ internal class MiMarketChrome(private val context: Context, private val backdrop
         edgeVeil=null
         if(deferRemoval)renderHandler.post(removeOwnedViews)else removeOwnedViews.run()
         fields.clear()
+        fragmentAccessors.clear()
         pagerCache.clear()
         behaviorContracts.clear()
     }

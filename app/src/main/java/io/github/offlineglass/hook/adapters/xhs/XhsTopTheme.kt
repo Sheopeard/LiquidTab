@@ -2,6 +2,7 @@ package io.github.offlineglass.hook.adapters.xhs
 
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.drawable.GradientDrawable
 import android.view.View
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.compat.XC_MethodHook
@@ -37,6 +38,16 @@ internal object XhsTopTheme {
     }
     fun watch(root: View) { roots[root] = true }
     fun unwatch(root: View) { roots.remove(root) }
+    fun statusGradient(dark: Boolean): GradientDrawable {
+        val rgb = if (dark) 0x0018181B else 0x00FFFFFF
+        val colors = IntArray(17) { index ->
+            val t = index / 16f
+            val alpha = (160f * (1f - t*t*(3f - 2f*t))).toInt().coerceIn(0, 160)
+            (alpha shl 24) or rgb
+        }
+        return GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, colors)
+    }
+
     fun dark(context: Context, themeMode: Int = GlassConfig.THEME_SYSTEM): Boolean = when (themeMode) {
         GlassConfig.THEME_LIGHT -> false
         GlassConfig.THEME_DARK -> true

@@ -16,9 +16,27 @@ internal object XReplyBackdropMask {
         val stateIndex=scope.parameterTypes.indices.single { it.let { index -> scope.parameterTypes[index]==stateType } }
         require(factory.parameterCount==12 && factory.returnType==factory.parameterTypes[0])
         data class Frame(val parameter: XC_MethodHook.MethodHookParam,val state: Any?)
+        val owner=bindings.methods["replyMaskOwner"]
+        val ownerStates=ThreadLocal.withInitial { ArrayDeque<Frame>() }
+        if(owner!=null) {
+            val ownerStateIndex=owner.parameterTypes.indices.single { owner.parameterTypes[it]==stateType }
+            hook(owner,object: XC_MethodHook() {
+                override fun beforeHookedMethod(p: MethodHookParam) {
+                    ownerStates.get()?.addLast(Frame(p,p.args[ownerStateIndex]))
+                }
+                override fun afterHookedMethod(p: MethodHookParam) {
+                    val frames=ownerStates.get() ?: return
+                    if(frames.lastOrNull()?.parameter===p) frames.removeLast()
+                }
+            })
+        }
         val stack=ThreadLocal.withInitial { ArrayDeque<Frame>() }
         hook(scope,object: XC_MethodHook() {
-            override fun beforeHookedMethod(p: MethodHookParam) { stack.get()?.addLast(Frame(p,p.args[stateIndex])) }
+            override fun beforeHookedMethod(p: MethodHookParam) {
+                val state=p.args[stateIndex] ?: return
+                if(owner!=null && ownerStates.get()?.lastOrNull()?.state!==state) return
+                stack.get()?.addLast(Frame(p,state))
+            }
             override fun afterHookedMethod(p: MethodHookParam) {
                 val frames=stack.get() ?: return
                 if(frames.lastOrNull()?.parameter===p) frames.removeLast()

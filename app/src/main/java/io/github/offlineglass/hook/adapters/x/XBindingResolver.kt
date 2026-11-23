@@ -12,9 +12,9 @@ import java.util.zip.ZipFile
  * Reflection revalidates cached descriptors before any interception is installed.
  */
 internal object XBindingResolver {
-    private const val SCHEMA = "semantic-contract-v10"
+    private const val SCHEMA = "semantic-contract-v12"
     private val roles = listOf("landing", "bottom", "postFab", "chatFab", "toggle", "drawerContainer", "drawerRenderer", "drawerOpen", "detailConstructor", "detailDestroy",
-        "replyComposer", "backgroundFactory", "coordinateBounds", "coordinateRoot", "coordinateSize", "drawContent", "backgroundNodeConstructor", "backgroundInvalidation", "hazeDraw", "hazeAreas", "hazeAreaRecording", "hazeAreaLayer", "replyBorderFactory", "replyBorderScope", "replyMaskScope", "replyMaskFactory")
+        "gestureDrawerContainer", "gestureDrawerRenderer", "gestureDrawerOpen", "replyComposer", "replySurface", "backgroundFactory", "coordinateBounds", "coordinateRoot", "coordinateSize", "drawContent", "backgroundNodeConstructor", "backgroundInvalidation", "hazeDraw", "hazeAreas", "hazeAreaRecording", "hazeAreaLayer", "replyBorderFactory", "replyBorderScope", "replyMaskOwner", "replyMaskScope", "replyMaskFactory")
     data class Bindings(val methods: Map<String, Method>, val detailClass: Class<*>?, val report: String,
                         val backgroundNode: Class<*>? = null, val fields: Map<String,java.lang.reflect.Field> = emptyMap())
 
@@ -80,7 +80,7 @@ internal object XBindingResolver {
                 } else {
                     owner.getDeclaredMethod(key.substring(arrow + 2, open), *params).also {
                         require(it.returnType == type(key.substring(close + 1), loader))
-                        require(Modifier.isStatic(it.modifiers) == (role !in setOf("drawerOpen", "detailDestroy", "replyComposer", "hazeDraw", "hazeAreaLayer", "drawContent", "coordinateSize")))
+                        require(Modifier.isStatic(it.modifiers) == (role !in setOf("drawerOpen", "gestureDrawerOpen", "detailDestroy", "replyComposer", "hazeDraw", "hazeAreaLayer", "drawContent", "coordinateSize")))
                         it.isAccessible = true
                     }
                 }
@@ -93,12 +93,17 @@ internal object XBindingResolver {
             val enums=landing.parameterTypes.filter { type -> type.isEnum && XApkIndex.TAB_NAMES.all { name ->
                 runCatching { type.getField(name).type==type }.getOrDefault(false)
             } }
-            if(enums.size!=1 || landing.parameterTypes.count { it.name=="kotlin.jvm.functions.Function1" }!=1) {
+            if(enums.size!=1 || landing.parameterTypes.none { it.name=="kotlin.jvm.functions.Function1" }) {
                 methods.remove("landing");failures+="landing:enum/callback contract"
             }
         }
+        if (properties.getProperty("replyMaskOwner.candidates", "0") != "0" && methods["replyMaskOwner"] == null) {
+            methods.remove("replyMaskScope")
+            methods.remove("replyMaskFactory")
+            failures += "replyMask:owner unavailable"
+        }
         val absent=roles.filter { properties.getProperty(it)==null }.joinToString { "$it(candidates=${properties.getProperty("$it.candidates","0")})" }
-        return Bindings(methods, detail, "$origin; active=${methods.keys}; fields=${fields.keys}; invalid=$failures; unavailable=[$absent]", background, fields)
+        return Bindings(methods, detail, "$SCHEMA; $origin; active=${methods.keys}; fields=${fields.keys}; invalid=$failures; unavailable=[$absent]", background, fields)
     }
 
     private fun fingerprint(apks: List<File>): String {

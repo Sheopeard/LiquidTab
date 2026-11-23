@@ -15,6 +15,8 @@ internal class QuoraWebSafety {
     private val webRect=Rect()
     private val hostRect=Rect()
 
+    fun visibleBoundWeb(): WebView? = active?.takeIf { it.isAttachedToWindow && it.isShown }
+
     fun update(host: View, source: ViewGroup?, owner: ViewGroup?, topBottom: Int) {
         val now = SystemClock.uptimeMillis()
         if (now - lastProbe < 200L) return

@@ -28,7 +28,7 @@ internal class XComposeBridge(val bindings: XBindingResolver.Bindings) {
     private val coordinateSize=requireNotNull(bindings.methods["coordinateSize"]) { "coordinateSize: bounds call relationship missing" }.also {
         require(it.declaringClass==coordinateType && it.parameterCount==0 && it.returnType==Long::class.javaPrimitiveType)
     }
-    private val stateType=requireNotNull(bindings.methods["replyBorderScope"]).parameterTypes.single {
+    private val stateType=requireNotNull(bindings.methods["replySurface"]) { "reply Haze surface contract missing" }.parameterTypes.single {
         it.name.startsWith("dev.chrisbanes.haze.")
     }
     private val replyStates=java.util.Collections.newSetFromMap(java.util.WeakHashMap<Any,Boolean>())

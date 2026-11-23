@@ -197,6 +197,7 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
     private var postureEnabled = true
     private var liquidViscosity = 25f
+    private var refractionScale = 1f
     private var opticalSignature = ""
 
     private var opticalSceneSignature = ""
@@ -237,7 +238,6 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
     private val bloomPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
 
-    private val lightingRect = RectF()
 
     private val lightingPath = Path()
 
@@ -295,6 +295,7 @@ internal class NeteaseMiniPlayerGlassDrawable(
         val opticalConfig = io.github.offlineglass.hook.HookConfigReader.read(target.context, target.context.packageName)
         postureEnabled = opticalConfig.postureEffectsEnabled
         liquidViscosity = opticalConfig.liquidViscosity
+        refractionScale = opticalConfig.refractionScale
         io.github.offlineglass.rendering.LiquidMotion.configure(target,
             opticalConfig.flowHorizontalStrength, opticalConfig.flowVerticalStrength)
 
@@ -368,7 +369,7 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
         target.getLocationInWindow(targetLocation)
 
-        val pad = io.github.offlineglass.rendering.NativeBackdropBlur.padding(blurRadius, 26f * displayDensity).roundToInt()
+        val pad = io.github.offlineglass.rendering.NativeBackdropBlur.padding(blurRadius, 26f * displayDensity * refractionScale.coerceAtLeast(1f)).roundToInt()
 
         val w = bounds.width()
 
@@ -388,7 +389,7 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
         io.github.offlineglass.rendering.PostureGlass.track(target, postureEnabled && liquidGlassEnabled)
         lens?.let { io.github.offlineglass.rendering.PostureGlass.sync(it, target, postureEnabled && liquidGlassEnabled, liquidViscosity) }
-        val signature = "$w/$h/$pad/$blurRadius/$radiusPercent/$liquidGlassEnabled"
+        val signature = "$w/$h/$pad/$blurRadius/$radiusPercent/$liquidGlassEnabled/$refractionScale"
 
         val postureChanged = lens?.let { io.github.offlineglass.rendering.PostureGlass.effectChanged(it) } == true
         if (signature != opticalSignature || postureChanged) {
@@ -409,7 +410,7 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
                 shader.setFloatUniform("refractionHeight", min(h / 2f, 24f * displayDensity))
 
-                shader.setFloatUniform("refractionAmount", -24f * displayDensity)
+                shader.setFloatUniform("refractionAmount", -24f * displayDensity * refractionScale)
 
                 shader.setFloatUniform("depthEffect", 0f)
                 val refraction = RenderEffect.createRuntimeShaderEffect(shader, "content")
@@ -635,11 +636,11 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
         strokePaint.strokeWidth = stroke
 
-        if (dark && liquidGlassEnabled && bloomShader != null && canvas.isHardwareAccelerated) {
+        if (liquidGlassEnabled && bloomShader != null && canvas.isHardwareAccelerated) {
 
             // Dynamic bloom highlight, matching the navigation panel's stroke.
 
-            drawBloomStrokePlayer(canvas, rect, radius.coerceAtLeast(0f), outlineStrength.coerceIn(0f, 1f))
+            drawBloomStrokePlayer(canvas, rect, outlineStrength.coerceIn(0f, 1f), dark)
 
         } else {
 
@@ -721,7 +722,7 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
     /** Dynamic bloom stroke copied from the navigation panel's highlight. */
 
-    private fun drawBloomStrokePlayer(canvas: Canvas, target: RectF, radius: Float, alpha: Float) {
+    private fun drawBloomStrokePlayer(canvas: Canvas, target: RectF, alpha: Float, dark: Boolean) {
 
         val shader = bloomShader ?: return
 
@@ -757,15 +758,14 @@ internal class NeteaseMiniPlayerGlassDrawable(
 
             bloomPaint.strokeWidth = displayDensity.coerceAtLeast(1f)
 
-            lightingRect.set(0f, 0f, width, height)
-
-            lightingPath.setBottomBarSquircle(lightingRect, radius, smoothing)
+            path.offset(-target.left, -target.top, lightingPath)
 
             canvas.save()
 
             canvas.translate(target.left, target.top)
 
-            canvas.drawPath(lightingPath, bloomPaint)
+            io.github.offlineglass.rendering.GlassEdgeHighlight.draw(
+                canvas, lightingPath, bloomPaint, shader, displayDensity, dark, alpha > 0f)
 
             canvas.restore()
 

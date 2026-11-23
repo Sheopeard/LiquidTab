@@ -12,7 +12,6 @@ import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.globalGlassBottomGapPx
 import io.github.offlineglass.hook.setBottomBarSquircle
 import io.github.offlineglass.rendering.KYANT_LENS_SHADER
-import io.github.offlineglass.rendering.NativeBackdropBlur
 import java.lang.ref.WeakReference
 
 /** Glass samples the engine with its footer transparent. All glyphs and check
@@ -41,7 +40,7 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
     private val paths = Array(2) { Path() }
     private val highlightPaths = Array(2) { Path() }
     private val highlights = Array(2) {
-        runCatching { RuntimeShader(GlassHostLayout.BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
+        runCatching { io.github.offlineglass.rendering.GlassEdgeHighlight.shader() }.getOrNull()
     }
     private val highlightUniforms = Array(2) { index -> highlights[index]?.let {
         io.github.offlineglass.rendering.ExactOpticalUniformCache(it)
@@ -53,12 +52,9 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
     private var foregroundKey: ForegroundKey? = null
     private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val sharedBlurNode = RenderNode("TaobaoCartSharedBlur")
-    private var sharedFrameEpoch = -1
-    private data class BlurKey(val radius:Float,val scaleX:Float,val scaleY:Float)
-    private var sharedBlurKey:BlurKey? = null
     private val nodes = Array(2) { RenderNode("TaobaoCleanCartButton$it") }
     private val lenses = Array(2) { io.github.offlineglass.rendering.PostureGlass.shader(KYANT_LENS_SHADER, flowing = false) }
-    private data class EffectKey(val width:Int,val height:Int,val blur:Float,val density:Float)
+    private data class EffectKey(val width:Int,val height:Int,val blur:Float,val density:Float,val refraction:Float)
     private data class RecordingKey(val left:Float,val top:Float,val right:Float,val bottom:Float,
         val sourceLeft:Int,val sourceTop:Int,val sourceWidth:Int,val sourceHeight:Int,
         val bitmapWidth:Int,val bitmapHeight:Int,val pad:Float,val dark:Boolean)
@@ -74,11 +70,81 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
     private val location = IntArray(2)
     private val hostLocation = IntArray(2)
     private val parentLocation = IntArray(2)
+    private val sceneLocation = IntArray(2)
+    private data class SceneKey(val node: RenderNode, val x: Int, val y: Int,
+        val width: Int, val height: Int, val blur: Float)
+    private var sceneKey: SceneKey? = null
+    fun onNativeContentFrame() {
+        sceneKey = null
+        recordings.fill(null)
+        invalidate()
+    }
+
+    private fun prepareScene(glass: GlassHostLayout, density: Float): Boolean {
+        if (!glass.config.backdropCapture || glass.config.solidBarEnabled) return false
+        val blur = (geometry?.blur ?: 0f) * density
+        if (!glass.config.liquidGlassEnabled && blur <= 0f) return false
+        val root = (glass.appNavigationState as? TaobaoNavigationState)?.resolveBackdropScene(this) ?: return false
+        val node = glass.retainedBackdropNodeForAdapter(root) ?: return false
+        root.getLocationInWindow(sceneLocation)
+        val key = SceneKey(node, sceneLocation[0] - location[0] - node.left,
+            sceneLocation[1] - location[1] - node.top, width, height, blur)
+        if (key != sceneKey || !sharedBlurNode.hasDisplayList()) {
+            val recording = sharedBlurNode.beginRecording(width, height)
+            try {
+                recording.translate(key.x.toFloat(), key.y.toFloat())
+                recording.drawRenderNode(node)
+            } finally { sharedBlurNode.endRecording() }
+            sharedBlurNode.setPosition(0, 0, width, height)
+            sharedBlurNode.setRenderEffect(if (blur > 0f)
+                RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.CLAMP) else null)
+            sceneKey = key
+        }
+        return true
+    }
+
+    private fun drawScene(canvas: Canvas, i: Int, glass: GlassHostLayout, density: Float) {
+        val rect = rects[i]
+        val lens = lenses[i]
+        if (!glass.config.liquidGlassEnabled || lens == null) {
+            canvas.drawRenderNode(sharedBlurNode)
+            return
+        }
+        val w = kotlin.math.ceil(rect.width()).toInt()
+        val h = kotlin.math.ceil(rect.height()).toInt()
+        val pad = (24f * density).toInt()
+        val key = EffectKey(w, h, 0f, density, 1f)
+        val node = nodes[i]
+        val recordingKey = RecordingKey(rect.left, rect.top, rect.right, rect.bottom,
+            0, 0, width, height, 0, 0, pad.toFloat(), false)
+        if (recordings[i] != recordingKey || !node.hasDisplayList()) {
+            val recording = node.beginRecording(w + 2 * pad, h + 2 * pad)
+            try {
+                recording.translate(pad - rect.left, pad - rect.top)
+                recording.drawRenderNode(sharedBlurNode)
+            } finally { node.endRecording() }
+            node.setPosition(0, 0, w + 2 * pad, h + 2 * pad)
+            recordings[i] = recordingKey
+        }
+        if (effects[i] != key) {
+            lens.setFloatUniform("size", rect.width(), rect.height())
+            lens.setFloatUniform("offset", -pad.toFloat(), -pad.toFloat())
+            lens.setFloatUniform("cornerRadii", FloatArray(4) { rect.height() / 2f })
+            lens.setFloatUniform("refractionHeight", 12f * density)
+            lens.setFloatUniform("refractionAmount", -24f * density)
+            lens.setFloatUniform("depthEffect", 0f)
+            node.setRenderEffect(RenderEffect.createRuntimeShaderEffect(lens, "content"))
+            effects[i] = key
+        }
+        val save = canvas.save()
+        canvas.translate(rect.left - pad, rect.top - pad)
+        canvas.drawRenderNode(node)
+        canvas.restoreToCount(save)
+    }
     private data class GeometryKey(val left:Float,val right:Float,val bottom:Float,val height:Float,
         val blur:Float,val dark:Boolean)
     private var geometry:GeometryKey? = null
     @Volatile private var cleanBackdrop = false
-    private var lastCleanFrame: io.github.offlineglass.hook.adapters.AppVideoBackdrop? = null
     private var downKind: String? = null
     private var downX = 0f
     private var downY = 0f
@@ -122,6 +188,9 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
     }
 
     override fun onDraw(canvas: Canvas) {
+        // A software backdrop capture must not record these foreground controls
+        // or feed their pixels back into either glass surface.
+        if (!canvas.isHardwareAccelerated) return
         android.os.Trace.beginSection("LiquidTab.CartButtons.draw")
         try { drawButtonFrame(canvas) } finally { android.os.Trace.endSection() }
     }
@@ -133,46 +202,12 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
         if (rects.any { it.width() <= 0 || it.height() <= 0 }) return
         val density = resources.displayMetrics.density
         val dark = glass.adapterContentOrSystemDark()
-        val sampled = (glass.appNavigationState as? TaobaoNavigationState)?.cartButtonBackdrop()
-        // Edge overscroll can briefly invalidate surface coverage. Retain the
-        // last immutable clean frame instead of drawing a tint-only frame.
-        // A page or handshake change explicitly clears this reference.
-        if (cleanBackdrop && sampled != null && !sampled.bitmap.isRecycled) lastCleanFrame = sampled
-        val frame = lastCleanFrame?.takeUnless { it.bitmap.isRecycled }
-        val postureEnabled = glass.config.postureEffectsEnabled && glass.config.liquidGlassEnabled &&
-            !glass.config.solidBarEnabled
-        // Register this independently-drawn control with the shared sensor so
-        // it receives frame invalidations without moving its screen-space layers.
-        io.github.offlineglass.rendering.PostureGlass.track(this, postureEnabled)
-        val blur = ((glass.appNavigationState as? TaobaoNavigationState)?.cartButtonBlurRadius(glass)
-            ?: glass.config.blurRadius) * density
-        getLocationInWindow(location)
-        // The input is already sampled at its native bitmap resolution. Blur it once
-        // in that coordinate space, then map the same filtered source into both lenses.
-        // Radius and saturation stay identical in screen space; no additional downsampling.
-        if (cleanBackdrop && frame != null && canvas.isHardwareAccelerated) {
-            val bitmap=frame.bitmap
-            val scaleX=frame.surfaceWidth.toFloat()/bitmap.width
-            val scaleY=frame.surfaceHeight.toFloat()/bitmap.height
-            val key=BlurKey(blur,scaleX,scaleY)
-            if(sharedBlurKey!=key){
-                val saturation=NativeBackdropBlur.effect(0f)
-                sharedBlurNode.setRenderEffect(if(blur>0f)RenderEffect.createBlurEffect(
-                    blur/scaleX,blur/scaleY,saturation,Shader.TileMode.CLAMP) else saturation)
-                sharedBlurKey=key
-            }
-            if(sharedFrameEpoch!=frame.epoch||!sharedBlurNode.hasDisplayList()){
-                sharedBlurNode.setPosition(0,0,bitmap.width,bitmap.height)
-                val recording=sharedBlurNode.beginRecording(bitmap.width,bitmap.height)
-                try{paint.color=Color.WHITE;paint.style=Paint.Style.FILL;recording.drawBitmap(bitmap,0f,0f,paint)}finally{sharedBlurNode.endRecording()}
-                sharedFrameEpoch=frame.epoch
-            }
-        }
         if(shadowDensity!=density||shadowDark!=dark){
             ambient.setShadowLayer(10f*density,0f,0f,Color.argb(if(dark)36 else 48,0,0,0))
             glow.setShadowLayer(18f*density,0f,0f,Color.argb(14,220,235,255))
             shadowDensity=density;shadowDark=dark
         }
+        val sceneReady = prepareScene(glass, density)
         for (i in rects.indices) {
             val rect = rects[i]
             val path = paths[i]
@@ -194,62 +229,18 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
             }
             val save = canvas.save()
             canvas.clipPath(path)
-            if (cleanBackdrop && canvas.isHardwareAccelerated && frame != null && !frame.bitmap.isRecycled) {
-                val pad = NativeBackdropBlur.padding(blur, 24f * density)
-                val w = (rect.width() + pad * 2).toInt()
-                val h = (rect.height() + pad * 2).toInt()
-                val node = nodes[i]
-                node.setPosition(0, 0, w, h)
-                val frameRect = RectF((frame.surfaceLeft - location[0]).toFloat(),
-                    (frame.surfaceTop - location[1]).toFloat(),
-                    (frame.surfaceLeft - location[0] + frame.surfaceWidth).toFloat(),
-                    (frame.surfaceTop - location[1] + frame.surfaceHeight).toFloat())
-                val record = RecordingKey(rect.left,rect.top,rect.right,rect.bottom,
-                    frame.surfaceLeft-location[0],frame.surfaceTop-location[1],frame.surfaceWidth,frame.surfaceHeight,
-                    frame.bitmap.width,frame.bitmap.height,pad,dark)
-                if (recordings[i] != record || !node.hasDisplayList()) {
-                    val recording = node.beginRecording(w, h)
-                    try {
-                        recording.drawColor(if (dark) 0xFF121215.toInt() else Color.WHITE)
-                        recording.translate(pad - rect.left, pad - rect.top)
-                        paint.color = Color.WHITE
-                        recording.translate(frameRect.left,frameRect.top)
-                        recording.scale(frameRect.width()/frame.bitmap.width,frameRect.height()/frame.bitmap.height)
-                        recording.drawRenderNode(sharedBlurNode)
-                    } finally { node.endRecording() }
-                    recordings[i] = record
-                }
-                val effect = EffectKey(w,h,blur,density)
-                if (effects[i] != effect) {
-                    val lens = lenses[i]
-                    lens.setFloatUniform("size", rect.width(), rect.height())
-                    lens.setFloatUniform("offset", -pad, -pad)
-                    lens.setFloatUniform("cornerRadii", FloatArray(4) { rect.height() / 2f })
-                    // Kyant LiquidButton reference: 48dp high, lens(12dp, 24dp).
-                    lens.setFloatUniform("refractionHeight", 12f * density)
-                    lens.setFloatUniform("refractionAmount", -24f * density)
-                    lens.setFloatUniform("depthEffect", 0f)
-                    node.setRenderEffect(RenderEffect.createRuntimeShaderEffect(lens, "content"))
-                    effects[i] = effect
-                }
-                // RenderEffect retains this shader instance. Updating the
-                // sampling vector in place avoids rebuilding the GPU effect.
-                io.github.offlineglass.rendering.PostureGlass.sync(lenses[i], this, postureEnabled,
-                    glass.config.liquidViscosity, glass.config.flowHorizontalStrength, glass.config.flowVerticalStrength)
-                val translated = canvas.save()
-                canvas.translate(rect.left - pad, rect.top - pad)
-                canvas.drawRenderNode(node)
-                canvas.restoreToCount(translated)
-            }
+            if (sceneReady) drawScene(canvas, i, glass, density)
             paint.style = Paint.Style.FILL
             paint.color = if (i == 1) Color.argb(184, 255, 102, 0)
                 else if (dark) Color.argb(184, 28, 28, 30) else Color.argb(184, 255, 255, 255)
             canvas.drawRect(rect, paint)
             canvas.restoreToCount(save)
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = .6f * density
-            paint.color = Color.argb(if (dark) 30 else 90, 255, 255, 255)
-            canvas.drawPath(path, paint)
+            if (!glass.config.liquidGlassEnabled || glass.config.solidBarEnabled) {
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = .6f * density
+                paint.color = Color.argb(if (dark) 30 else 90, 255, 255, 255)
+                canvas.drawPath(path, paint)
+            }
             val light = canvas.save()
             canvas.clipPath(path)
             drawHighlight(canvas, i, glass, density)
@@ -277,7 +268,7 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
 
     /** UI-owned chrome: never touch the host's worker-owned shader, Paint or Path. */
     private fun drawHighlight(canvas: Canvas, index: Int, glass: GlassHostLayout, density: Float) {
-        if (!glass.config.liquidGlassEnabled || !glass.config.outlineEnabled) return
+        if (!glass.config.liquidGlassEnabled || !glass.config.outlineEnabled || glass.config.solidBarEnabled) return
         val shader = highlights[index] ?: return
         val uniforms = highlightUniforms[index] ?: return
         val rect = rects[index]
@@ -311,7 +302,9 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
         highlightPaint.strokeWidth = density
         val saved = canvas.save()
         canvas.translate(rect.left, rect.top)
-        canvas.drawPath(highlightPaths[index], highlightPaint)
+        io.github.offlineglass.rendering.GlassEdgeHighlight.draw(
+            canvas, highlightPaths[index], highlightPaint, shader, density, glass.adapterContentOrSystemDark(),
+            glass.config.darkBarHighlightStrength > 0f)
         canvas.restoreToCount(saved)
         highlightPaint.shader = null
     }
@@ -403,7 +396,7 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
     }
 
     fun release() {
-        lastCleanFrame = null; sharedBlurNode.discardDisplayList()
+        resetBackdrop()
         nodes.forEach { it.discardDisplayList() }
         foregroundNode.discardDisplayList(); foregroundKey = null; geometryWork.clear()
     }
@@ -412,8 +405,8 @@ internal class TaobaoCartNativeButtons(context: Context, host: GlassHostLayout,
         cleanBackdrop = true
         return true
     }
-    fun resetBackdrop() { cleanBackdrop = false; lastCleanFrame = null; sharedFrameEpoch = -1 }
-    /** PixelCopy publication may notify from the optical worker. No View state
+    fun resetBackdrop() { cleanBackdrop = false }
+    /** Background publication may notify from the optical worker. No View state
      * or RenderNode is mutated there; Android coalesces the next UI redraw. */
     fun onBackdropFramePublished() {
         if (cleanBackdrop) postInvalidate()

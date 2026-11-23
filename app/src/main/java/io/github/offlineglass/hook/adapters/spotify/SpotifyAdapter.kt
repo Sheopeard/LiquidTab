@@ -141,7 +141,6 @@ internal object SpotifyAdapter : TargetAdapter {
     override fun installHooks(lpparam: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
         SpotifyIndicatorHooks.install(lpparam.classLoader)
         SpotifyPlaybackHooks.install(lpparam.classLoader)
-        SpotifyMediaIslandHooks.install(lpparam.classLoader)
     }
 
     override fun findNavigation(root: View, spec: TargetSpec): NavigationCandidate? {

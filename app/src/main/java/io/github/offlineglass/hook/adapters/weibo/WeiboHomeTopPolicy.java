@@ -14,9 +14,12 @@ public final class WeiboHomeTopPolicy {
         return anchor != 0 && anchor == nativeHeader;
     }
     public static Layout layout(float width, float density, float statusInset, float contentTop) {
+        return layout(width, density, statusInset, contentTop, 144 * density);
+    }
+    public static Layout layout(float width, float density, float statusInset, float contentTop, float preferredTabs) {
         float size = 40 * density, margin = 12 * density, gap = 8 * density;
-        float tabs = Math.min(144 * density, width - 2 * margin - 48 * density - 2 * size - 3 * gap);
-        tabs = Math.max(80 * density, tabs);
+        float available = width - 2 * margin - 48 * density - 2 * size - 3 * gap;
+        float tabs = Math.max(1, Math.min(preferredTabs, available));
         float groupWidth = 48 * density + tabs + 2 * size + 3 * gap;
         float left = (width - groupWidth) * .5f;
         float channelX = left + 48 * density + gap;

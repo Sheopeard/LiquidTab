@@ -26,6 +26,8 @@ import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
+import io.github.offlineglass.hook.topbar.TopBarChannelHost
+import io.github.offlineglass.hook.topbar.TopBarTabMeasure
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import kotlin.math.roundToInt
@@ -103,6 +105,7 @@ internal object WeiboHomeTopBar {
             }
             publishBitmap?.let { canvas.drawBitmap(it, publishCrop, Rect(0, 0, width, height), ink) }
         }
+        private val channelMeasure = TopBarTabMeasure()
         private var lastLabels = listOf("推荐", "关注")
         private var lastColors = listOf(Color.BLACK, Color.GRAY)
         private val layout = ViewTreeObserver.OnGlobalLayoutListener {
@@ -114,6 +117,7 @@ internal object WeiboHomeTopBar {
             override fun onViewDetachedFromWindow(v: View) { stop() }
         }
         fun start() {
+            overlay.setForceDarkAllowed(false)
             overlay.addView(topFade, FrameLayout.LayoutParams(-1, 1))
             overlay.translationZ = 28f * density()
             content.addView(overlay, FrameLayout.LayoutParams(-1, -1))
@@ -184,7 +188,9 @@ internal object WeiboHomeTopBar {
             active = true; overlay.visibility = View.VISIBLE
             content.getLocationInWindow(contentPosition)
             val inset = content.rootWindowInsets?.getInsets(WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout())?.top ?: 0
-            val geometry = WeiboHomeTopPolicy.layout(content.width.toFloat(), density(), inset.toFloat(), contentPosition[1].toFloat())
+            val tabs = channelMeasure.update(lastLabels, density(), 16f * activity.resources.displayMetrics.scaledDensity)
+            val geometry = WeiboHomeTopPolicy.layout(content.width.toFloat(), density(), inset.toFloat(),
+                contentPosition[1].toFloat(), tabs?.desiredWidth ?: 144f * density())
             val night = dark()
             if (fadeDark != night) {
                 hosts.forEach { it.refreshAdapterDerivedConfig() }
@@ -200,6 +206,7 @@ internal object WeiboHomeTopBar {
             if (topFade.layoutParams.height != fadeHeight) topFade.layoutParams = FrameLayout.LayoutParams(-1, fadeHeight)
             val top = geometry.top().roundToInt(); val size = geometry.size().roundToInt()
             place(hosts[0], geometry.left().roundToInt(), top, dp(48), size)
+            hosts[1].updateTopBarTabs(tabs)
             place(hosts[1], geometry.tabs().roundToInt(), top, geometry.tabWidth().roundToInt(), size)
             place(hosts[2], geometry.reward().roundToInt(), top, size, size)
             place(hosts[3], geometry.publish().roundToInt(), top, size, size)
@@ -358,9 +365,9 @@ internal object WeiboHomeTopBar {
             if (hosts.isNotEmpty()) return
             repeat(4) { role ->
                 val state = PanelState(this, role)
-                val host = GlassHostLayout(activity, config, if (role == 1) 2 else 1,
+                val host = TopBarChannelHost.createPanel(activity, config, if (role == 1) 2 else 1,
                     nativeSelectionReliable = false, navigationSource = null,
-                    sliderEnabled = role == 1, adapterOverride = PanelAdapter(state)).apply {
+                    sliderEnabled = role == 1, adapterOverride = PanelAdapter(state), isChannel = role == 1).apply {
                     elevation = 0f; clipChildren = false; clipToPadding = false
                     contentDescription = when (role) { 0 -> "超话"; 1 -> "首页频道：推荐、关注"; 2 -> "红包"; else -> "发布" }
                 }
@@ -381,14 +388,14 @@ internal object WeiboHomeTopBar {
         }
         fun draw(canvas: Canvas, frame: AdapterNavigationFrame, role: Int) {
             if (role == 1) {
-                ink.textSize = 16f * frame.scaledDensity
+                ink.textSize = 16f * frame.scaledDensity * (frame.topBarTabs?.fitScale(frame.width) ?: 1f)
                 val metrics = ink.fontMetrics
                 lastLabels.forEachIndexed { index, text ->
                     ink.typeface = Typeface.create("sans-serif", if (index == selected) Typeface.BOLD else Typeface.NORMAL)
                     ink.color = if (dark()) {
                         if (index == selected) Color.WHITE else 0xFFAAAAAA.toInt()
                     } else lastColors.getOrElse(index) { Color.BLACK }
-                    val x = 4f * frame.density + (index + .5f) * frame.slotWidth
+                    val x = frame.channelCenter(index)
                     canvas.drawText(text, x, frame.height * .5f - (metrics.ascent + metrics.descent) * .5f, ink)
                 }
                 return
@@ -421,7 +428,7 @@ internal object WeiboHomeTopBar {
         fun dark(): Boolean = when (config.themeMode) {
             GlassConfig.THEME_LIGHT -> false
             GlassConfig.THEME_DARK -> true
-            else -> ownerRef.get()?.adapterContentOrSystemDark() ?: config.systemDark
+            else -> ownerRef.get()?.isDarkGlass() ?: config.systemDark
         }
         fun selection() = selected
         private fun density() = content.resources.displayMetrics.density
@@ -467,6 +474,7 @@ internal object WeiboHomeTopBar {
         }
         private class PanelAdapter(val state: PanelState) : TargetAdapter {
             override val disablePlatformForceDark = true
+            override fun glassSurfaceFillBlendMode(dark: Boolean) = weiboGlassFillBlendMode(dark)
             override val key = "weibo-home-top-${state.role}"
             override val ownsNavigationDrawing = true
             override val ownsNavigationTap = true
@@ -484,8 +492,7 @@ internal object WeiboHomeTopBar {
                 role = if (state.role == 1) TopBarRole.CHANNELS else TopBarRole.ACTION,
                 iconOnly = state.role != 1, selectedAccent = state.role == 1, accentColor = 0xFFFF8200.toInt())
             override fun normalizeConfig(config: GlassConfig): GlassConfig {
-                val result = material.apply(config).copy(themeMode =
-                    if (state.session.dark()) GlassConfig.THEME_DARK else GlassConfig.THEME_LIGHT)
+                val result = material.apply(config)
                 return if (state.role == 3) result.copy(lightAlpha = 0f, darkAlpha = 0f, solidBarEnabled = false) else result
             }
             override val indicatorInteractionPolicy get() = material.indicatorInteractionPolicy

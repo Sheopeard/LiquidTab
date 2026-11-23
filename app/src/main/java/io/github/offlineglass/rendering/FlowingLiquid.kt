@@ -59,6 +59,7 @@ internal object FlowingLiquid {
 
     const val MATERIAL_OPTICS = """
 float2 postureOffset(float2 coord) {
+    if (refractionAmount == 0.0) return float2(0.0);
     float2 halfSize = max(size * 0.5, float2(1.0));
     float2 p = (coord + offset - halfSize) / halfSize;
     float gain = flowingRippleGain(flowingRimGain(p, postureTilt, halfSize), p);
@@ -105,6 +106,10 @@ float2 flowingLiquidOffset(float2 p, float2 tilt, float2 halfSize) {
 }
 float flowingRimGain(float2 p, float2 tilt, float2 halfSize) {
     float activation = flowingActivation(tilt);
+    // The final mix is exactly 1 when activation is zero. Keep its existing
+    // threshold, but avoid per-pixel direction, division and pow work in the
+    // static material (including posture-disabled controls).
+    if (activation == 0.0) return 1.0;
     float verticalWeight = tilt.y * tilt.y / max(dot(tilt, tilt), 0.000001);
     activation *= 1.0 - 0.70 * verticalWeight;
     float direction = flowingDirection(p, tilt);

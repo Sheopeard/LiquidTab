@@ -65,7 +65,6 @@ internal object SpotifyPlaybackHooks {
             val now=SystemClock.elapsedRealtime()
             val position=(clock.position+(now-clock.sampledAt)*clock.speed).toLong().coerceIn(0L,clock.duration)
             value.clock=Clock(position,clock.duration,if(knownPlaying==false)0f else clock.speed,now)
-            value.clock?.let { SpotifyMediaIslandHooks.onClock(it) }
         }
     }
     private fun sample(value: Binding) {
@@ -93,7 +92,6 @@ internal object SpotifyPlaybackHooks {
             else -> value.clock?.speed ?: 0f
         }
         value.clock=Clock(position,duration,rate,now)
-        SpotifyMediaIslandHooks.onClock(value.clock!!)
         player.postInvalidateOnAnimation()
     }
     fun install(loader: ClassLoader) {

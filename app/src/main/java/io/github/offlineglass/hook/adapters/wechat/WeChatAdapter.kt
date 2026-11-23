@@ -30,6 +30,8 @@ internal object WeChatAdapter : TargetAdapter {
     override val synchronousConfigPolling = true
     override val nativeNavigationDrawsInSourceSpace = true
     override val foregroundNavigationOverSelection = true
+    // Inset tap geometry is not compatible with this artwork pipeline yet.
+    override val foregroundUsesRenderedSelectionOutline = true
     override val foregroundMaskInsetDp = 0f
     override val usesNavigationOpticalMix = true
     override val persistentNavigationOpticalMix = true
@@ -97,6 +99,7 @@ internal object WeChatAdapter : TargetAdapter {
             "status masks" to { WeChatStatusMaskBinding.install(lpparam.classLoader) },
             "main page top content" to { WeChatMainPageTopContent.install(lpparam.classLoader) },
             "contacts layout" to { WeChatContactsLayoutRepair.install(lpparam.classLoader) },
+            "launcher pager transition" to { WeChatLauncherPages.installPagerTransition(lpparam.classLoader) },
             "fold banner" to { WeChatFoldPresentation.install(lpparam.classLoader) },
             "native frost" to { installWeChatNativeFrostSuppression(lpparam, spec) },
         ).forEach { (name, install) ->
@@ -106,6 +109,13 @@ internal object WeChatAdapter : TargetAdapter {
             }
         }
     }
+
+    private val frostProperties = listOf(
+        Triple("getFrostedEnabled", "setFrostedEnabled", false),
+        Triple("getFrostedColor", "setFrostedColor", 0),
+        Triple("getBottomBlurAreaHeight", "setBottomBlurAreaHeight", 0),
+        Triple("getTopBlurAreaHeight", "setTopBlurAreaHeight", 0),
+    )
 
     // Suppress only LauncherUI's native tab frost. ChatFooter remains untouched.
     private fun installWeChatNativeFrostSuppression(
@@ -123,54 +133,26 @@ internal object WeChatAdapter : TargetAdapter {
             // native tab frost only belongs to pages hosted by LauncherUI's
             // main CustomViewPager, so leave secondary pages completely native.
             if (!isWeChatLauncherPageFrost(view)) return@clear
-            // Native Kotlin property accessors survive backing-field renaming.
-            val values = runCatching {
-                Triple(
-                    XposedHelpers.callMethod(view, "getFrostedEnabled") as Boolean,
-                    XposedHelpers.callMethod(view, "getFrostedColor") as Int,
-                    XposedHelpers.callMethod(view, "getBottomBlurAreaHeight") as Int,
-                )
-            }.getOrNull()
-            runCatching { XposedHelpers.callMethod(view, "setFrostedEnabled", false) }
-            runCatching { XposedHelpers.callMethod(view, "setFrostedColor", 0) }
-            runCatching { XposedHelpers.callMethod(view, "setBottomBlurAreaHeight", 0) }
-            runCatching { XposedHelpers.callMethod(view, "setTopBlurAreaHeight", 0) }
-            if (values == null || values.first || values.second != 0 || values.third != 0) {
-                (view as? View)?.invalidate()
-                (view as? View)?.postInvalidateOnAnimation()
+            var changed = false
+            for ((getter, setter, value) in frostProperties) {
+                runCatching {
+                    if (XposedHelpers.callMethod(view, getter) != value) {
+                        XposedHelpers.callMethod(view, setter, value)
+                        changed = true
+                    }
+                }
             }
-            if (!frostRepairLogged) {
-                frostRepairLogged = true
-                android.util.Log.i(
-                    "LiquidTabInject",
-                    "WECHAT-FROST-REPAIR hit=${values?.first}/${values?.second}/${values?.third} view=${view.javaClass.name}",
-                )
-            }
+            if (changed) (view as View).invalidate()
         }
-        // The decompiled a(ZIF) writer calls these setters/field assignments
-        // on each tab layout. Clamp its three draw controls at the write point;
-        // this is more reliable than hoping a later page scan wins the frame.
-        XposedBridge.hookAllMethods(frostedClass, "setFrostedEnabled", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (isWeChatLauncherPageFrost(param.thisObject) && param.args.isNotEmpty()) {
-                    param.args[0] = false
+        for ((_, setter, value) in frostProperties) {
+            XposedBridge.hookAllMethods(frostedClass, setter, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (isWeChatLauncherPageFrost(param.thisObject) && param.args.isNotEmpty()) {
+                        param.args[0] = value
+                    }
                 }
-            }
-        })
-        XposedBridge.hookAllMethods(frostedClass, "setFrostedColor", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (isWeChatLauncherPageFrost(param.thisObject) && param.args.isNotEmpty()) {
-                    param.args[0] = 0
-                }
-            }
-        })
-        XposedBridge.hookAllMethods(frostedClass, "setBottomBlurAreaHeight", object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (isWeChatLauncherPageFrost(param.thisObject) && param.args.isNotEmpty()) {
-                    param.args[0] = 0
-                }
-            }
-        })
+            })
+        }
         // LauncherUI can restore its 171 px native blur strip after the module's
         // normal pre-draw pass. Clear it both at the writer and immediately
         // before FrostedContentView records its RenderNode.
@@ -219,7 +201,6 @@ internal object WeChatAdapter : TargetAdapter {
     private fun isWeChatLauncherPageFrost(instance: Any?): Boolean =
         WeChatLauncherPages.owns(instance)
 
-    private var frostRepairLogged = false
 
 
 

@@ -112,8 +112,7 @@ internal class MeituanMainCheckoutController(private val binding: MeituanMainBin
     }
 
     fun update(glass: GlassHostLayout, index: Int, preview: Boolean, previewScene: View? = null) {
-        val cartIndex = MeituanMainNativeTabs.cartIndex(glass.adapterNavigationSource, glass.adapterSlotCount)
-        if (index != cartIndex) {
+        if (index != 3) {
             stopWatchingLayout()
             if (active) {
                 active = false

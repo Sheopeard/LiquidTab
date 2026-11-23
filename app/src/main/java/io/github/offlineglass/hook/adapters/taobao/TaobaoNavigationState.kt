@@ -10,7 +10,6 @@ import android.os.SystemClock
 import android.os.Handler
 import android.os.HandlerThread
 import io.github.offlineglass.hook.adapters.AppNavigationState
-import io.github.offlineglass.hook.adapters.AppVideoBackdrop
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.GlassHostLayout
 
@@ -19,7 +18,6 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
     private val artwork = TaobaoArtwork(context)
     private val badge = TaobaoBadge()
     internal val scene = TaobaoScene()
-    private val sampler = TaobaoHomeSurfaceSampler()
     private val frameCopyScheduler = TaobaoFrameCopyScheduler()
     private val pageChrome = TaobaoPageChrome()
     private val messageInsets = TaobaoMessageInsets()
@@ -66,7 +64,7 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
     }
     private var cartOpticsBase: io.github.offlineglass.config.GlassConfig? = null
     private var cartOpticsApplied: io.github.offlineglass.config.GlassConfig? = null
-    private data class BlurInput(val backdrop: Bitmap?, val surface: AppVideoBackdrop?,
+    private data class BlurInput(val backdrop: Bitmap?,
         val generation: Long, val width: Int, val height: Int,
         val effect: android.graphics.RenderEffect?, val x: Int, val y: Int)
     private val backdropGeneration = java.util.concurrent.atomic.AtomicLong()
@@ -77,7 +75,7 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
     private var recordedBlur: BlurInput? = null
     private var pendingBlur: BlurInput? = null
     private val blurLocation = IntArray(2)
-    private data class SceneInput(val backdrop: Bitmap?, val surface: AppVideoBackdrop?,
+    private data class SceneInput(val backdrop: Bitmap?,
         val generation: Long, val route: Long, val width: Int, val height: Int,
         val x: Int, val y: Int, val config: io.github.offlineglass.config.GlassConfig)
     private data class IndicatorInput(val scene: SceneInput, val navigation: Bitmap?,
@@ -89,7 +87,7 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
 
     private fun sceneInput(backdrop: Bitmap?, width: Int, height: Int): SceneInput {
         glassHost.getLocationInWindow(blurLocation)
-        return SceneInput(backdrop, sampler.snapshot(), backdropGeneration.get(), captureRouteEpoch,
+        return SceneInput(backdrop, backdropGeneration.get(), captureRouteEpoch,
             width, height, blurLocation[0], blurLocation[1], glassHost.config)
     }
 
@@ -104,6 +102,7 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         outerInput = pendingOuterInput
     }
     override fun reuseCombinedIndicatorScene(surfaceActive: Boolean): Boolean = surfaceActive
+    override val retainsIndicatorReturnLayers = true
     override fun combinedIndicatorSceneNeedsRecord(backdrop: Bitmap?, navigation: Bitmap?,
         signature: Long, width: Int, height: Int, dark: Boolean, hasDisplayList: Boolean): Boolean {
         val key = IndicatorInput(sceneInput(backdrop, width, height), navigation, signature,
@@ -148,7 +147,7 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
     override fun opticalBlurNodeNeedsRecord(prepared: Boolean, backdrop: Bitmap?, width: Int,
         height: Int, effect: android.graphics.RenderEffect?): Boolean {
         currentHost?.getLocationInWindow(blurLocation)
-        val input = BlurInput(backdrop, sampler.snapshot(), backdropGeneration.get(), width, height,
+        val input = BlurInput(backdrop, backdropGeneration.get(), width, height,
             effect, blurLocation[0], blurLocation[1])
         pendingBlur = input
         return !prepared || recordedBlur != input
@@ -199,13 +198,51 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         return true
     }
 
+    private var diagnosticTapGeneration = 0
+
+    private fun observePageCommit(host: View, index: Int, previous: View?) {
+        val generation = ++diagnosticTapGeneration
+        val observer = host.viewTreeObserver
+        val deadline = SystemClock.uptimeMillis() + 1800L
+        val listener = object : android.view.ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (generation != diagnosticTapGeneration || SystemClock.uptimeMillis() >= deadline) {
+                    if (observer.isAlive) observer.removeOnPreDrawListener(this)
+                    return true
+                }
+                val page = if (navigationVisibility.selected() == index) navigationVisibility.page() else null
+                if (page != null && page !== previous && page.isHardwareAccelerated) {
+                    observer.removeOnPreDrawListener(this)
+                    observer.registerFrameCommitCallback {
+                        if (generation == diagnosticTapGeneration && navigationVisibility.selected() == index &&
+                            navigationVisibility.page() === page && android.os.Trace.isEnabled()) {
+                            android.os.Trace.beginSection("LiquidTab.Taobao.PageRootCommit.$index")
+                            android.os.Trace.endSection()
+                        }
+                    }
+                }
+                return true
+            }
+        }
+        if (!observer.isAlive) return
+        observer.addOnPreDrawListener(listener)
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (observer.isAlive) observer.removeOnPreDrawListener(listener)
+        }, 1800L)
+    }
+
     override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
         navigationVisibility.bind(source)
-        return tabTransitions.dispatch(source, index, slotCount) {
+        val observe = io.github.offlineglass.BuildConfig.DEBUG && android.os.Trace.isEnabled() &&
+            navigationVisibility.selected()?.let { it != index } == true
+        val previous = if (observe) navigationVisibility.page() else null
+        val dispatched = tabTransitions.dispatch(source, index, slotCount) {
             TaobaoNativePageTransactions.click(navigationVisibility.nativeRouter()) {
                 nativeTap(source, index, slotCount)
             }
         }
+        if (observe && dispatched) observePageCommit(host, index, previous)
+        return dispatched
     }
 
     private fun nativeTap(source: ViewGroup?, index: Int, slotCount: Int): Boolean {
@@ -290,7 +327,7 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         }
         // All tabs share one output; no teardown/recreation between My and Cart.
         // Sampling native Views from the worker must never re-enter their recording.
-        val enabled = host.adapterSelectedIndex in 0..4 && host.config.backdropCapture &&
+        val enabled = !cartPageActive() && host.adapterSelectedIndex in 0..4 && host.config.backdropCapture &&
             !host.config.solidBarEnabled && (host.config.liquidGlassEnabled || host.config.blurRadius > 0f)
         if (enabled) {
             host.disableOpticalSurfaceNativeBlurForAdapter()
@@ -304,7 +341,38 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         return true
     }
 
-    override fun skipLiveBackdrop(selectedIndex: Int): Boolean = selectedIndex in 0..4
+    private var cartScene = java.lang.ref.WeakReference<View>(null)
+    private var cartFramePending = false
+    override fun forceLiveBackdropFrame(selectedIndex: Int): Boolean {
+        if (!cartPageActive() || !cartFramePending) return false
+        cartFramePending = false
+        return true
+    }
+    fun bindCartScene(root: View) {
+        if (cartScene.get() === root) return
+        cartScene = java.lang.ref.WeakReference(root)
+        val state = java.lang.ref.WeakReference(this)
+        TaobaoCartRenderSurface.attach(root) {
+            state.get()?.let {
+                if (it.cartPageActive()) {
+                    it.cartFramePending = true
+                    it.glassHost.invalidate()
+                    TaobaoCartNativeBridge.onNativeContentFrame()
+                }
+            }
+        }
+    }
+    override fun resolveBackdropScene(host: View): View? {
+        if (!cartPageActive()) return null
+        val root = cartScene.get()?.takeIf { it.isAttachedToWindow && it.isShown } ?: return null
+        var ancestor: View? = host
+        while (ancestor != null) {
+            if (ancestor === root) return null
+            ancestor = ancestor.parent as? View
+        }
+        return root
+    }
+    override fun skipLiveBackdrop(selectedIndex: Int): Boolean = resolveBackdropScene(glassHost) == null
 
     override fun requiresSampledBackdrop(): Boolean = currentHost?.config?.let {
         it.enabled && it.backdropCapture && !it.solidBarEnabled &&
@@ -354,8 +422,6 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
             }.also { glassHost.postDelayed(it, 200L) }
         }
         unchangedRootCopies = 0
-        currentHost?.resetCompositorSamplingCadence()
-        sampler.noteInteraction()
     }
 
     private var sampledRoute = -1
@@ -379,9 +445,6 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         // TBFragmentTabHost owns the current fragment. Scope optional chrome and
         // Surface discovery to its real, attached view, not cached sibling pages.
         val page=navigationVisibility.page() as? ViewGroup
-        traced("LiquidTab.Taobao.surfaceProbe") {
-            sampler.probe(host, selectedIndex == 0 || selectedIndex == 3, routeChanged, page)
-        }
         val root = page ?: host.rootView as? ViewGroup ?: return
         val change = traced("LiquidTab.Taobao.channelProbe") {
             scene.probe(root, homeSelected = selectedIndex == 0)
@@ -395,16 +458,10 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         }
     }
 
-    override fun requestVideoBackdrop(host: View, pageAllowed: Boolean) {
-        val glass = host as? GlassHostLayout
-        sampler.request(host, pageAllowed && (selectedIndex == 0 || selectedIndex == 3),
-            scene.fliggyChannelActive,
-            scene.flashSaleChannelActive && glass?.barVisibilityAnimating == true &&
-                !glass.barVisibilityTarget)
-    }
+    // The cart's Unicorn scene can draw hardware-only bitmaps.
+    override val allowsSoftwareBackdropCapture: Boolean
+        get() = !cartPageActive()
 
-    override fun videoBackdrop(): AppVideoBackdrop? = sampler.snapshot()
-    internal fun cartButtonBackdrop(): AppVideoBackdrop? = sampler.snapshot()
     internal fun cartPageActive(): Boolean =
         (navigationVisibility.selected() ?: glassHost.adapterSelectedIndex) == 3
     internal fun cartButtonBlurRadius(host: GlassHostLayout): Float =
@@ -481,7 +538,8 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
             val artworkSelection = if (frame.hideSelectedForOptics) index
                 else if (frame.navigationOpticalMix > 0f) -1 else frame.selectedIndex
             if (fixed && artwork.drawFixedSlot(canvas, index, artworkSelection, frame.darkGlass,
-                    center, frame.height / 2f, minOf(nativeSlotWidth, sourceHeight.toFloat()) * scale * frame.extraScale)) {
+                    center, frame.height / 2f, minOf(nativeSlotWidth, sourceHeight.toFloat()) * scale * frame.extraScale,
+                    iconOnly = frame.iconOnly)) {
                 canvas.restoreToCount(saved)
                 continue
             }
@@ -500,8 +558,12 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
 
     override fun drawFixedNavigationSlot(canvas: Canvas, index: Int, selectedIndex: Int,
                                          dark: Boolean, centerX: Float, centerY: Float, boxSize: Float): Boolean =
-        if (index == 0 && selectedIndex == 0) false
-        else artwork.drawFixedSlot(canvas, index, selectedIndex, dark, centerX, centerY, boxSize)
+        currentHost.let { host ->
+            val iconOnly = host?.config?.let { it.bottomBarIconOnly || it.iconOnly } == true
+            if (index == 0 && selectedIndex == 0 && !iconOnly) false
+            else artwork.drawFixedSlot(canvas, index, selectedIndex, dark, centerX,
+                if (iconOnly && host != null) host.height / 2f else centerY, boxSize, iconOnly)
+        }
 
     override fun sourceContentOffsetY(index: Int, selectedIndex: Int, hostHeight: Int,
                                       transformDy: Float, transformScale: Float): Float? =
@@ -513,7 +575,6 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         badge.draw(canvas, contentScale)
     }
 
-    override fun needsSurfaceBackdrop(): Boolean = sampler.hasSurface
 
     override fun retainBackdropDuringTransition(now: Long): Boolean = now < scene.barPriorityUntil
 
@@ -542,12 +603,11 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
 
     override fun onHostWindowFocusChanged(hasFocus: Boolean) {
         if (!hasFocus) requestAnimationFrameRate(false)
-        if (!hasFocus) { sampler.pause(); TaobaoCartNativeBridge.suspend(); tabTransitions.cancel(); pagePreview.clear(); frameCopyScheduler.cancel() }
+        if (!hasFocus) { TaobaoCartNativeBridge.suspend(); tabTransitions.cancel(); pagePreview.clear(); frameCopyScheduler.cancel() }
     }
 
     override fun onHostFocusLost() {
         requestAnimationFrameRate(false)
-        sampler.pause()
         TaobaoCartNativeBridge.suspend()
         tabTransitions.cancel(); pagePreview.clear(); frameCopyScheduler.cancel()
     }
@@ -572,7 +632,6 @@ internal class TaobaoNavigationState(context: Context, private val glassHost: Gl
         currentHost = null
         sceneWindow=null;sceneFrameTime=Long.MIN_VALUE
         navigationPixels = null
-        sampler.dispose()
         synchronized(this) {
             opticalThread?.quitSafely()
             opticalThread = null

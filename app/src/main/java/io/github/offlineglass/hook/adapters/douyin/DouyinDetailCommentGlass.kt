@@ -575,6 +575,10 @@ internal object DouyinDetailCommentGlass {
                     ancestor.getLocationOnScreen(origin)
                     for (index in 0 until ancestor.childCount) {
                         val sibling = ancestor.getChildAt(index)
+                        if (DouyinProfilePages.contains(sibling)) {
+                            restorePageClip(sibling)
+                            continue
+                        }
                         if (sibling === page || sibling !is ViewGroup ||
                             sibling.width < ancestor.width / 2 || sibling.height < ancestor.height / 2) continue
                         pageMatrix.reset()

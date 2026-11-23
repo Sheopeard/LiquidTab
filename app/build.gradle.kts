@@ -11,8 +11,8 @@ android {
         applicationId = "com.sheopeard.liquidtab"
         minSdk = 35
         targetSdk = 37
-        versionCode = 226
-        versionName = "2.1.01"
+        versionCode = 227
+        versionName = "2.1.21"
         buildConfigField("Boolean", "BETA_BUILD", "false")
 
         vectorDrawables.useSupportLibrary = true
@@ -33,6 +33,7 @@ android {
     }
 
     packaging {
+        jniLibs.useLegacyPackaging = false
         resources.excludes += setOf(
             "/META-INF/{AL2.0,LGPL2.1}",
             "META-INF/versions/**"

@@ -125,6 +125,10 @@ internal object TaobaoCartNativeBridge {
         }.onFailure { android.util.Log.e("LiquidTabCart", "Ability contract failed", it) }.getOrDefault(false)
     }
 
+    fun onNativeContentFrame() {
+        frameTarget.get()?.onNativeContentFrame()
+    }
+
     private fun ensureWidget(binding:Binding,root:ViewGroup,host:GlassHostLayout):TaobaoCartNativeButtons{
         val parent=host.parent as? ViewGroup?:root
         val previous=binding.widget.get()?:persistentWidget.get()

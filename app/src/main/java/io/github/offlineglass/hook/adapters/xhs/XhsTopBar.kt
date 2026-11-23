@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.drawable.Drawable
-import android.graphics.drawable.GradientDrawable
 
 import android.os.SystemClock
 import android.view.Gravity
@@ -75,7 +74,36 @@ internal object XhsTopBar {
         }
     }
     private class TabInk(context: Context) : LinearLayout(context) {
+        private val channelMeasure = io.github.offlineglass.hook.topbar.TopBarTabMeasure()
+        private var tabLayout: io.github.offlineglass.hook.topbar.TopBarTabLayout? = null
         var material: GlassHostLayout? = null
+            set(value) {
+                field = value
+                value?.updateTopBarTabs(tabLayout)
+            }
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val labels = (0 until childCount).map { getChildAt(it) as TextView }
+            val density = resources.displayMetrics.density
+            val measure = channelMeasure.update(labels.map { it.text.toString() }, density,
+                labels.maxOfOrNull { it.textSize } ?: 0f)
+            if (measure == null) {
+                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+                return
+            }
+            if (tabLayout !== measure) {
+                tabLayout = measure
+                material?.updateTopBarTabs(measure)
+            }
+            val width = resolveSize(kotlin.math.ceil(measure.desiredWidth).toInt(), widthMeasureSpec)
+            val inset = (4f * density).roundToInt()
+            if (paddingLeft != inset || paddingRight != inset) setPadding(inset, paddingTop, inset, paddingBottom)
+            labels.forEachIndexed { index, label ->
+                val lp = label.layoutParams as LayoutParams
+                lp.width = measure.slotPixels(index, width, inset.toFloat()).coerceAtLeast(1)
+            }
+            super.onMeasure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), heightMeasureSpec)
+        }
         private val inkPosition = IntArray(2)
         private val glassPosition = IntArray(2)
         override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -150,6 +178,7 @@ internal object XhsTopBar {
         private val selectedTab = runCatching { nativeTabs.javaClass.getMethod("getSelectedTabPosition") }.getOrNull()
         private var homeTab: View? = null
         private val headerChrome = XhsHeaderChrome(nativeTabs)
+        private val marketBackdrop = XhsMarketBackdrop(nativeTabs)
         private var clearedChrome: View? = null
         val position = IntArray(2)
         val rootPosition = IntArray(2)
@@ -175,7 +204,6 @@ internal object XhsTopBar {
         var channelPendingUntil = 0L
         private var scanDirty = true
         val layoutListener = ViewTreeObserver.OnGlobalLayoutListener { scanDirty = true }
-        val controls = LinearLayout(activity).apply { gravity = Gravity.CENTER_VERTICAL; clipChildren = false; clipToPadding = false }
         val left = Action(activity, 0) { openSidebar() }
         val right = Action(activity, 1) { click(searchSource) }
         val channel = ChannelAction(activity).apply {
@@ -189,10 +217,12 @@ internal object XhsTopBar {
         val labels = listOf("关注", "发现", "同城").mapIndexed { index, label ->
             TextView(activity).apply {
                 text = label; textSize = 15f; gravity = Gravity.CENTER; includeFontPadding = false
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
                 isFocusable = true; contentDescription = label
                 setOnClickListener { click(nativeCells.getOrNull(index)) }
-            }.also { tabInk.addView(it, LinearLayout.LayoutParams(0, -1, 1f)) }
+            }.also { tabInk.addView(it, LinearLayout.LayoutParams(0, -1)) }
         }
+        val controls = XhsTopBarRow(activity, left, tabInk, channel, right, labels)
         val topHosts = ArrayList<GlassHostLayout>()
         val viewport = XhsTopViewport()
         private val refreshIndicator = XhsRefreshIndicator()
@@ -204,6 +234,7 @@ internal object XhsTopBar {
                 // posted callbacks before either one gets to inspect the window.
                 if (!foreground) {
                     foregroundEpoch.update(false, false)
+                    controls.resetMotion()
                     settledRecovery?.let(root::removeCallbacks); settledRecovery = null
                 }
                 root.removeCallbacks(foregroundUpdate)
@@ -217,11 +248,7 @@ internal object XhsTopBar {
 
             root.viewTreeObserver.addOnPreDrawListener(this)
             root.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
-            controls.addView(left, LinearLayout.LayoutParams(dp(40), -1))
-            controls.addView(tabInk, LinearLayout.LayoutParams(0, -1, 1f).apply { leftMargin = dp(7); rightMargin = dp(7) })
-            controls.addView(channel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, -1).apply { rightMargin = dp(7) })
-            controls.addView(right, LinearLayout.LayoutParams(dp(40), -1))
-            overlay.addView(controls, FrameLayout.LayoutParams(-1, dp(40)))
+            overlay.addView(controls, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
         }
         fun click(view: View?) {
             if (view?.isAttachedToWindow == true && view.isEnabled) view.performClick()
@@ -339,15 +366,18 @@ internal object XhsTopBar {
                     selected = { if (role == 1) selection.coerceAtLeast(0) else 0 },
                     onSelect = if (role == 1) { index ->
                         val target = nativeCells.getOrNull(index)
-                        if (target?.isAttachedToWindow == true && target.isEnabled) {
+                        if (ready && !stopped && config.enabled && config.xhsTopBar &&
+                            target?.isAttachedToWindow == true && target.isEnabled && target.rootView === root) {
                             XhsTopBinding.spacer(channelSheet())?.let(::click)
+                            if (nativeCells.getOrNull(index) !== target || !target.isAttachedToWindow ||
+                                !target.isEnabled || target.rootView !== root) return@create false
                             target.performClick().also { root.postInvalidateOnAnimation() }
                         } else false
                     } else null)
-                topHosts.add(host); overlay.addView(host, 0, FrameLayout.LayoutParams(1, 1))
+                topHosts.add(host)
+                controls.mountGlass(role, host)
                 if (role == 1) tabInk.material = host
             }
-            controls.bringToFront()
         }
         override fun onPreDraw(): Boolean {
             if (stopped) return true
@@ -362,7 +392,8 @@ internal object XhsTopBar {
             }
             // Layout events are hints, not permission to rescan for every
             // layout in a native page-switch transaction.
-            if ((scanDirty || !ready || panel?.isAttachedToWindow == false) && now - scanAt > 350L) {
+            val scanned = (scanDirty || !ready || panel?.isAttachedToWindow == false) && now - scanAt > 350L
+            if (scanned) {
                 scanAt = now; scan()
             }
             var parent = nativeTabs.parent as? View
@@ -372,15 +403,18 @@ internal object XhsTopBar {
             if (!config.enabled || !config.xhsTopBar) {
                 overlay.visibility = View.GONE; restoreNative(); return true
             }
+            if (scanned || !marketBackdrop.discovered) marketBackdrop.discover()
             val active = visible && (home == null || home.isSelected)
             if (!active || (!ready && topHosts.isEmpty())) {
+                controls.resetMotion()
                 overlay.visibility = View.GONE; recoverForegroundMaterial(); return true
             }
             ensureHosts()
             overlay.visibility = View.VISIBLE
             recoverForegroundMaterial()
-            val nativeIndex = runCatching { selectedTab?.invoke(nativeTabs) as? Int }.getOrNull() ?: 0
-            selection = nativeCells.indexOf(nativeOrder.getOrNull(nativeIndex)).coerceIn(0, 2)
+            val nativeIndex = runCatching { selectedTab?.invoke(nativeTabs) as? Int }.getOrNull()
+            val current = nativeIndex?.let { nativeCells.indexOf(nativeOrder.getOrNull(it)) }
+            if (current != null && current in 0..2) selection = current
             discovery = selection == 1
             val nativeNight = XhsTopTheme.dark(activity, config.themeMode)
             if (night != nativeNight) {
@@ -395,25 +429,18 @@ internal object XhsTopBar {
             headerBottom = top + dp(40) + dp(10)
             XhsTopNotifications.update(root, headerBottom)
             val lp = controls.layoutParams as FrameLayout.LayoutParams
-            if (lp.topMargin != top || lp.leftMargin != dp(12) || lp.width != root.width - dp(24)) {
-                lp.topMargin = top; lp.leftMargin = dp(12); lp.width = root.width - dp(24); controls.layoutParams = lp
+            if (lp.topMargin != top) {
+                lp.topMargin = top
+                controls.layoutParams = lp
             }
-            channel.visibility = if (discovery) View.VISIBLE else View.GONE
             if (discovery) channel.caption = channelSelection.currentTitle() ?: channel.caption
-            channel.widthLimit = (root.width - dp(260)).coerceAtLeast(dp(66))
-            topHosts[2].visibility = channel.visibility
             val color = if (night) Color.WHITE else Color.BLACK
             left.ink = color; right.ink = color
             channel.ink = color
             channel.expanded = channelSheet() != null
-            labels.forEachIndexed { index, text ->
-                val ink = if (index == selection) 0xFFFF2442.toInt() else color
-                if (text.currentTextColor != ink) text.setTextColor(ink)
-            }
+            val channelWidth = if (discovery) channel.preferredWidth((root.width - dp(260)).coerceAtLeast(dp(66))) else 0
+            controls.update(channelWidth, selection, color, activity.hasWindowFocus())
             topHosts[1].updateAdapterSlotCount(3, selection)
-            listOf(left, tabInk, channel, right).forEachIndexed { index, target ->
-                if (target.width > 0) place(topHosts[if(index == 3) 3 else index], controls.left + target.left, top, target.width, dp(40))
-            }
             hide(nativeTabs); hide(menuSource); hide(searchSource)
             headerChrome.suppress { view, decorative -> hide(view, decorative) }
             clear(clearedChrome)
@@ -437,13 +464,7 @@ internal object XhsTopBar {
         fun updateStatusGradient() {
             // Bilibili/YouTube's curve and extent, with peak alpha reduced from 242 to 160.
             if (gradientNight != night) {
-                val rgb = if (night) 0x0018181B else 0x00FFFFFF
-                val colors = IntArray(17) { index ->
-                    val t = index / 16f
-                    val alpha = (160f * (1f - t*t*(3f - 2f*t))).toInt().coerceIn(0, 160)
-                    (alpha shl 24) or rgb
-                }
-                topGradient.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, colors)
+                topGradient.background = XhsTopTheme.statusGradient(night)
                 gradientNight = night
             }
             val inset = root.rootWindowInsets?.getInsets(
@@ -535,6 +556,7 @@ internal object XhsTopBar {
             root.getLocationInWindow(rootPosition)
         }
         fun restoreNative() {
+            controls.resetMotion()
             XhsTopNotifications.restore(root)
             channelMotion.restore()
             contentMounts.forEach { (body, mount) ->
@@ -546,6 +568,7 @@ internal object XhsTopBar {
             }
             contentMounts.clear()
             viewport.restore()
+            marketBackdrop.restore()
             refreshIndicator.restore()
             panelLimits.forEach { (view, limit) -> runCatching {
                 XhsNativeBindings.field("maxHeight")?.takeIf { it.declaringClass.isInstance(view) }?.setInt(view, limit)
@@ -606,13 +629,16 @@ internal object XhsTopBar {
     private class ChannelAction(context: Context) : View(context) {
         private val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG)
         private val chevron = android.graphics.Path()
+        private var measuredTextSize = 0f
+        private var measuredTitle = Float.NaN
         var caption = "频道"
             set(value) {
                 if (field == value) return
-                field = value; updateDescription(); requestLayout(); invalidate()
+                field = value
+                measuredTitle = Float.NaN
+                updateDescription()
+                invalidate()
             }
-        var widthLimit = Int.MAX_VALUE
-            set(value) { if (field != value) { field = value; requestLayout(); invalidate() } }
         var ink = Color.BLACK
             set(value) { if (field != value) { field = value; invalidate() } }
         var expanded = false
@@ -626,14 +652,20 @@ internal object XhsTopBar {
         private fun updateDescription() {
             contentDescription = "$caption，${if (expanded) "收起" else "展开"}频道选择"
         }
-        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            paint.textSize = 13f * resources.displayMetrics.scaledDensity
+        fun preferredWidth(limit: Int): Int {
+            val size = 13f * resources.displayMetrics.scaledDensity
+            if (measuredTextSize != size || measuredTitle.isNaN()) {
+                measuredTextSize = size
+                paint.textSize = size
+                measuredTitle = paint.measureText(caption)
+            }
             val d = resources.displayMetrics.density
-            val desired = kotlin.math.ceil(paint.measureText(caption) + 41f * d).toInt()
-                .coerceAtLeast((66f * d).roundToInt()).coerceAtMost(widthLimit)
-            setMeasuredDimension(resolveSize(desired, widthMeasureSpec), resolveSize((40f * d).roundToInt(), heightMeasureSpec))
+            return kotlin.math.ceil(measuredTitle + 41f * d).toInt()
+                .coerceAtLeast((66f * d).roundToInt()).coerceAtMost(limit)
         }
         override fun onDraw(canvas: Canvas) {
+            val save = canvas.save()
+            canvas.clipRect(0, 0, width, height)
             val d = resources.displayMetrics.density
             paint.color = ink; paint.style = Paint.Style.FILL
             paint.textSize = 13f * resources.displayMetrics.scaledDensity
@@ -655,6 +687,7 @@ internal object XhsTopBar {
             chevron.rewind(); chevron.moveTo(x, edgeY)
             chevron.lineTo(x + glyphWidth / 2f, tipY); chevron.lineTo(x + glyphWidth, edgeY)
             canvas.drawPath(chevron, paint)
+            canvas.restoreToCount(save)
         }
     }
     private class Action(context: Context, val kind: Int, action: () -> Unit) : View(context) {

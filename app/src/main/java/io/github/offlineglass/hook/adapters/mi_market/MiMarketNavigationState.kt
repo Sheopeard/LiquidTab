@@ -10,6 +10,7 @@ import android.graphics.PorterDuffColorFilter
 import android.graphics.Rect
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.graphics.drawable.Drawable
 import android.widget.ImageView
 import android.widget.TextView
@@ -43,6 +44,8 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
         copyBarrier.schedule(root, opticalCaptureEpoch(), ::opticalCaptureEpoch, copy)
     @Volatile private var opticalFrameReady = false
     private var hostRef = WeakReference<GlassHostLayout>(null)
+    private var scrollObserver: ViewTreeObserver? = null
+    private val backdropScrollListener = ViewTreeObserver.OnScrollChangedListener(::invalidateNativeBackdrop)
     private val renderHandler = android.os.Handler(android.os.Looper.getMainLooper())
     override fun opticalSurfaceCopyHandler() = renderHandler
     override fun deferOpticalCopyRenderToUi() = true
@@ -77,11 +80,23 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
         glass.clipToOutline = false
         hostRef = WeakReference(glass)
         chrome.update(glass, currentNativePage(), currentVisualPage())
-    }
-    override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<View> =
-        (0 until hostIndex.coerceAtMost(content.childCount)).map(content::getChildAt).filter {
-            it !is GlassHostLayout && it !is io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
+        val observer = glass.viewTreeObserver
+        if (observer !== scrollObserver && observer.isAlive) {
+            detachBackdropScrollListener()
+            observer.addOnScrollChangedListener(backdropScrollListener)
+            scrollObserver = observer
         }
+    }
+    private fun invalidateNativeBackdrop() {
+        hostRef.get()?.takeIf { it.isAttachedToWindow && it.isShown }?.postInvalidateOnAnimation()
+        chrome.invalidateBackdropPanels()
+    }
+    private fun detachBackdropScrollListener() {
+        scrollObserver?.takeIf { it.isAlive }?.removeOnScrollChangedListener(backdropScrollListener)
+        scrollObserver = null
+    }
+    override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<View> = listOfNotNull(nativeScene())
+    override fun handleSystemBack(host: View): Boolean = chrome.dismissMenu()
     override fun onOpticalSurfaceFrameInvalidated() {
         opticalFrameReady = false
         opticalDirty = true
@@ -92,6 +107,9 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
     override fun onHostDetached() {
         copyBarrier.reset()
         hostRef.get()?.let(::invalidateBackdropHost)
+        detachBackdropScrollListener()
+        sceneCandidate = null
+        safeScene = null
     }
     override fun onOpticalBackdropCaptured(barSource: Rect?) {
         if (!opticalFrameReady) hostRef.get()?.queueOpticalSurfaceRender()
@@ -168,42 +186,43 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
     override fun retainNavigationWithoutNativeSource(selectedIndex: Int): Boolean =
         retainNavigationWhenNativeRowHidden(selectedIndex)
 
-    // Chromium's Vulkan functor belongs to the window's normal draw pass.
-    // Replaying a parent RenderNode into the glass scene invokes it again.
-    // Keep navigation visible on web subpages. Sample the window's completed
-    // pixels with the shared compositor path instead of replaying Chromium.
-    // Cached parent display lists can still contain Chromium functors after
-    // the WebView is hidden or rebuilt for night mode. Never replay Market's
-    // View/RenderNode tree into a second target, including transient frames.
-    override fun skipLiveBackdrop(selectedIndex: Int): Boolean = true
-    override val allowsSoftwareBackdropCapture: Boolean get() = false
-    override fun allowsOpticalSurfacePipeline(): Boolean = hostRef.get()?.config?.let {
-        it.enabled && it.backdropCapture && !it.solidBarEnabled
-    } ?: true
-    override fun maintainsCompositorSamplingWithoutSurface(): Boolean = allowsOpticalSurfacePipeline()
-    override fun opticalCaptureEpoch(): Long = backdropEpoch
+    // Bind to the selected channel so preloaded siblings cannot invalidate its backdrop.
+    // Chromium and other independently rendered surfaces cannot be replayed safely.
+    private var sceneCandidate: View? = null
+    private var sceneCheckedAt = 0L
+    private var safeScene: View? = null
 
-    override fun enterDirectOpticalBackdrop(surface: android.view.SurfaceView, pipelineActive: Boolean): Boolean {
-        val config = hostRef.get()?.config
-        if (config == null || (config.enabled && config.backdropCapture && !config.solidBarEnabled)) return false
-        surface.visibility = View.GONE
-        return true
+    private fun nativeScene(): View? {
+        val page = currentNativePage() ?: return null
+        val candidate = if (currentVisualPage() == 3) {
+            callNoArgs(page, "getView") as? View
+        } else {
+            chrome.selectedBackdropRoot(page)
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        if (candidate !== sceneCandidate || now - sceneCheckedAt >= 8L) {
+            sceneCandidate = candidate
+            sceneCheckedAt = now
+            val next = candidate?.takeIf(::isSafeMarketBackdrop)
+            if (safeScene !== next) {
+                safeScene = next
+                invalidateNativeBackdrop()
+            }
+        }
+        return safeScene?.takeIf { it.isAttachedToWindow && it.isShown }
     }
 
+    override fun resolveBackdropScene(host: View): View? = nativeScene()
+    override fun skipLiveBackdrop(selectedIndex: Int): Boolean = nativeScene() == null
+    override fun onLiveBackdropRecorded(selectedIndex: Int) {
+        hostRef.get()?.postInvalidateOnAnimation()
+    }
+    override val allowsSoftwareBackdropCapture: Boolean get() = false
+    override fun allowsOpticalSurfacePipeline() = false
+    override fun opticalCaptureEpoch(): Long = backdropEpoch
+
     override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
-        val enabled = host.config.enabled && host.config.backdropCapture && !host.config.solidBarEnabled
-        // Each host must retire its old display list, even when another
-        // accessory already updated the shared page mode earlier this frame.
-        if (hostModes[host] != enabled) {
-            hostModes[host] = enabled
-            host.liveBackdropNodeForAdapter.setRenderEffect(null)
-            host.liveBackdropNodeForAdapter.discardDisplayList()
-            host.clearLiveBackdropForAdapter()
-            host.invalidate()
-            host.disableOpticalSurfaceNativeBlurForAdapter()
-            if (enabled) host.enableOpticalSurfaceRendererForAdapter()
-            else host.disableOpticalSurfaceRendererForAdapter()
-        }
+        host.disableOpticalSurfaceRendererForAdapter()
         return true
     }
     override fun onOpticalRendererConfigurationChanged() {
@@ -284,7 +303,8 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
             val gap = 0.5f * frame.density
             val groupHeight = iconHeight + gap + metrics.descent - metrics.ascent
             val groupTop = (frame.height - groupHeight) / 2f
-            val iconCenterY = groupTop + iconHeight / 2f
+            val hideLabel = frame.iconOnly && icon != null
+            val iconCenterY = if (hideLabel) frame.height / 2f else groupTop + iconHeight / 2f
             val artworkColor = if (frame.hideSelectedForOptics) MARKET_ACCENT
                 else if (frame.darkGlass) Color.WHITE else NORMAL_ICON_COLOR
             canvas.save()
@@ -303,7 +323,7 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
             }
             labelPaint.color = artworkColor
             val labelBaseline = groupTop + iconHeight + gap - metrics.ascent
-            canvas.drawText(title, centerX, labelBaseline, labelPaint)
+            if (!hideLabel) canvas.drawText(title, centerX, labelBaseline, labelPaint)
             drawBadge(canvas, tab, nativeIndex, centerX, iconCenterY, iconWidth, frame)
             canvas.restore()
         }
@@ -522,6 +542,9 @@ internal class MiMarketNavigationState(private val context: Context) : AppNaviga
 
     override fun dispose() {
         searchAnimator?.cancel(); searchAnimator = null
+        detachBackdropScrollListener()
+        sceneCandidate = null
+        safeScene = null
         // Entire window restoration/removal runs after Android's detach walk.
         // Capture the old owner so a reattached host cannot clean up new views.
         val retiredChrome=chrome

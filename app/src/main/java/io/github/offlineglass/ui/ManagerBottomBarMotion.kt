@@ -17,6 +17,7 @@ import kotlin.math.abs
 internal class ManagerBottomBarMotion(initial: Float, private val slots: Int, private val expands: Boolean = true) {
     var position by mutableFloatStateOf(initial); private set
     var pressProgress by mutableFloatStateOf(0f); private set
+    var sliderOnlyPress by androidx.compose.runtime.mutableStateOf(false); private set
     var scaleX by mutableFloatStateOf(1f); private set
     var scaleY by mutableFloatStateOf(1f); private set
     var velocity by mutableFloatStateOf(0f); private set
@@ -36,15 +37,17 @@ internal class ManagerBottomBarMotion(initial: Float, private val slots: Int, pr
     private val positionSpring get() = springs.position
     private val velocitySpring get() = springs.velocity
 
-    fun press(enabled: Boolean) {
+    fun press(enabled: Boolean, sliderOnly: Boolean = false) {
         if (disposed) return
+        sliderOnlyPress = sliderOnly
         held = true; dragging = false; releasePending = false
         if (!expands) return
         tintAnimator?.cancel(); tintAnimator = null; restingTintProgress = 0f
         if (!enabled) {
             springs.resetPress()
         } else {
-            springs.press(BottomBarIndicatorStyle.PRESS_SCALE, slots)
+            springs.press(1f + (BottomBarIndicatorStyle.PRESS_SCALE - 1f) *
+                BottomBarIndicatorStyle.PRESS_GROWTH_GAIN, slots)
         }
     }
     fun dragTo(value: Float, deltaPixels: Float) {
@@ -75,14 +78,16 @@ internal class ManagerBottomBarMotion(initial: Float, private val slots: Int, pr
         }
         releaseIfSettled()
     }
-    fun tap(value: Float, enabled: Boolean) {
-        press(enabled)
-        releaseTo(value)
-    }
     fun followSelection(value: Float) {
         if (disposed || held) return
         target = value
         positionSpring.animateTo(value)
+    }
+    fun selectByTap(value: Float, rich: Boolean) {
+        if (rich && !disposed && !held && abs(position - value) > 0.001f) {
+            press(true, sliderOnly = true)
+            releaseTo(value)
+        } else followSelection(value)
     }
     private fun releaseIfSettled() {
         if (held || !releasePending || abs(position - target) > slots.coerceAtLeast(1) * 0.025f) return

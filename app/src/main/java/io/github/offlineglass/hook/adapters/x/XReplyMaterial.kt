@@ -29,16 +29,19 @@ internal class XReplyMaterial(private val anchor: View,private val source: XRepl
     private var sampleWidth=0f
     private var sampleHeight=0f
     private var samplePadding=0f
+    private var sampleInputs: List<XReplyPageSource.Input>?=null
     private var currentEffect: RenderEffect?=null
+    private var sampleEffect: RenderEffect?=null
     private var liveFrames=0L
     private var retainedFrames=0L
     private var waitingFrames=0L
+    private var sceneRecords=0L
     private var sceneIssue=""
     private var shaderFailure=""
     private val shader=runCatching { PostureGlass.shader(XReplyOptics.source) }.getOrElse {
         shaderFailure=it.stackTraceToString();null
     }
-    private val highlight=runCatching { RuntimeShader(GlassHostLayout.BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
+    private val highlight=runCatching { io.github.offlineglass.rendering.GlassEdgeHighlight.shader() }.getOrNull()
     private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
     val contour=Path()
     private var geometry=""
@@ -79,24 +82,32 @@ internal class XReplyMaterial(private val anchor: View,private val source: XRepl
         val blend=expansion*expansion*(3f-2f*expansion)
         val lensHeight=(LENS_HEIGHT_DP+(EXPANDED_LENS_HEIGHT_DP-LENS_HEIGHT_DP)*blend)*density
         val lensAmount=(LENS_AMOUNT_DP+(EXPANDED_LENS_AMOUNT_DP-LENS_AMOUNT_DP)*blend)*density
-        val pad=ceil(NativeBackdropBlur.padding(blur,lensAmount)).toInt()
+        val pad=ceil(NativeBackdropBlur.padding(blur,lensAmount * cfg.refractionPaddingScale)).toInt()
         val width=ceil(w+pad*2).toInt();val height=ceil(h+pad*2).toInt()
         // Publish complete recordings atomically. A temporary native source
         // gap must not erase the last valid material or reveal native styling.
-        staging.setPosition(0,0,width,height)
-        val recording=staging.beginRecording(width,height)
-        val valid=try {
-            runCatching { source.draw(recording,node,coordinate,pad.toFloat()) }.getOrElse {
-                sceneIssue="${it.javaClass.simpleName}: ${it.message}";false
-            }
-        } finally { staging.endRecording() }
+        sceneIssue=""
+        val inputs=runCatching { source.resolve(node,coordinate) }.getOrElse {
+            sceneIssue="${it.javaClass.simpleName}: ${it.message}"
+            null
+        }
+        val reuse=inputs!=null && sample.hasDisplayList() && sampleInputs==inputs &&
+            sampleWidth==w && sampleHeight==h && samplePadding==pad.toFloat()
+        val recorded=inputs!=null && !reuse && runCatching {
+            staging.setPosition(0,0,width,height)
+            val recording=staging.beginRecording(width,height)
+            try { source.draw(recording,inputs,pad.toFloat()) } finally { staging.endRecording() }
+        }.onFailure { sceneIssue="${it.javaClass.simpleName}: ${it.message}" }.isSuccess
+        val valid=reuse || recorded
         if(valid) {
-            sceneIssue=""
-            val previous=sample;sample=staging;staging=previous
-            sampleWidth=w;sampleHeight=h;samplePadding=pad.toFloat()
+            if(recorded) {
+                val previous=sample;sample=staging;staging=previous
+                sampleWidth=w;sampleHeight=h;samplePadding=pad.toFloat();sampleInputs=inputs
+                sceneRecords++
+            }
             liveFrames++
         } else if(sample.hasDisplayList()) retainedFrames++ else waitingFrames++
-        val key="$next/$blur/$pad/$lensHeight/$lensAmount/${cfg.liquidGlassEnabled}/${cfg.postureEffectsEnabled}"
+        val key="$next/$blur/$pad/$lensHeight/$lensAmount/${cfg.liquidGlassEnabled}/${cfg.postureEffectsEnabled}:${cfg.refractionStrength}"
         if(effectKey!=key || cfg.postureEffectsEnabled) {
             effectKey=key
             val optical=if(cfg.liquidGlassEnabled) lens?.let {
@@ -106,7 +117,7 @@ internal class XReplyMaterial(private val anchor: View,private val source: XRepl
                 it.setFloatUniform("detachedGeometry",0f,0f,0f)
                 it.setFloatUniform("safeSampleBounds",.5f,.5f,width-.5f,height-.5f)
                 it.setFloatUniform("refractionHeight",min(h/3f,lensHeight))
-                it.setFloatUniform("refractionAmount",-lensAmount)
+                it.setFloatUniform("refractionAmount",-lensAmount * cfg.refractionScale)
                 it.setFloatUniform("depthEffect",0f)
                 it.setFloatUniformExact("unifiedDropletPilot",0f)
                 it.setFloatUniformExact("directionalRimPilot",0f)
@@ -117,7 +128,10 @@ internal class XReplyMaterial(private val anchor: View,private val source: XRepl
             val gaussian=if(blur>0) NativeBackdropBlur.effect(blur,1.25f) else null
             currentEffect=if(optical!=null && gaussian!=null) RenderEffect.createChainEffect(optical,gaussian) else optical?:gaussian
         }
-        if(valid) sample.setRenderEffect(currentEffect)
+        if(valid && (recorded || sampleEffect!==currentEffect)) {
+            sample.setRenderEffect(currentEffect)
+            sampleEffect=currentEffect
+        }
         val dark=anchor.resources.configuration.uiMode and 0x30==0x20
         val base=if(dark) Color.rgb(32,32,34) else Color.WHITE
         if(exteriorVisible) halo.update(coordinate,contour,w,h,density,dark,next)
@@ -153,7 +167,7 @@ internal class XReplyMaterial(private val anchor: View,private val source: XRepl
                 if(length>.1f) { gx/=length;gy/=length } else { gx=0f;gy=-1f }
                 val c=.70710677f
                 it.setFloatUniform("halfView",w/2f,h/2f)
-                it.setFloatUniform("highlightAlpha",.25f)
+                it.setFloatUniform("highlightAlpha", .50f * cfg.darkBarHighlightStrength)
                 it.setColorUniform("strokeColor",Color.WHITE)
                 it.setFloatUniform("strokeAlphaMul",0f)
                 it.setFloatUniform("lightDir1",c*gx+c*gy,-c*gx+c*gy,-.05f)
@@ -166,16 +180,19 @@ internal class XReplyMaterial(private val anchor: View,private val source: XRepl
             }
             val rim=canvas.save()
             canvas.clipPath(contour)
-            canvas.drawPath(contour,paint)
+            val edgeShader = highlight
+            if (cfg.liquidGlassEnabled && !cfg.solidBarEnabled && edgeShader != null)
+                io.github.offlineglass.rendering.GlassEdgeHighlight.draw(canvas, contour, paint, edgeShader, density, dark, cfg.darkBarHighlightStrength > 0f)
+            else canvas.drawPath(contour,paint)
             canvas.restoreToCount(rim)
             paint.shader=null;paint.blendMode=BlendMode.SRC_OVER;paint.style=Paint.Style.FILL
         }
-        diagnostic="continuous-contour ${w.toInt()}x${h.toInt()} r=$radius; material=${if(valid) "live" else if(sample.hasDisplayList()) "retained" else "awaiting scene"}; frames=$liveFrames/$retainedFrames/$waitingFrames; exterior=${if(dark) "glow" else "shadow"}/${halo.diagnostic}; ${if(cfg.liquidGlassEnabled && lens==null) "shader unavailable: ${shaderFailure.take(160)}" else sceneIssue.ifEmpty { source.diagnostic }}"
+        diagnostic="continuous-contour ${w.toInt()}x${h.toInt()} r=$radius; material=${if(valid) "live" else if(sample.hasDisplayList()) "retained" else "awaiting scene"}; frames=$liveFrames/$retainedFrames/$waitingFrames; records=$sceneRecords; exterior=${if(dark) "glow" else "shadow"}/${halo.diagnostic}; ${if(cfg.liquidGlassEnabled && lens==null) "shader unavailable: ${shaderFailure.take(160)}" else sceneIssue.ifEmpty { source.diagnostic }}"
         return true
     }
     fun close() {
         halo.close();sample.discardDisplayList();staging.discardDisplayList()
-        sampleWidth=0f;sampleHeight=0f;samplePadding=0f;effectKey=""
+        sampleWidth=0f;sampleHeight=0f;samplePadding=0f;sampleInputs=null;sampleEffect=null;effectKey=""
         PostureGlass.track(anchor,false)
     }
 }

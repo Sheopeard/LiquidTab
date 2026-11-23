@@ -11,14 +11,24 @@ class SettingsProvider : ContentProvider() {
     override fun onCreate(): Boolean {
         // Also covers upgrades where the manager UI is not opened before a
         // hooked application requests its configuration.
-        context?.let { LocalSettings.applyFormalDefaultsOnce(it) }
+        context?.let {
+            LocalSettings.applyFormalDefaultsOnce(it)
+        }
         return true
     }
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
         if (io.github.offlineglass.BuildConfig.DEBUG && android.os.Binder.getCallingUid() == 2000 &&
-            method == "debug_verify_manager_controls") {
-            return io.github.offlineglass.ui.verifyManagerControlOptics()
+            method == "debug_verify_glass_edge_color") {
+            return io.github.offlineglass.rendering.GlassEdgeColorProbe.run()
+        }
+        if (io.github.offlineglass.BuildConfig.DEBUG && android.os.Binder.getCallingUid() == 2000 &&
+            method == "debug_verify_gpu_halo") {
+            return io.github.offlineglass.rendering.GpuHaloProbe.run()
+        }
+        if (io.github.offlineglass.BuildConfig.DEBUG && android.os.Binder.getCallingUid() == 2000 &&
+            method == "debug_verify_outer_light_translation") {
+            return io.github.offlineglass.rendering.IndicatorInteractionLight.verifyTranslation()
         }
         val context = requireNotNull(context)
         if(io.github.offlineglass.BuildConfig.DEBUG && method==io.github.offlineglass.hook.adapters.wechat.WeChatPreviewDiagnostics.REPORT) {
@@ -45,6 +55,10 @@ class SettingsProvider : ContentProvider() {
         if (io.github.offlineglass.BuildConfig.DEBUG && android.os.Binder.getCallingUid() == 2000 &&
             method == "debug_verify_contour_gpu") {
             return io.github.offlineglass.rendering.ContourGpuProbe.run()
+        }
+        if (io.github.offlineglass.BuildConfig.DEBUG && android.os.Binder.getCallingUid() == 2000 &&
+            method == "debug_verify_bounded_contour_gpu") {
+            return io.github.offlineglass.rendering.BoundedContourGpuProbe.run()
         }
         if (io.github.offlineglass.BuildConfig.DEBUG && android.os.Binder.getCallingUid() == 2000 &&
             method == "debug_verify_exact_optical_work") {
@@ -96,6 +110,11 @@ class SettingsProvider : ContentProvider() {
                 runCatching { io.github.offlineglass.ui.verifyManagerPostureShaders() }
                     .onFailure { failures.add("manager: ${it.message}") }
                 runCatching {
+                    val bloom = android.graphics.RuntimeShader(
+                        io.github.offlineglass.hook.GlassHostLayout.BLOOM_STROKE_DUAL_SHADER)
+                    for (band in 0..4) bloom.setFloatUniform("featherBand", band.toFloat())
+                }.onFailure { failures.add("panel bloom: ${it.message}") }
+                runCatching {
                     io.github.offlineglass.rendering.LiquidMotion.verify()
                     io.github.offlineglass.rendering.LiquidMotion.verifyAxes(android.view.View(context))
                     io.github.offlineglass.ui.verifyViscosityDetents()
@@ -111,7 +130,16 @@ class SettingsProvider : ContentProvider() {
                         check(restored.flowHorizontalStrength == x && restored.flowVerticalStrength == y)
                     }
                     check(GlassConfig.fromBundle(android.os.Bundle()).flowHorizontalStrength == 100f)
-                    check(GlassConfig().blurRadius == 2f && GlassConfig.fromBundle(Bundle()).blurRadius == 2f)
+                    for (strength in listOf(0f, 100f, 150f, 200f)) {
+                        val restored = GlassConfig.fromBundle(GlassConfig(refractionStrength = strength)
+                            .toBundle("com.xingin.xhs"))
+                        check(restored.refractionStrength == strength && restored.refractionScale == strength / 100f)
+                    }
+                    check(GlassConfig.fromBundle(Bundle()).refractionStrength == GlassConfig.DEFAULT_REFRACTION_STRENGTH)
+                    check(GlassConfig(refractionStrength = Float.NaN).normalized().refractionStrength == GlassConfig.DEFAULT_REFRACTION_STRENGTH)
+                    check(GlassConfig(refractionStrength = 250f).normalized().refractionStrength == 200f)
+                    check(GlassConfig(refractionStrength = -1f).normalized().refractionStrength == 0f)
+                    check(GlassConfig().blurRadius == 0f && GlassConfig.fromBundle(Bundle()).blurRadius == 0f)
                     for (alpha in listOf(0f, 0.1f, 0.4f, 0.5f, 0.8f)) {
                         val c = GlassConfig(lightAlpha = alpha, darkAlpha = 0.123f).normalized()
                         check(c.lightAlpha == alpha && c.darkAlpha == alpha)

@@ -1,17 +1,25 @@
 package io.github.offlineglass.hook.adapters.chatgpt
 
 import android.view.View
-import android.view.ViewGroup
-import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
-import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.targets.TargetSpec
 
-/** ChatGPT owns its composer overlay; it does not participate in tab-bar discovery. */
+/** The adapter binds Compose controls and delegates the tab bar to the shared host. */
 internal object ChatGptAdapter : TargetAdapter {
     override val key = "chatgpt"
     override val ownsNavigationFinding = true
+
+    override val ownsNavigationDrawing = true
+    override val ownsNavigationTap = true
+    override val foregroundNavigationOverSelection = true
+    override val skipNavigationSnapshot = true
+    override val hasPerFrameScene = true
+    override val ownsHostLayout = true
+    override val skipBackdropStableDelay = true
+    override val allowsSystemBackgroundBlur = false
+    override fun createNavigationState(context: android.content.Context, host: io.github.offlineglass.hook.GlassHostLayout) =
+        ChatGptBottomBar.state(host)
 
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
         ChatGptComposerGlass.install(lpparam.classLoader)

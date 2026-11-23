@@ -263,6 +263,7 @@ internal object AmapSearchGlass {
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
         private val clear = Paint(Paint.ANTI_ALIAS_FLAG).apply { blendMode = BlendMode.CLEAR }
         private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
         private val flow = Paint(Paint.ANTI_ALIAS_FLAG)
         private val shape = Path()
         private val rect = RectF()
@@ -273,6 +274,7 @@ internal object AmapSearchGlass {
         private var nodeWidth = 0
         private var nodeHeight = 0
         private var nodeDark = false
+        private var nodeRefraction = Float.NaN
         private var edgeGradientWidth = 0
         private var edgeGradientHeight = 0
         private var edgeGradient: Shader? = null
@@ -419,16 +421,16 @@ internal object AmapSearchGlass {
             }
             if (canvas.isHardwareAccelerated && config.liquidGlassEnabled && !config.solidBarEnabled) {
                 PostureGlass.sync(lens, owner, config.postureEffectsEnabled)
-                if (nodeWidth != w || nodeHeight != h || nodeDark != dark ||
+                if (nodeWidth != w || nodeHeight != h || nodeDark != dark || nodeRefraction != config.refractionStrength ||
                     PostureGlass.effectChanged(lens)) {
-                    nodeWidth = w; nodeHeight = h; nodeDark = dark
+                    nodeWidth = w; nodeHeight = h; nodeDark = dark; nodeRefraction = config.refractionStrength
                     lens.setFloatUniform("size", w.toFloat(), h.toFloat())
                     lens.setFloatUniform("offset", 0f, 0f)
                     val radius = cornerRadius(h)
                     lens.setFloatUniform("cornerRadii", radius, radius, radius, radius)
                     lens.setFloatUniform("safeSampleBounds", .5f, .5f, w - .5f, h - .5f)
                     lens.setFloatUniform("refractionHeight", 12f * density)
-                    lens.setFloatUniform("refractionAmount", -24f * density)
+                    lens.setFloatUniform("refractionAmount", -24f * density * config.refractionScale)
                     lens.setFloatUniform("depthEffect", 0f)
                     lens.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
                     lens.setFloatUniformExact("flowingLiquidEnabled", 1f)
@@ -460,6 +462,9 @@ internal object AmapSearchGlass {
             fill.color = if (dark) Color.argb(alpha, 33, 31, 38)
                 else Color.argb(alpha, 243, 237, 247)
             canvas.drawPath(shape, fill)
+            if (config.liquidGlassEnabled && !config.solidBarEnabled) {
+                if (config.outlineEnabled) glassEdge.draw(canvas, shape, density, dark, 1.1f * config.darkBarHighlightStrength)
+            } else {
             edge.strokeWidth = density * 1.1f
             if (edgeGradientWidth != w || edgeGradientHeight != h) {
                 edgeGradientWidth = w; edgeGradientHeight = h
@@ -470,6 +475,7 @@ internal object AmapSearchGlass {
             edge.shader = edgeGradient
             canvas.drawPath(shape, edge)
             edge.shader = null
+            }
             canvas.restoreToCount(saved)
         }
 

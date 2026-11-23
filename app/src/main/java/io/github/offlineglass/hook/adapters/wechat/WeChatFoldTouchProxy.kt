@@ -27,7 +27,42 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
     private val node = RenderNode("WeChatFoldButton")
     private val lens = PostureGlass.shader(KYANT_LENS_SHADER, flowing = false)
     private val nodeField = View::class.java.getDeclaredField("mRenderNode").apply { isAccessible = true }
+    private val backdropPosition = IntArray(2)
+    private val backdropOrigin = IntArray(2)
+    private val backdropInputs = io.github.offlineglass.rendering.ExactRenderInputs(5)
     private var effectKey = ""
+    private var arrowRotation = 0f
+    private var arrowTarget = 0f
+    private var collapsed: Boolean? = null
+    private var arrowAnimation: android.animation.ValueAnimator? = null
+    var togglePinnedChats: (() -> Boolean)? = null
+    private var pressedPlanB = false
+
+    fun setFoldState(next: Boolean?) {
+        if (next == collapsed) return
+        val hadState = collapsed != null
+        collapsed = next
+        contentDescription = if (next == true) "展开置顶聊天" else "收起置顶聊天"
+        if (next == null) return
+        arrowAnimation?.cancel()
+        if (!hadState || !visibilityTarget) {
+            arrowTarget = if (next) 0f else 180f
+            arrowRotation = arrowTarget
+            invalidate()
+            return
+        }
+        val start = arrowRotation
+        arrowTarget += 180f
+        arrowAnimation = android.animation.ValueAnimator.ofFloat(start, arrowTarget).apply {
+            duration = 220L
+            addUpdateListener {
+                arrowRotation = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
     private var visibilityTarget = false
     var planB = false
         private set
@@ -35,9 +70,14 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
     fun setPlanB(enabled: Boolean) {
         if (planB == enabled) return
         planB = enabled
+        arrowAnimation?.cancel()
+        collapsed = null
+        if (enabled) contentDescription = "收起置顶聊天"
         animate().cancel()
         visibilityTarget = false
         alpha = 0f
+        scaleX = 1f
+        scaleY = 1f
         visibility = INVISIBLE
         effectKey = ""
         invalidate()
@@ -48,9 +88,16 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
         if (visibilityTarget) return
         visibilityTarget = true
         animate().cancel()
-        if (visibility != VISIBLE) alpha = 0f
+        if (visibility != VISIBLE) {
+            alpha = 0f
+            if (planB) {
+                scaleX = 0f
+                scaleY = 0f
+            }
+        }
         visibility = VISIBLE
-        animate().alpha(1f).setDuration(if (planB) 240L else 180L).withEndAction(null).start()
+        animate().alpha(1f).scaleX(1f).scaleY(1f)
+            .setInterpolator(if (planB) planBInterpolator else android.view.animation.AccelerateDecelerateInterpolator()).setDuration(if (planB) 240L else 180L).withEndAction(null).start()
     }
 
     fun hideAnimated() {
@@ -59,7 +106,11 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
         visibilityTarget = false
         animate().cancel()
         // View alpha includes the shadow padding and highlight, not just fill.
-        animate().alpha(0f).setDuration(if (planB) 240L else 160L).withEndAction {
+        val exit = animate().alpha(0f).setDuration(if (planB) 240L else 160L)
+        if (planB) {
+            exit.scaleX(0f).scaleY(0f).setInterpolator(planBInterpolator)
+        }
+        exit.withEndAction {
             if (!visibilityTarget) {
                 visibility = GONE
                 PostureGlass.track(this, false)
@@ -69,6 +120,9 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
 
     override fun onDetachedFromWindow() {
         animate().cancel()
+        arrowAnimation?.cancel()
+        backdropInputs.clear()
+        node.discardDisplayList()
         visibilityTarget = false
         visibility = GONE
         alpha = 0f
@@ -76,10 +130,14 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
         super.onDetachedFromWindow()
     }
 
-    fun configure(host: GlassHostLayout, bar: ViewGroup) {
+    fun configure(host: GlassHostLayout, bar: ViewGroup?) {
         val changedSource = glass.get() !== host || scene.get() !== host.parent
-        glass = WeakReference(host)
-        scene = WeakReference(host.parent as? View)
+        if (changedSource) {
+            glass = WeakReference(host)
+            scene = WeakReference(host.parent as? View)
+            invalidate()
+        }
+        if (bar == null) return
         val labels = ArrayList<String>()
         fun collect(view: View) {
             if (view.visibility != VISIBLE) return
@@ -126,28 +184,35 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
             val sourceNode = nodeField.get(source) as? RenderNode
             if (source !== parent && sourceNode?.hasDisplayList() == true) {
                 val blur = cfg.blurRadius * d
-                val pad = NativeBackdropBlur.padding(blur, 24f * d)
+                val pad = NativeBackdropBlur.padding(blur, 24f * d * cfg.refractionPaddingScale)
                 val w = (width + pad * 2).toInt()
                 val h = (height + pad * 2).toInt()
-                val location = IntArray(2).also(::getLocationInWindow)
-                location[0] += inset
-                location[1] += inset
-                val origin = IntArray(2).also(source::getLocationInWindow)
-                node.setPosition(0, 0, w, h)
-                val recording = node.beginRecording(w, h)
-                try {
-                    recording.drawColor(if (dark) Color.rgb(24, 24, 24) else Color.WHITE)
-                    recording.translate(pad + origin[0] - location[0] - source.left,
-                        pad + origin[1] - location[1] - source.top)
-                    recording.drawRenderNode(sourceNode)
-                } finally { node.endRecording() }
-                val key = "$width:$height:$blur:${cfg.liquidGlassEnabled}"
+                getLocationInWindow(backdropPosition)
+                source.getLocationInWindow(backdropOrigin)
+                val x = pad + backdropOrigin[0] - backdropPosition[0] - inset - source.left
+                val y = pad + backdropOrigin[1] - backdropPosition[1] - inset - source.top
+                backdropInputs.set(0, w.toFloat())
+                backdropInputs.set(1, h.toFloat())
+                backdropInputs.set(2, x)
+                backdropInputs.set(3, y)
+                backdropInputs.set(4, if (dark) 1f else 0f)
+                if (!node.hasDisplayList() || !backdropInputs.matches(sourceNode)) {
+                    node.setPosition(0, 0, w, h)
+                    val recording = node.beginRecording(w, h)
+                    try {
+                        recording.drawColor(if (dark) Color.rgb(24, 24, 24) else Color.WHITE)
+                        recording.translate(x, y)
+                        recording.drawRenderNode(sourceNode)
+                    } finally { node.endRecording() }
+                    backdropInputs.commit(sourceNode)
+                }
+                val key = "$width:$height:$blur:${cfg.liquidGlassEnabled}:${cfg.refractionStrength}"
                 if (effectKey != key) {
                     lens.setFloatUniform("size", width.toFloat(), height.toFloat())
                     lens.setFloatUniform("offset", -pad, -pad)
                     lens.setFloatUniform("cornerRadii", FloatArray(4) { height / 2f })
                     lens.setFloatUniform("refractionHeight", 12f * d)
-                    lens.setFloatUniform("refractionAmount", -24f * d)
+                    lens.setFloatUniform("refractionAmount", -24f * d * cfg.refractionScale)
                     lens.setFloatUniform("depthEffect", 0f)
                     val blurEffect = NativeBackdropBlur.effect(blur)
                     node.setRenderEffect(if (cfg.liquidGlassEnabled) RenderEffect.createChainEffect(
@@ -169,7 +234,7 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
         canvas.drawPath(shape, ink)
         if (isPressed) { ink.color = Color.argb(24, 127, 127, 127); canvas.drawPath(shape, ink) }
         canvas.restoreToCount(save)
-        if (cfg.liquidGlassEnabled && cfg.outlineEnabled) host.drawAccessoryPanelHighlight(canvas, rect, height / 2f)
+        if (cfg.liquidGlassEnabled && cfg.outlineEnabled) host.drawAccessoryPanelHighlight(canvas, rect, height / 2f, shape)
         if (planB) {
             ink.style = Paint.Style.STROKE
             ink.color = Color.WHITE
@@ -183,7 +248,10 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
                 lineTo(cx, cy - 4f * d)
                 lineTo(cx + 7f * d, cy + 3f * d)
             }
+            val arrowSave = canvas.save()
+            canvas.rotate(arrowRotation, cx, cy)
             canvas.drawPath(arrow, ink)
+            canvas.restoreToCount(arrowSave)
             ink.style = Paint.Style.FILL
             canvas.restoreToCount(frameSave)
             return
@@ -213,6 +281,11 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
 
     override fun performClick(): Boolean {
         if (!isEnabled) return false
+        if (planB) {
+            if (togglePinnedChats?.invoke() != true) return false
+            super.performClick()
+            return true
+        }
         val target = clickTarget?.takeIf { it.isAttachedToWindow && it.isEnabled } ?: return false
         super.performClick()
         beforeClick?.invoke()
@@ -220,6 +293,8 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
     }
 
     companion object {
+        val planBInterpolator = android.view.animation.PathInterpolator(0.4f, 0f, 0.6f, 1f)
+
     fun findClickTarget(bar: View): View? {
 
         var current: View? = bar
@@ -292,6 +367,15 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
                 if (event.x < inset || event.y < inset ||
                     event.x >= width - inset || event.y >= height - inset) return false
 
+                if (planB) {
+                    pressedPlanB = isEnabled && togglePinnedChats != null
+                    downX = event.x
+                    downY = event.y
+                    moved = false
+                    isPressed = pressedPlanB
+                    return pressedPlanB
+                }
+
                 activeClickTarget = clickTarget?.takeIf {
 
                     it.isAttachedToWindow && it.visibility == View.VISIBLE && it.isEnabled
@@ -322,11 +406,17 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
 
                 }
 
-                return activeClickTarget != null
+                return pressedPlanB || activeClickTarget != null
 
             }
 
             MotionEvent.ACTION_UP -> {
+                if (pressedPlanB) {
+                    pressedPlanB = false
+                    isPressed = false
+                    if (!moved) performClick()
+                    return true
+                }
 
                 val target = activeClickTarget
 
@@ -356,7 +446,8 @@ internal class WeChatFoldTouchProxy(context: Context) : View(context) {
 
             MotionEvent.ACTION_CANCEL -> {
 
-                val handled = activeClickTarget != null
+                val handled = pressedPlanB || activeClickTarget != null
+                pressedPlanB = false
 
                 isPressed = false
 

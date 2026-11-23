@@ -1,4 +1,5 @@
 package io.github.offlineglass.ui
+
 import io.github.offlineglass.ui.ManagerFeedbackMaterialSwitch as Switch
 
 import androidx.activity.compose.BackHandler
@@ -155,6 +156,8 @@ fun MaterialManager(
                 liquidGlassEnabled = settings.liquidGlassEnabled,
                 solidBarEnabled = settings.solidBarEnabled,
                 postureEffectsEnabled = settings.glass.postureEffectsEnabled,
+                indicatorInteractionLightEnabled = settings.glass.indicatorInteractionLightEnabled,
+                simplifyTabSwitch = settings.glass.simplifyTabSwitch,
                 outlineEnabled = settings.outlineEnabled,
                 blurRadius = previewGlass.blurRadius,
                 cornerRadiusPercent = previewGlass.cornerRadiusPercent,
@@ -164,6 +167,7 @@ fun MaterialManager(
                 lightAlpha = previewGlass.lightAlpha,
                 darkAlpha = previewGlass.darkAlpha,
                 classicNavigation = previewGlass.classicNavigation,
+                iconOnly = previewGlass.bottomBarIconOnly,
             )
             }
         },
@@ -533,7 +537,8 @@ private fun MaterialAppEntries(
 ) {
     val labels = if (target.key == "spotify") emptyList() else entryLabels(target.key, settings)
     val config = settings.appConfigs[target.packageName] ?: settings.glass
-    val enabledCount = labels.indices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
+    val toggleIndices = labels.indices.filter { labels[it].isNotBlank() }
+    val enabledCount = toggleIndices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
@@ -552,7 +557,7 @@ private fun MaterialAppEntries(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        items(labels.indices.toList()) { index ->
+        items(toggleIndices) { index ->
             val enabled = config.hiddenMask and (1 shl index) == 0
             Card(shape = MaterialTheme.shapes.extraLarge) {
                 ListItem(
@@ -570,7 +575,8 @@ private fun MaterialAppEntries(
                                 } else {
                                     config.hiddenMask or (1 shl index)
                                 }
-                                actions.setAppConfig(target.packageName, config.copy(hiddenMask = mask))
+                                actions.setAppConfig(target.packageName, if (target.key == "youtube") config.withEntryVisibilityMask(target.key, mask)
+                                    else config.copy(hiddenMask = mask))
                             },
                         )
                     },
@@ -648,9 +654,11 @@ private fun MaterialTikTokTopChannels(target: TargetSpec, settings: ManagerSetti
 @Composable
 private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, padding: PaddingValues, actions: UiActions,
     onTopChannels: () -> Unit) {
+    val context = LocalContext.current
     val config = settings.appConfigs[target.packageName] ?: settings.glass
     val labels = if (target.key == "spotify") emptyList() else entryLabels(target.key, settings)
-    val enabledCount = labels.indices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
+    val toggleIndices = labels.indices.filter { labels[it].isNotBlank() }
+    val enabledCount = toggleIndices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
     LazyColumn(
         contentPadding = PaddingValues(
             start = 16.dp, end = 16.dp,
@@ -710,8 +718,10 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                     MaterialSwitchRow("液态玻璃顶栏", "保留原生频道和点击操作，使用胶囊顶栏与完整频道菜单。", config.tiktokTopBar) {
                         actions.setAppConfig(target.packageName, config.copy(tiktokTopBar = it))
                     }
-                    MaterialSwitchRow("发布键独立到右侧", "四个页面在左，无底色的液态玻璃发布键独立在右；左右屏幕边距不变。", config.detachedPublish) {
-                        actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
+                    if (config.hiddenMask and (1 shl 2) == 0) {
+                        MaterialSwitchRow("发布键独立到右侧", "四个页面在左，无底色的液态玻璃发布键独立在右；左右屏幕边距不变。", config.detachedPublish) {
+                            actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
+                        }
                     }
                     MaterialSwitchRow("竖屏视频上下铺满（实验）", "对 9:16 及更修长的视频等比缩放至屏幕上下边界，可能裁切左右；关闭恢复完整居中。切换后重新进入视频生效。", config.tiktokTallVideoFill) {
                         actions.setAppConfig(target.packageName, config.copy(tiktokTallVideoFill = it))
@@ -725,8 +735,10 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                     MaterialSwitchRow("液态玻璃顶栏", "四个频道使用胶囊顶栏，其他频道从更多菜单进入；关闭恢复原生顶栏。", config.douyinTopBar) {
                         actions.setAppConfig(target.packageName, config.copy(douyinTopBar = it))
                     }
-                    MaterialSwitchRow("发布键独立到右侧", "关闭使用原布局；开启后四个页面在左，发布键独立在右，整体左右边距不变。", config.detachedPublish) {
-                        actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
+                    if (config.hiddenMask and (1 shl 2) == 0) {
+                        MaterialSwitchRow("发布键独立到右侧", "关闭使用原布局；开启后四个页面在左，发布键独立在右，整体左右边距不变。", config.detachedPublish) {
+                            actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
+                        }
                     }
                 }
             }
@@ -736,6 +748,9 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                 Card(shape = MaterialTheme.shapes.extraLarge) {
                     MaterialSwitchRow("重构顶栏", "关闭后恢复 Bilibili 原生首页顶栏；底栏仍由应用列表中的开关控制。", config.bilibiliTopBar) {
                         actions.setAppConfig(target.packageName, config.copy(bilibiliTopBar = it))
+                    }
+                    MaterialSwitchRow("取消首页信息流左右边距", "让双列卡片和通栏视频卡片贴近屏幕两侧，保留两列之间的间距。", config.bilibiliEdgeToEdgeFeed) {
+                        actions.setAppConfig(target.packageName, config.copy(bilibiliEdgeToEdgeFeed = it))
                     }
                 }
             }
@@ -759,6 +774,22 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
         if (target.key == "bilibili") {
             item {
                 Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.extraLarge) {
+                    val searchBlocked = config.hiddenMask and 31 == 0
+                    val notifySearchBlocked = {
+                        android.widget.Toast.makeText(context, "请至少关闭一个页面开关", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    Box(Modifier.fillMaxWidth()) {
+                        MaterialSwitchRow("独立搜索键", "将首页搜索栏改为底栏右侧的独立液态搜索键，开启时自动关闭独立发布键。",
+                            config.bilibiliDetachedSearch, enabled = !searchBlocked) { checked ->
+                            if (checked && searchBlocked) notifySearchBlocked()
+                            else actions.setAppConfig(target.packageName, config.copy(
+                                    bilibiliDetachedSearch = checked,
+                                    detachedPublish = if (checked) false else config.detachedPublish,
+                                ))
+                        }
+                        if (searchBlocked) Box(Modifier.matchParentSize().clickable(
+                            onClickLabel = "请至少关闭一个页面开关", onClick = notifySearchBlocked))
+                    }
                     MaterialSwitchRow("播放页状态栏氛围背景", "以低频画面取样生成柔和模糊背景，保留系统状态栏图标；默认关闭。", config.bilibiliVideoAmbient) {
                         actions.setAppConfig(target.packageName, config.copy(bilibiliVideoAmbient = it))
                     }
@@ -770,6 +801,9 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                 Card(shape = MaterialTheme.shapes.extraLarge) {
                     MaterialSwitchRow("重构顶栏", "关闭后恢复小红书原生首页顶栏；底栏仍由应用列表中的开关控制。", config.xhsTopBar) {
                         actions.setAppConfig(target.packageName, config.copy(xhsTopBar = it))
+                    }
+                    MaterialSwitchRow("取消首页信息流左右边距", "让关注、发现、同城的信息流贴近屏幕两侧，保留列间距。", config.xhsEdgeToEdgeFeed) {
+                        actions.setAppConfig(target.packageName, config.copy(xhsEdgeToEdgeFeed = it))
                     }
                 }
             }
@@ -783,24 +817,31 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                 }
             }
         }
-        if (target.key == "youtube") {
+        if (target.key == "youtube" && config.isYouTubeCreateVisible()) {
             item {
                 Card(shape = MaterialTheme.shapes.extraLarge) {
-                    MaterialSwitchRow("重构顶栏", "关闭后恢复 YouTube 原生首页顶栏；底栏仍由应用列表中的开关控制。", config.youtubeTopBar) {
-                        actions.setAppConfig(target.packageName, config.copy(youtubeTopBar = it))
+                    MaterialSwitchRow("独立创作键", "开启后将创作入口放在底栏右侧的独立圆形按钮。", config.detachedPublish) {
+                        actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
                     }
                 }
             }
         }
-        if (target.key == "bilibili" || target.key == "xhs" || target.key == "zhihu" || target.key == "xianyu") {
+        if (((target.key == "bilibili" || target.key == "xhs" || target.key == "zhihu") &&
+            config.hiddenMask and (1 shl 2) == 0) ||
+            (target.key == "xianyu" && config.hiddenMask and (1 shl 2) == 0) ||
+            (target.key == "tieba" && config.isTiebaPublishVisible())) {
             item {
                 Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.extraLarge) {
                     MaterialSwitchRow(if (target.key == "xianyu") "独立拍照键" else "独立发布键",
                         if (target.key == "xianyu") "开启后四个页面在左，黄色液态玻璃拍照键独立在右，底色跟随底栏透明度设置。"
                         else if (target.key == "zhihu") "开启后四个页面在左，半透明蓝色发布键独立在右，两部分分别绘制阴影。"
                         else if (target.key == "xhs") "开启后四个页面在左，红色发布键独立在右，两部分分别绘制阴影。"
-                        else "开启后四个页面在左，粉色发布键独立在右，整体左右边距不变。", config.detachedPublish) {
-                        actions.setAppConfig(target.packageName, config.copy(detachedPublish = it))
+                        else if (target.key == "tieba") "开启后四个页面在左，蓝色发布键独立在右，整体左右边距不变。"
+                        else "开启后四个页面在左，粉色发布键独立在右，整体左右边距不变。", config.detachedPublish) { checked ->
+                        actions.setAppConfig(target.packageName, config.copy(
+                            detachedPublish = checked,
+                            bilibiliDetachedSearch = if (target.key == "bilibili" && checked) false else config.bilibiliDetachedSearch,
+                        ))
                     }
                 }
             }
@@ -897,7 +938,7 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
             item { Text("底栏入口", style = MaterialTheme.typography.titleLargeEmphasized) }
             item {
                 Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.extraLarge) {
-                    labels.indices.filterNot { it in target.automaticEntryIndices }.forEach { index ->
+                    toggleIndices.filterNot { it in target.automaticEntryIndices }.forEach { index ->
                     val enabled = config.hiddenMask and (1 shl index) == 0
                     ListItem(
                         headlineContent = { Text(labels[index]) },
@@ -911,7 +952,7 @@ private fun MaterialAppOverride(target: TargetSpec, settings: ManagerSettings, p
                                 onCheckedChange = { checked ->
                                     val mask = if (checked) config.hiddenMask and (1 shl index).inv()
                                     else config.hiddenMask or (1 shl index)
-                                    actions.setAppConfig(target.packageName, config.copy(hiddenMask = mask))
+                                    actions.setAppConfig(target.packageName, config.withEntryVisibilityMask(target.key, mask))
                                 },
                             )
                         },
@@ -1040,11 +1081,12 @@ private fun MaterialSwitchCard(title: String, summary: String, checked: Boolean,
 }
 
 @Composable
-private fun MaterialSwitchRow(title: String, summary: String, checked: Boolean, onChecked: (Boolean) -> Unit) {
+private fun MaterialSwitchRow(title: String, summary: String, checked: Boolean,
+    enabled: Boolean = true, onChecked: (Boolean) -> Unit) {
     ListItem(
         headlineContent = { Text(title) },
         supportingContent = { Text(summary) },
-        trailingContent = { Switch(checked, onChecked) },
+        trailingContent = { Switch(checked, onChecked, enabled = enabled) },
     )
 }
 
@@ -1059,6 +1101,7 @@ private fun MaterialEffectSlider(
     valueSuffix: String = "",
     detents: List<SliderDetent> = emptyList(),
     onPreview: (Float) -> Unit = {},
+    valueFormatter: ((Float) -> String)? = null,
     onChange: (Float) -> Unit,
 ) {
     ExcludeControlCardTilt()
@@ -1085,7 +1128,7 @@ private fun MaterialEffectSlider(
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(title, style = MaterialTheme.typography.titleMedium)
             Text(
-                if (valueSuffix.isEmpty()) "${"%.1f".format(localValue)}" else "${localValue.toInt()}$valueSuffix",
+                valueFormatter?.invoke(localValue) ?: if (valueSuffix.isEmpty()) "${"%.1f".format(localValue)}" else "${localValue.toInt()}$valueSuffix",
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
             )
@@ -1173,10 +1216,28 @@ private fun MaterialSettings(settings: ManagerSettings, padding: PaddingValues, 
                         onChecked = { actions.setGlassConfig(settings.glass.copy(postureEffectsEnabled = it)) },
                     )
                     MaterialSwitchRow(
+                        title = "简化切页动画",
+                        summary = "开启时滑块保持原尺寸平移并保留折射；关闭后恢复放大。冷切页等待不变。",
+                        checked = settings.glass.simplifyTabSwitch,
+                        onChecked = { actions.setGlassConfig(settings.glass.copy(simplifyTabSwitch = it)) },
+                    )
+                    MaterialSwitchRow(
+                        title = "滑块照亮效果",
+                        summary = "关闭后取消底栏滑块交互时的照亮和阴影。",
+                        checked = settings.glass.indicatorInteractionLightEnabled,
+                        onChecked = { actions.setGlassConfig(settings.glass.copy(indicatorInteractionLightEnabled = it)) },
+                    )
+                    MaterialSwitchRow(
                         title = "描边",
                         summary = "控制纯模糊/纯色底栏的反色描边，以及液态底栏的高光描边。",
                         checked = settings.outlineEnabled,
                         onChecked = actions.setOutlineEnabled,
+                    )
+                    MaterialSwitchRow(
+                        title = "底栏无字模式",
+                        summary = "有图标和文字的底栏只显示图标，并垂直居中。",
+                        checked = settings.glass.bottomBarIconOnly,
+                        onChecked = { actions.setGlassConfig(settings.glass.copy(bottomBarIconOnly = it)) },
                     )
                     MaterialSwitchRow(
                         title = "使用经典导航键",
@@ -1184,7 +1245,7 @@ private fun MaterialSettings(settings: ManagerSettings, padding: PaddingValues, 
                         checked = settings.glass.classicNavigation,
                         onChecked = { actions.setGlassConfig(settings.glass.copy(classicNavigation = it)) },
                     )
-                    MaterialSwitchRow("动态配色", "从系统壁纸提取颜色。", settings.dynamicColor, actions.setDynamicColor)
+                    MaterialSwitchRow("动态配色", "从系统壁纸提取颜色。", settings.dynamicColor, onChecked = actions.setDynamicColor)
                 }
             }
         }
@@ -1213,11 +1274,19 @@ private fun MaterialSettings(settings: ManagerSettings, padding: PaddingValues, 
                         onChange = { actions.setGlassConfig(settings.glass.copy(flowVerticalStrength = it)) },
                     )
                     }
+                    if (settings.liquidGlassEnabled && !settings.solidBarEnabled) {
+                        MaterialEffectSlider(
+                            title = "折射强度\n默认 120% · 100% 原有强度 · 最高 200% · 不影响桌面",
+                            value = settings.glass.refractionStrength,
+                            range = 0f..200f, valueSuffix = "%", hapticTriggerValue = GlassConfig.DEFAULT_REFRACTION_STRENGTH,
+                            onChange = { actions.setGlassConfig(settings.glass.copy(refractionStrength = it)) },
+                        )
+                    }
                     if (!settings.solidBarEnabled) {
                         MaterialEffectSlider(
                             title = "底色透明度\n深浅色统一 · 100% 为完全透明",
                             value = (1f - settings.glass.lightAlpha) * 100f,
-                            range = 20f..100f, valueSuffix = "%", hapticTriggerValue = 100f,
+                            range = 20f..100f, valueSuffix = "%", hapticTriggerValue = GlassConfig.DEFAULT_BAR_TRANSPARENCY_PERCENT,
                             onChange = { actions.setGlassConfig(settings.glass.copy(
                                 lightAlpha = 1f - it / 100f, darkAlpha = 1f - it / 100f)) },
                         )
@@ -1225,7 +1294,7 @@ private fun MaterialSettings(settings: ManagerSettings, padding: PaddingValues, 
                             title = "模糊半径\n默认 0.0",
                             value = settings.glass.blurRadius,
                             range = 0f..16f,
-                            hapticTriggerValue = 0f,
+                            hapticTriggerValue = GlassConfig.DEFAULT_BLUR_RADIUS,
                             onChange = {
                                 actions.setGlassConfig(settings.glass.copy(blurRadius = it))
                             },
@@ -1235,20 +1304,26 @@ private fun MaterialSettings(settings: ManagerSettings, padding: PaddingValues, 
                         title = "底栏高度\n50–64 dp",
                         value = settings.glass.barHeight,
                         range = GlassConfig.MIN_BAR_HEIGHT..GlassConfig.MAX_BAR_HEIGHT,
-                        hapticTriggerValue = 50f,
+                        hapticTriggerValue = GlassConfig.DEFAULT_BAR_HEIGHT,
                         onChange = {
                             actions.setGlassConfig(settings.glass.copy(barHeight = it))
                         },
                     )
                     if (!settings.solidBarEnabled) {
                         MaterialEffectSlider(
-                            title = "深色模式高光描边强度\n仅调整底栏外框 · 默认 50%",
+                            title = "高光描边强度\n适用于深浅色液态玻璃控件 · 默认 60%",
                             value = settings.glass.darkBarHighlightStrength * 100f,
-                            range = 50f..170f,
-                            hapticTriggerValue = 50f,
+                            range = 0f..170f,
+                            hapticTriggerValue = GlassConfig.DEFAULT_HIGHLIGHT_STRENGTH_PERCENT,
                             onChange = {
                                 actions.setGlassConfig(settings.glass.copy(darkBarHighlightStrength = it / 100f))
                             },
+                        )
+                        if (settings.liquidGlassEnabled) MaterialEffectSlider(
+                            title = "高光透明度\n深浅色同时生效 · 默认 45% · 100% 隐藏高光",
+                            value = settings.glass.highlightTransparency * 100f,
+                            range = 0f..100f, valueSuffix = "%", hapticTriggerValue = GlassConfig.DEFAULT_HIGHLIGHT_TRANSPARENCY_PERCENT,
+                            onChange = { actions.setGlassConfig(settings.glass.copy(highlightTransparency = it / 100f)) },
                         )
                     }
                 }
@@ -1256,4 +1331,5 @@ private fun MaterialSettings(settings: ManagerSettings, padding: PaddingValues, 
         }
     }
 }
+
 

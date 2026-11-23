@@ -20,10 +20,11 @@ public final class XhsNativeContract {
         final List<Ref> calls=new ArrayList<>();
         final List<Field> reads=new ArrayList<>(),writes=new ArrayList<>();
         final List<Field> titled=new ArrayList<>();
+        final Map<String, List<Field>> labelledReads=new HashMap<>();
         Body(Ref ref,int flags){this.ref=ref;this.flags=flags;}
     }
     public static Properties resolve(String[] paths,String cachePath) throws IOException {
-        StringBuilder identity=new StringBuilder("xhs-contract-3");
+        StringBuilder identity=new StringBuilder("xhs-contract-6");
         for(String path:paths){File f=new File(path);identity.append('|').append(path).append(':').append(f.length()).append(':').append(f.lastModified());}
         Properties p=new Properties(); File cache=new File(cachePath);
         if(cache.isFile())try(InputStream in=new FileInputStream(cache)){
@@ -102,6 +103,7 @@ public final class XhsNativeContract {
         role(p,"channelTitle",all.stream().filter(b->b.ref.owner.startsWith("Lcom/xingin/matrix/widgets/NewTabLayout$")&&
             b.ref.name.equals("toString")&&b.strings.contains("ItemBean(title="))
             .flatMap(b->b.titled.stream()).map(Field::key).toList());
+        XhsImageSaveContract.bind(all,p);
     }
     static final class Dex {
         final byte[] b; final Map<Integer,String> text=new HashMap<>();
@@ -128,9 +130,10 @@ public final class XhsNativeContract {
                         owner.equals("Lcom/xingin/xhs/homepage/container/home/IndexHomeFragment;")||owner.endsWith("/LottieAnimationView;")||
                         owner.startsWith("Lcom/xingin/matrix/widgets/NewTabLayout$")||owner.equals("Lcom/xingin/xhs/homepage/explorefeed/category/panel/widgets/MaxHeightFrameLayout;");
                     boolean cold=r.args.isEmpty()||r.args.contains(AD)||(r.args.size()==3&&r.args.subList(1,3).equals(List.of("Lkotlin/jvm/functions/Function1;","Lkotlin/jvm/functions/Function1;")));
-                    if(!known&&!cold)continue;
+                    boolean imageSave=XhsImageSaveContract.inspect(r);
+                    if(!known&&!cold&&!imageSave)continue;
                     Body body=inspect(r,flags,code);
-                    if(known||r.args.contains(AD)||body.strings.contains("no splash ad")||body.strings.stream().anyMatch(t->t.startsWith("splashLoadError -> use CountdownLatch"))||
+                    if(known||XhsImageSaveContract.retain(body)||r.args.contains(AD)||body.strings.contains("no splash ad")||body.strings.stream().anyMatch(t->t.startsWith("splashLoadError -> use CountdownLatch"))||
                         (r.args.isEmpty()&&body.calls.stream().anyMatch(c->c.owner.equals("Lkotlin/Lazy;")&&c.name.equals("getValue"))))output.add(body);
                 }}
             }
@@ -139,14 +142,17 @@ public final class XhsNativeContract {
             Body body=new Body(r,flags);int count=u4(code+12),start=code+16;
             if(count<0||(long)start+count*2L>b.length)throw new IOException("DEX code bounds");
             boolean titlePending=false;
+            String imageLabel=null;
             for(int pos=0;pos<count;){int word=u2(start+pos*2),op=word&255,w=width(op);
                 if(op==0&&word!=0){if(word==0x100)w=4+u2(start+(pos+1)*2)*2;else if(word==0x200)w=2+u2(start+(pos+1)*2)*4;else if(word==0x300)w=4+(int)(((long)u2(start+(pos+1)*2)*Integer.toUnsignedLong(u4(start+(pos+2)*2))+1)/2);else throw new IOException("DEX payload");}
                 if(w<1||pos+w>count)throw new IOException("DEX instruction");
-                if(op==0x1a||op==0x1b){String value=str(op==0x1a?u2(start+(pos+1)*2):u4(start+(pos+1)*2));body.strings.add(value);if(value.equals("ItemBean(title="))titlePending=true;}
+                if(op==0x1a||op==0x1b){String value=str(op==0x1a?u2(start+(pos+1)*2):u4(start+(pos+1)*2));body.strings.add(value);if(value.equals("ItemBean(title="))titlePending=true;
+                    if(XhsImageSaveContract.isActionLabel(value))imageLabel=value;}
                 if((op>=0x6e&&op<=0x72)||(op>=0x74&&op<=0x78))body.calls.add(ref(u2(start+(pos+1)*2)));
                 if((op>=0x52&&op<=0x58)||(op>=0x60&&op<=0x66)){
                     Field f=field(u2(start+(pos+1)*2));body.reads.add(f);
                     if(titlePending&&f.owner.equals(r.owner)&&f.type.equals("Ljava/lang/String;")){body.titled.add(f);titlePending=false;}
+                    if(imageLabel!=null&&f.owner.equals(r.owner)){body.labelledReads.computeIfAbsent(imageLabel,key->new ArrayList<>()).add(f);imageLabel=null;}
                 }
                 if((op>=0x59&&op<=0x5f)||(op>=0x67&&op<=0x6d))body.writes.add(field(u2(start+(pos+1)*2)));
                 pos+=w;

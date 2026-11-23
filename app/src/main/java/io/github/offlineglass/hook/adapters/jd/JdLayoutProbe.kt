@@ -51,8 +51,7 @@ internal class JdLayoutProbe(
             }
             checkout.syncPageVisibility(-1)
             if (now - lastLayoutDetect < 80L) return@OnGlobalLayoutListener
-            if ((checkout.discoveryExhausted || now < checkout.nextFindAt) &&
-                now < flash.nextFindAt) return@OnGlobalLayoutListener
+            if (now < flash.nextFindAt) return@OnGlobalLayoutListener
             lastLayoutDetect = now
             if (selectedIndex() == 0 && !newProductsActive() && now >= flash.nextFindAt &&
                 (!flashBannerLive || !flashCartLive)

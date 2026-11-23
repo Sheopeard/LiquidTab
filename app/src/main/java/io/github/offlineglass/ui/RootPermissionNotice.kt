@@ -64,6 +64,7 @@ private suspend fun rootStatus(): String? = withContext(Dispatchers.IO) {
 @Composable
 internal fun RootPermissionNotice(backdrop: Backdrop, dark: Boolean, blurRadius: Float,
     suppressed: Boolean = false,
+    highlightStrength: Float = .5f,
     onVisibilityChange: (Boolean) -> Unit = {}) {
     var attempt by remember { mutableIntStateOf(0) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -104,7 +105,8 @@ internal fun RootPermissionNotice(backdrop: Backdrop, dark: Boolean, blurRadius:
     val dismiss = { message = null }
     ManagerGlassDialog(backdrop, dark, blurRadius, "请授予 Root 权限", body,
         "稍后", if (checking) "检测中…" else "重新检测",
-        dismiss, { attempt++ }, confirmEnabled = !checking, accessibilityTitle = "Root 授权提醒")
+        dismiss, { attempt++ }, confirmEnabled = !checking, accessibilityTitle = "Root 授权提醒",
+        highlightStrength = highlightStrength)
 }
 
 @Composable
@@ -112,11 +114,13 @@ internal fun ManagerGlassDialog(
     backdrop: Backdrop, dark: Boolean, blurRadius: Float, title: String, body: String,
     cancelLabel: String, confirmLabel: String, onDismiss: () -> Unit, onConfirm: () -> Unit,
     confirmEnabled: Boolean = true, accessibilityTitle: String = title,
+    highlightStrength: Float = .5f,
 ) {
     BackHandler(onBack = onDismiss)
     val localizedTitle = managerText(accessibilityTitle)
     val ink = if (dark) Color.White else Color.Black
     val shape = BottomBarSquircleShape(CornerSize(48.dp), -1f)
+    val dialogEdge = remember { ManagerGlassEdge() }
     val container = if (dark) Color(0xFF121212).copy(alpha = 0.4f) else Color(0xFFFAFAFA).copy(alpha = 0.6f)
     val accent = if (dark) Color(0xFF0091FF) else Color(0xFF0088FF)
     // Same-window modal: avoids the cross-window backdrop coordinate mismatch.
@@ -135,8 +139,8 @@ internal fun ManagerGlassDialog(
                 managerLens(24.dp.toPx(), 48.dp.toPx(), depthEffect = true)
             }, highlight = { iosIndicatorSpecular.copy(alpha = 0f) }, onDrawSurface = {
                 drawRect(container)
+                dialogEdge.draw(this, shape, dark, (if (dark) .30f else .40f) * 2f * highlightStrength)
             })
-            .border(1.dp, Color.White.copy(alpha = 0.05f), shape)
             .clickable {}.padding(24.dp)) {
             Text(title, color = ink, fontSize = 24.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(16.dp))
@@ -144,9 +148,10 @@ internal fun ManagerGlassDialog(
             Spacer(Modifier.height(12.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 RootGlassButton(cancelLabel, backdrop, blurRadius, Color(0xFFE5E5E5), Color(0xFF242424),
-                    Modifier.weight(1f), onClick = onDismiss)
+                    Modifier.weight(1f), highlightStrength = highlightStrength, onClick = onDismiss)
                 RootGlassButton(confirmLabel, backdrop, blurRadius,
-                    accent, Color.White, Modifier.weight(1f), enabled = confirmEnabled, onClick = onConfirm)
+                    accent, Color.White, Modifier.weight(1f), enabled = confirmEnabled,
+                    highlightStrength = highlightStrength, onClick = onConfirm)
             }
         }
     }
@@ -156,7 +161,7 @@ internal fun ManagerGlassDialog(
 @Composable
 private fun RootGlassButton(
     label: String, backdrop: Backdrop, blurRadius: Float, tint: Color, ink: Color,
-    modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit,
+    modifier: Modifier = Modifier, enabled: Boolean = true, highlightStrength: Float, onClick: () -> Unit,
 ) {
     val source = remember { MutableInteractionSource() }
     val pressed by source.collectIsPressedAsState()
@@ -164,6 +169,8 @@ private fun RootGlassButton(
         spring(dampingRatio = 0.65f, stiffness = 420f), label = "rootDialogButtonPress")
     val shape = BottomBarSquircleShape(CornerSize(24.dp), LocalIosSmoothing.current)
     val view = LocalView.current
+    val buttonEdge = remember { ManagerGlassEdge() }
+    val dark = LocalIosDark.current
     Box(modifier.height(48.dp).drawBackdrop(
         backdrop = backdrop, shape = { shape }, effects = {
             val px = blurRadius.coerceAtLeast(0f).dp.toPx()
@@ -171,7 +178,7 @@ private fun RootGlassButton(
             downscaleFactor = 1
             padding = io.github.offlineglass.rendering.NativeBackdropBlur.padding(px, padding)
             managerLens(12.dp.toPx(), 24.dp.toPx())
-        }, highlight = { iosIndicatorSpecular.copy(alpha = 0.06f + 0.10f * progress) },
+        }, highlight = { iosIndicatorSpecular.copy(alpha = 0f) },
         layerBlock = {
             val scale = 1f + (4.dp.toPx() / size.height) * progress
             scaleX = scale
@@ -181,6 +188,7 @@ private fun RootGlassButton(
             if (progress > 0.001f) drawRect(Brush.radialGradient(
                 listOf(Color.White.copy(alpha = 0.22f * progress.coerceIn(0f, 1f)), Color.Transparent),
                 Offset(size.width / 2f, size.height / 2f), size.maxDimension * 0.7f))
+            buttonEdge.draw(this, shape, dark, (.06f + .10f * progress) * 2f * highlightStrength)
         }
     ).clip(shape).clickable(interactionSource = source, indication = null,
         enabled = enabled, role = Role.Button) {

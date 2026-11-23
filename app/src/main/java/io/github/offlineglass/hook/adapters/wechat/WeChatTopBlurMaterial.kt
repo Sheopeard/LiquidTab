@@ -19,7 +19,15 @@ internal class WeChatTopBlurMaterial(
     private var source = WeakReference<View>(null)
     private var conversations = WeakReference<android.widget.ListView>(null)
     private val band = RenderNode("WeChatTopGradientBlur")
-    private var key: List<Any>? = null
+    private var sceneValid = false
+    private val nodes = ArrayList<RenderNode>()
+    private val recordedNodes = ArrayList<RenderNode>()
+    private var recordedProperties = IntArray(0)
+    private var recordedWidth = 0
+    private var recordedHeight = 0
+    private var recordedDensity = 0f
+    private var recordedX = 0
+    private var recordedY = 0
     private var cachedEffect: RenderEffect? = null
     private var effectHeight = -1f
     private var effectDensity = -1f
@@ -30,7 +38,7 @@ internal class WeChatTopBlurMaterial(
     private var failed = false
     var hideMaterial = false
     var color = color
-        set(value) { if (field != value) { field = value; key = null } }
+        set(value) { if (field != value) { field = value; sceneValid = false } }
     var enabled = false
         set(value) {
             if (field == value) return
@@ -38,15 +46,16 @@ internal class WeChatTopBlurMaterial(
             failed = false
             if (!value) {
                 band.discardDisplayList(); band.setRenderEffect(null)
-                cachedEffect = null; key = null
+                cachedEffect = null; sceneValid = false
+                nodes.clear(); recordedNodes.clear()
             }
         }
 
     fun extensionPx(density: Float): Int = ceil(bottomExtensionDp * density).toInt()
 
-    fun bind(view: View) { if (source.get() !== view) { source = WeakReference(view); key = null } }
+    fun bind(view: View) { if (source.get() !== view) { source = WeakReference(view); sceneValid = false } }
     fun bindConversations(view: android.widget.ListView) {
-        if (conversations.get() !== view) { conversations = WeakReference(view); key = null }
+        if (conversations.get() !== view) { conversations = WeakReference(view); sceneValid = false }
     }
 
     fun drawable(color: IntArray, status: Boolean): GradientDrawable = object : GradientDrawable(Orientation.TOP_BOTTOM, color) {
@@ -91,15 +100,17 @@ internal class WeChatTopBlurMaterial(
         parent.getLocationInWindow(parentPosition)
         val x = parentPosition[0] - rootPosition[0] - parent.scrollX
         val y = parentPosition[1] - rootPosition[1] - parent.scrollY
-        val nodes = if (list != null) (0 until list.childCount).mapNotNull { index ->
-            val child = list.getChildAt(index)
-            if (child.javaClass.name == "com.tencent.mm.plugin.taskbar.ui.TaskBarContainer" ||
-                child.visibility != View.VISIBLE) null
-            else (nodeField?.get(child) as? RenderNode)?.takeIf { it.hasDisplayList() }
-        } else listOfNotNull((nodeField?.get(source) as? RenderNode)?.takeIf { it.hasDisplayList() })
-        val next = listOf(width, height, density, x, y, nodes,
-            nodes.map { listOf(it.left, it.top, it.right, it.bottom, it.translationX, it.translationY, it.alpha) })
-        if (key != next || !band.hasDisplayList()) {
+        nodes.clear()
+        if (list != null) {
+            for (index in 0 until list.childCount) {
+                val child = list.getChildAt(index)
+                if (child.visibility == View.VISIBLE &&
+                    child.javaClass.name != "com.tencent.mm.plugin.taskbar.ui.TaskBarContainer") addNode(child)
+            }
+        } else addNode(source)
+        val changed = !sceneValid || recordedWidth != width || recordedHeight != height ||
+            recordedDensity != density || recordedX != x || recordedY != y || !matchesRecordedNodes()
+        if (changed || !band.hasDisplayList()) {
             val padding = ceil(96f * blurRadiusScale * density * SCALE).toInt()
             val w = ceil(width * SCALE).toInt()
             val h = ceil(height * SCALE).toInt() + padding * 2
@@ -112,8 +123,8 @@ internal class WeChatTopBlurMaterial(
             if (cachedEffect == null || effectHeight != scaledHeight || effectDensity != scaledDensity) {
                 cachedEffect = effect(scaledHeight, scaledDensity, padding.toFloat())
                 effectHeight = scaledHeight; effectDensity = scaledDensity
+                band.setRenderEffect(cachedEffect)
             }
-            band.setRenderEffect(cachedEffect)
             val recording = band.beginRecording(w, h)
             recording.drawColor(color)
             recording.translate(0f, padding.toFloat())
@@ -122,7 +133,13 @@ internal class WeChatTopBlurMaterial(
             recording.translate(x.toFloat(), y.toFloat())
             nodes.forEach(recording::drawRenderNode)
             band.endRecording()
-            key = next
+            recordedWidth = width
+            recordedHeight = height
+            recordedDensity = density
+            recordedX = x
+            recordedY = y
+            recordNodeProperties()
+            sceneValid = true
         }
         val saved = canvas.save()
         if (!status) canvas.translate(-left.toFloat(), -top.toFloat())
@@ -130,6 +147,45 @@ internal class WeChatTopBlurMaterial(
         canvas.translate(0f, -ceil(96f * blurRadiusScale * density * SCALE).toFloat())
         canvas.drawRenderNode(band)
         canvas.restoreToCount(saved)
+    }
+
+    private fun addNode(view: View) {
+        val node = nodeField?.get(view) as? RenderNode ?: return
+        if (node.hasDisplayList()) nodes.add(node)
+    }
+
+    private fun matchesRecordedNodes(): Boolean {
+        if (recordedNodes.size != nodes.size) return false
+        for (index in nodes.indices) {
+            val node = nodes[index]
+            val offset = index * 7
+            if (recordedNodes[index] !== node ||
+                recordedProperties[offset] != node.left ||
+                recordedProperties[offset + 1] != node.top ||
+                recordedProperties[offset + 2] != node.right ||
+                recordedProperties[offset + 3] != node.bottom ||
+                recordedProperties[offset + 4] != node.translationX.toBits() ||
+                recordedProperties[offset + 5] != node.translationY.toBits() ||
+                recordedProperties[offset + 6] != node.alpha.toBits()) return false
+        }
+        return true
+    }
+
+    private fun recordNodeProperties() {
+        recordedNodes.clear()
+        recordedNodes.addAll(nodes)
+        if (recordedProperties.size < nodes.size * 7) recordedProperties = IntArray(nodes.size * 7)
+        for (index in nodes.indices) {
+            val node = nodes[index]
+            val offset = index * 7
+            recordedProperties[offset] = node.left
+            recordedProperties[offset + 1] = node.top
+            recordedProperties[offset + 2] = node.right
+            recordedProperties[offset + 3] = node.bottom
+            recordedProperties[offset + 4] = node.translationX.toBits()
+            recordedProperties[offset + 5] = node.translationY.toBits()
+            recordedProperties[offset + 6] = node.alpha.toBits()
+        }
     }
 
     private fun effect(height: Float, density: Float, padding: Float): RenderEffect {

@@ -5,6 +5,7 @@ import android.app.Activity
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.graphics.Insets
+import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.adapters.TargetAdapter
 
@@ -22,8 +23,14 @@ internal object XhsAdapter : TargetAdapter {
         XhsTopBar.install(lpparam.classLoader)
         XhsTopNotifications.install(lpparam.classLoader)
         XhsHomeDiagnostics.install()
+        XhsHomeFeedEdges.install(lpparam.classLoader, spec.packageName)
+    }
+    override fun acceptPushedConfig(config: GlassConfig): Boolean {
+        XhsHomeFeedEdges.configChanged(config)
+        return false
     }
     override val key = "xhs"
+    override val useBoundedContourSearch = true
     override val ownsNavigationDrawing = true
     // Both optical passes use XhsNavigationRenderer. The invisible native row
     // is retained for actions/state, never used as an artwork bitmap.
@@ -52,6 +59,7 @@ internal object XhsAdapter : TargetAdapter {
         return io.github.offlineglass.hook.adapters.AdapterBarLayout(
             mainWidth = actionLeft - 12f * density, actionLeft = actionLeft,
             actionSize = height.toFloat(), actionIndex = 2, navigationIndices = navigation,
+            actionHighlightScale = 0.35f,
         ).also {
             cachedBarLayout = it
             cachedBarWidth = width; cachedBarHeight = height

@@ -32,7 +32,7 @@ internal class ChatGptControlShadow(private val role: String) {
         context = anchor.context
         val ownerLayout=ChatGptBindings.layout(owner)
         val oldHost=host.get()
-        val validHost=oldHost!=null&&ChatGptBindings.placed(oldHost)&&ownerLayout!=null&&ChatGptBindings.contains(oldHost,ownerLayout)
+        val validHost=oldHost!=null&&ChatGptBindings.placed(oldHost)&&ownerLayout!=null&&ChatGptBindings.contains(oldHost,ownerLayout,onLimit=false)
         if (consumer.get() !== owner || !validHost) {
             hide()
             // Old parent display lists can outlive their page. Never revive a
@@ -87,31 +87,36 @@ internal class ChatGptControlShadow(private val role: String) {
         } finally { node.endRecording() }
     }
     fun syncPosition() {
-        if (host.get() == null) return
+        val target = host.get() ?: return
         runCatching {
-            val owner = consumer.get() ?: return
-            val coord = ChatGptBindings.read("node.coordinate",owner) ?: return
-            val layout = ChatGptBindings.layout(owner)
-            if (ChatGptBindings.read("node.attached",owner) != true || layout == null || ChatGptBindings.read("layout.deactivated",layout) == true) {
+            val owner = consumer.get()
+            if (owner == null || !ChatGptBindings.attached(owner) || !ChatGptPageSource.hasBackdrop(owner)
+                || !ChatGptBindings.placed(target)) {
                 placement.setAlpha(0f)
                 return
             }
-            val parent = ChatGptBindings.parent(host.get()!!) ?: return
-            val parentCoord = ChatGptBindings.read("chain.inner",ChatGptBindings.read("layout.chain",parent)!!) ?: return
+            val coord = ChatGptBindings.read("node.coordinate",owner)!!
+            val parent = ChatGptBindings.parent(target)
+            val parentCoord = parent?.let { ChatGptBindings.read("chain.inner",ChatGptBindings.read("layout.chain",it)!!) }
+            if (parentCoord == null) {
+                placement.setAlpha(0f)
+                return
+            }
             var current: Any? = coord
             var alpha = 1f
-            repeat(32) {
-                val c = current ?: return@repeat
-                if (c === parentCoord) { current = null; return@repeat }
-                ChatGptBindings.read("coordinate.layer",c)?.let { layer ->
-                    alpha *= nativeAlpha(layer) ?: 0f
-                }
-                current = ChatGptBindings.read("coordinate.parent",c)
+            var depth = 0
+            while (current != null && current !== parentCoord && depth++ < 32) {
+                ChatGptBindings.read("coordinate.layer",current)?.let { alpha *= nativeAlpha(it) ?: 0f }
+                current = ChatGptBindings.read("coordinate.parent",current)
             }
-            placement.setAlpha(alpha.coerceIn(0f,1f))
-            val appliedAlpha=alpha.coerceIn(0f,1f)
+            val appliedAlpha=if (current === parentCoord) alpha.coerceIn(0f,1f) else 0f
+            if (appliedAlpha == 0f) placement.setAlpha(0f)
+            else {
+                ChatGptComposeBackground.relativeMatrix(coord,parentCoord,relativeTransform,relativeValues)
+                placement.setAlpha(appliedAlpha)
+            }
             if(lastAlpha!=appliedAlpha){lastAlpha=appliedAlpha;context?.let {ChatGptDiagnostics.report(it,"shadowAlpha.$role",appliedAlpha.toString())}}
-            ChatGptComposeBackground.relativeMatrix(coord,parentCoord,relativeTransform,relativeValues)
+            if (appliedAlpha == 0f) return
             val values=placementValues.also(relativeTransform::getValues)
             if (!values.contentEquals(lastPlacement)) {
                 values.copyInto(lastPlacement)
@@ -122,7 +127,7 @@ internal class ChatGptControlShadow(private val role: String) {
                 placement.setScaleX(sx); placement.setScaleY(sy)
                 placement.setRotationZ((kotlin.math.atan2(values[3],values[0])*180f/kotlin.math.PI.toFloat()))
             }
-        }
+        }.onFailure { placement.setAlpha(0f) }
     }
     private var alphaVerified=false
     private fun nativeAlpha(layer:Any):Float? = runCatching {

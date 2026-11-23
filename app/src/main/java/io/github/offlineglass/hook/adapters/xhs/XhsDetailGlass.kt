@@ -17,11 +17,8 @@ import io.github.offlineglass.hook.compat.XC_MethodHook
 import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.HookConfigReader
-import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.BloomTiltTracker
-import io.github.offlineglass.hook.setBottomBarSquircle
 import io.github.offlineglass.hook.globalGlassBottomGapPx
-import io.github.offlineglass.rendering.KYANT_LENS_SHADER
 import java.util.WeakHashMap
 import java.lang.ref.WeakReference
 
@@ -67,6 +64,7 @@ internal object XhsDetailGlass {
                 val activity = param.thisObject as? Activity ?: return
                 if (activity.javaClass.name != "com.xingin.matrix.notedetail.NoteDetailActivity") return
                 sessions.getOrPut(activity) { Session(activity) }.start()
+                XhsNoteTop.start(activity)
             }
         })
         XposedBridge.hookAllMethods(Activity::class.java, "onPostResume", object : XC_MethodHook() {
@@ -74,16 +72,21 @@ internal object XhsDetailGlass {
                 val activity = param.thisObject as? Activity ?: return
                 if (activity.javaClass.name != "com.xingin.matrix.notedetail.NoteDetailActivity") return
                 sessions.getOrPut(activity) { Session(activity) }.start()
+                XhsNoteTop.start(activity)
             }
         })
         XposedBridge.hookAllMethods(Activity::class.java, "onDestroy", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                sessions.remove(param.thisObject as? Activity)?.dispose()
+                val activity = param.thisObject as? Activity ?: return
+                XhsNoteTop.dispose(activity)
+                sessions.remove(activity)?.dispose()
             }
         })
         XposedBridge.hookAllMethods(Activity::class.java, "onStop", object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
-                sessions[param.thisObject as? Activity]?.pause()
+                val activity = param.thisObject as? Activity ?: return
+                XhsNoteTop.pause(activity)
+                sessions[activity]?.pause()
             }
         })
     }
@@ -111,6 +114,7 @@ internal object XhsDetailGlass {
         private val configReading = java.util.concurrent.atomic.AtomicBoolean(false)
         private val buttonSkins = ArrayList<VerticalButtonSkin>()
         private var compactActions: List<View> = emptyList()
+        private val actionCapsule = RectF()
         private val originalBounds = WeakHashMap<View, Rect>()
         private var originalRowTranslation = 0f
         private var commentColors: android.content.res.ColorStateList? = null
@@ -147,14 +151,17 @@ internal object XhsDetailGlass {
             val now = SystemClock.uptimeMillis()
             // Initial post-resume may run before the toolbar has dimensions.
             // Retry at the first drawable frame instead of waiting 600ms.
-            if (row?.isShown != true || now - lastCheck >= 600L) {
+            if (row?.isShown != true || buttonSkins.any { !it.isBound } || now - lastCheck >= 600L) {
                 lastCheck = now
                 update()
             }
             updateViewport()
             row?.let { allowShadowOverflow(it) }
             compactButtons()
-            buttonSkins.forEach { it.refresh() }
+            buttonSkins.forEach { it.refresh(now) }
+            if (buttonSkins.size == 3 && buttonSkins.all { it.isBound && it.hasGlyph }) {
+                buttonSkins.forEach { it.activate() }
+            }
             comment?.let { input ->
                 val foreground = if (skin?.isDarkPage() == true) Color.WHITE else Color.BLACK
                 if (input.currentTextColor != foreground) {
@@ -201,7 +208,7 @@ internal object XhsDetailGlass {
             val actions = (0 until candidate.childCount).map { candidate.getChildAt(it) }
                 .filter { it !== label && it.isShown && it.isClickable }
             if (actions.size != 3 || candidate.height <= 0 || candidate.width <= 0) return
-            if (row !== candidate) {
+            if (row !== candidate || comment !== label || compactActions != actions) {
                 restore()
                 row = candidate
                 originalRowTranslation = candidate.translationY
@@ -215,7 +222,7 @@ internal object XhsDetailGlass {
                 label.compoundDrawables.filterNotNull().forEach { it.mutate().setTint(Color.WHITE) }
                 compactActions = actions
                 (actions + label).forEach { originalBounds[it] = Rect(it.left, it.top, it.right, it.bottom) }
-                skin = DetailBackground(candidate, label, actions)
+                skin = DetailBackground(candidate, label, actionCapsule)
                 original[candidate] = candidate.background
                 clear(label)
                 // Only the compact native plate, never the page or keyboard.
@@ -224,11 +231,6 @@ internal object XhsDetailGlass {
                 }?.let { clear(it) }
                 candidate.background = skin
                 allowShadowOverflow(candidate)
-                actions.forEach { action ->
-                    (action as? ViewGroup)?.let { VerticalButtonSkin.create(it) }?.let {
-                        buttonSkins.add(it)
-                    }
-                }
                 val feedback = XhsPressFeedback(candidate, listOf(label) + actions) {
                     val scale = pressFeedback?.scale(0) ?: 1f
                     label.scaleX = commentScaleX * scale
@@ -238,12 +240,21 @@ internal object XhsDetailGlass {
                 }
                 pressFeedback = feedback
                 skin?.feedback = feedback
-                buttonSkins.forEachIndexed { index, button ->
-                    button.feedback = feedback
-                    button.feedbackIndex = index + 1
-                }
                 discoverViewport(candidate)
                 android.util.Log.i("LiquidTabInject", "XHS detail: two native glass capsules attached")
+            }
+            if (buttonSkins.any { !it.isBound }) {
+                buttonSkins.forEach { it.restore() }
+                buttonSkins.clear()
+            }
+            if (buttonSkins.isEmpty()) {
+                val artwork = actions.mapIndexedNotNull { index, action ->
+                    (action as? ViewGroup)?.let { VerticalButtonSkin.create(it, actionCapsule, index) }
+                }
+                if (artwork.size == actions.size) {
+                    artwork.forEach { it.feedback = pressFeedback }
+                    buttonSkins.addAll(artwork)
+                }
             }
             skin?.update(config)
             // Native theme/rebind code can replace these plates after attachment.
@@ -342,12 +353,16 @@ internal object XhsDetailGlass {
                     action.invalidate()
                     toolbar.invalidate()
                 }
-                // Compress artwork, not touch targets. Keep the complete group
-                // centered in the capsule (whose leading inset is 4dp).
-                val center = (start + 4f * dp + end) / 2f
-                val spacing = (end - start) / 3f * 0.85f
-                buttonSkins.getOrNull(index)?.setVisualCenter(
-                    center + (index - 1) * spacing - action.left)
+            }
+            val capsuleLeft = start + 4f * dp
+            val capsuleHeight = minOf(48f * dp, toolbar.height.toFloat())
+            val capsuleTop = (toolbar.height - capsuleHeight) / 2f
+            val capsuleBottom = capsuleTop + capsuleHeight
+            if (actionCapsule.left != capsuleLeft || actionCapsule.right != end.toFloat() ||
+                actionCapsule.top != capsuleTop || actionCapsule.bottom != capsuleBottom) {
+                actionCapsule.set(capsuleLeft, capsuleTop, end.toFloat(), capsuleBottom)
+                skin?.invalidateSelf()
+                buttonSkins.forEach { it.invalidateSelf() }
             }
             val inputRight = start - (12f * dp).toInt()
             if (inputRight > side && (input.right != inputRight || input.left != side))
@@ -360,10 +375,9 @@ internal object XhsDetailGlass {
             val rootPosition = IntArray(2)
             toolbar.getLocationOnScreen(position)
             root.getLocationOnScreen(rootPosition)
-            val glassBottom = (toolbar.height + minOf(48f * dp, toolbar.height.toFloat())) / 2f
             val gap = globalGlassBottomGapPx(toolbar) * if (latestConfig.classicNavigation) 2 else 1
             val target = rootPosition[1] + root.height - gap
-            val translation = target - (position[1] - toolbar.translationY + glassBottom)
+            val translation = target - (position[1] - toolbar.translationY + capsuleBottom)
             if (kotlin.math.abs(toolbar.translationY - translation) > 0.5f)
                 toolbar.translationY = translation
         }
@@ -388,6 +402,7 @@ internal object XhsDetailGlass {
             for ((view, rect) in originalBounds) view.layout(rect.left, rect.top, rect.right, rect.bottom)
             originalBounds.clear()
             compactActions = emptyList()
+            actionCapsule.setEmpty()
             extending = false
             previousExtending = null
             viewportParent?.let { paddingOwners.remove(it) }
@@ -430,220 +445,212 @@ internal object XhsDetailGlass {
         }
     }
 
-    /** Reproject native artwork without changing button or child layout/touch geometry. */
+    /** Project each native action into the same centered icon-and-label layout. */
     private class VerticalButtonSkin(
         private val button: ViewGroup, private val icon: ImageView, private val count: TextView,
+        private val actionCapsule: RectF, private val index: Int,
     ) : Drawable() {
         var feedback: XhsPressFeedback? = null
-        var feedbackIndex = 0
-        private val oldForeground = button.foreground
-        private val iconAlpha = icon.alpha
-        private val countAlpha = count.alpha
-        private val lottie = icon.javaClass.name.contains("LottieAnimationView")
-        private var glyphX = Float.NaN
-        private var glyphY = Float.NaN
-        private var glyphSize = 0f
-        private var measuredComposition: Any? = null
-        private var measuredDrawable: Drawable? = null
-        private var measuredGeometry = ""
-        private var measuredSelected = false
-        private var hasMeasuredGlyph = false
-        private var hasVisibleAnchor = false
+        private var active = false
+        private var iconAlpha = 1f
+        private var countAlpha = 1f
+        private var glyph: RectF? = null
+        val hasGlyph get() = glyph != null
+        val isBound get() = icon.parent === button && count.parent === button &&
+            if (active) button.foreground === this else button.foreground == null
+
+        private data class Source(
+            val drawable: Drawable, val composition: Any?, val selected: Boolean, val width: Int, val height: Int,
+        ) {
+            fun matches(drawable: Drawable?, composition: Any?, icon: ImageView): Boolean =
+                this.drawable === drawable && this.composition === composition && selected == icon.isSelected &&
+                    width == icon.width && height == icon.height
+        }
+
+        private var measuredSource: Source? = null
+        private var failedSource: Source? = null
         private var lastProbe = 0L
         private var lastDrawable: Drawable? = null
+        private var lastProgress: Float? = null
         private var lastSelected = false
-        private var lastProgress = Float.NaN
         private var lastComposition: Any? = null
-        private val progressGetter = if (lottie) runCatching {
-            icon.javaClass.getMethod("getProgress")
-        }.getOrNull() else null
-        private val compositionGetter = if (lottie) runCatching {
-            icon.javaClass.getMethod("getComposition")
-        }.getOrNull() else null
-        private val animatingGetter = if (lottie) runCatching {
-            icon.javaClass.getMethod("isAnimating")
-        }.getOrNull() else null
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+        private val progressGetter = runCatching {
+            icon.javaClass.getMethod("getProgress").takeIf { it.returnType == Float::class.javaPrimitiveType }
+        }.getOrNull()
+        private val compositionGetter = progressGetter?.let {
+            runCatching { icon.javaClass.getMethod("getComposition") }.getOrNull()
+        }
+        private val animatingGetter = progressGetter?.let {
+            runCatching {
+                icon.javaClass.getMethod("isAnimating").takeIf { it.returnType == Boolean::class.javaPrimitiveType }
+            }.getOrNull()
+        }
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT
+        }
+        private val fontMetrics = Paint.FontMetrics()
         private var lastText = ""
         private var lastColor = 0
-        private var lastGeometry = ""
-        private var visualCenter = Float.NaN
-        fun setVisualCenter(value: Float) {
-            if (visualCenter != value) { visualCenter = value; invalidateSelf() }
-        }
-        init {
+        private var lastButtonWidth = 0
+        private var lastButtonHeight = 0
+
+        fun activate() {
+            if (!isBound || active) return
+            iconAlpha = icon.alpha
+            countAlpha = count.alpha
+            active = true
             artworkOwners[icon] = WeakReference(this)
             icon.alpha = 0f
             count.alpha = 0f
             button.foreground = this
         }
-        fun refresh() {
-            val text = count.text.toString()
-            // Lottie retains the same Drawable while composition/progress and
-            // selected state change. Its subclass may also consume drawable
-            // invalidations before View.invalidateDrawable is reached.
-            val progress = runCatching { (progressGetter?.invoke(icon) as? Number)?.toFloat() }.getOrNull()
+
+        fun refresh(now: Long) {
+            if (!isBound) return
+            val drawable = icon.drawable
+            val progress = runCatching { progressGetter?.invoke(icon) as? Float }.getOrNull()
             val composition = runCatching { compositionGetter?.invoke(icon) }.getOrNull()
-            val geometry = "${button.width}:${button.height}:${icon.left}:${icon.top}:${icon.width}:${icon.height}"
-            if (lottie && icon.width > 0 && icon.height > 0) {
-                val changed = measuredComposition !== composition || measuredDrawable !== icon.drawable ||
-                    measuredGeometry != geometry || measuredSelected != icon.isSelected
-                if (changed) hasMeasuredGlyph = false
-                // The old visible path remains the fallback, never the center
-                // of the mostly transparent animation canvas.
-                // A new selected/composition state invalidates measurement,
-                // not the last valid anchor. Keep it throughout the animation.
-                if (!hasVisibleAnchor) {
-                    glyphX = 15f * button.resources.displayMetrics.density - icon.left
-                    glyphY = button.height / 2f - icon.top
-                    glyphSize = 30f * button.resources.displayMetrics.density
-                }
-                val animating = runCatching { animatingGetter?.invoke(icon) as? Boolean }.getOrNull() == true
-                val settled = !animating && (progress == null || progress <= 0.001f || progress >= 0.999f)
-                val now = SystemClock.uptimeMillis()
-                if (!hasMeasuredGlyph && settled && now - lastProbe >= 250L) {
-                    lastProbe = now
-                    if (measureVisibleGlyph()) {
-                        measuredComposition = composition
-                        measuredDrawable = icon.drawable
-                        measuredGeometry = geometry
-                        measuredSelected = icon.isSelected
-                        hasMeasuredGlyph = true
-                        hasVisibleAnchor = true
-                        invalidateSelf()
-                    }
+            val animating = (drawable as? android.graphics.drawable.Animatable)?.isRunning == true ||
+                runCatching { animatingGetter?.invoke(icon) as? Boolean }.getOrNull() == true
+            if (drawable != null && icon.width > 0 && icon.height > 0 && !animating &&
+                measuredSource?.matches(drawable, composition, icon) != true &&
+                (failedSource?.matches(drawable, composition, icon) != true || now - lastProbe >= 250L)) {
+                val source = Source(drawable, composition, icon.isSelected, icon.width, icon.height)
+                val bounds = measureVisibleGlyph()
+                lastProbe = now
+                if (bounds != null) {
+                    glyph = bounds
+                    measuredSource = source
+                    failedSource = null
+                    invalidateSelf()
+                } else {
+                    failedSource = source
                 }
             }
-            if (lastText != text || lastColor != count.currentTextColor || lastGeometry != geometry ||
-                lastDrawable !== icon.drawable || lastSelected != icon.isSelected ||
-                lastComposition !== composition || (progress != null && lastProgress != progress)) {
-                lastDrawable = icon.drawable
-                lastComposition = composition
+            val text = count.text.toString()
+            if (lastText != text || lastColor != count.currentTextColor ||
+                lastButtonWidth != button.width || lastButtonHeight != button.height ||
+                lastDrawable !== drawable || lastSelected != icon.isSelected ||
+                lastComposition !== composition || lastProgress != progress) {
+                lastText = text
+                lastColor = count.currentTextColor
+                lastButtonWidth = button.width
+                lastButtonHeight = button.height
+                lastDrawable = drawable
                 lastSelected = icon.isSelected
-                if (progress != null) lastProgress = progress
-                lastText = text; lastColor = count.currentTextColor; lastGeometry = geometry
+                lastComposition = composition
+                lastProgress = progress
                 invalidateSelf()
             }
-            if (icon.alpha != 0f) icon.alpha = 0f
-            if (count.alpha != 0f) count.alpha = 0f
+            if (active) {
+                if (icon.alpha != 0f) icon.alpha = 0f
+                if (count.alpha != 0f) count.alpha = 0f
+            }
         }
-        private fun measureVisibleGlyph(): Boolean {
-            // Inspect only this native icon on a small transparent canvas.
-            // No page capture; display still draws the live native animation.
+
+        private fun measureVisibleGlyph(): RectF? {
+            // Only the unanimated icon is sampled. The displayed frames are
+            // still drawn live with the cached anchor, including during bursts.
             val scale = minOf(1f, 192f / maxOf(icon.width, icon.height))
-            val w = maxOf(1, kotlin.math.ceil(icon.width * scale).toInt())
-            val h = maxOf(1, kotlin.math.ceil(icon.height * scale).toInt())
-            val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val width = maxOf(1, kotlin.math.ceil(icon.width * scale).toInt())
+            val height = maxOf(1, kotlin.math.ceil(icon.height * scale).toInt())
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             return try {
                 val probe = Canvas(bitmap)
                 probe.scale(scale, scale)
                 icon.draw(probe)
-                val pixels = IntArray(w * h)
-                bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-                var left = w; var right = -1; var top = h; var bottom = -1
-                var count = 0
-                for (y in 0 until h) for (x in 0 until w) {
-                    if (Color.alpha(pixels[y * w + x]) >= 64) {
-                        left = minOf(left, x); right = maxOf(right, x)
-                        top = minOf(top, y); bottom = maxOf(bottom, y)
-                        count++
+                val pixels = IntArray(width * height)
+                bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+                var left = width
+                var top = height
+                var right = -1
+                var bottom = -1
+                for (y in 0 until height) for (x in 0 until width) {
+                    if (Color.alpha(pixels[y * width + x]) >= 64) {
+                        left = minOf(left, x)
+                        top = minOf(top, y)
+                        right = maxOf(right, x)
+                        bottom = maxOf(bottom, y)
                     }
                 }
-                if (count < 4 || right <= left || bottom <= top) false else {
-                    glyphX = (left + right + 1f) / (2f * scale)
-                    glyphY = (top + bottom + 1f) / (2f * scale)
-                    glyphSize = (maxOf(right - left + 1, bottom - top + 1) + 2f) / scale
-                    true
-                }
-            } catch (_: Exception) { false }
-            finally { bitmap.recycle() }
+                if (right <= left || bottom <= top) null
+                else RectF(left / scale, top / scale, (right + 1) / scale, (bottom + 1) / scale)
+            } catch (_: Exception) {
+                null
+            } finally {
+                bitmap.recycle()
+            }
         }
+
         override fun draw(canvas: Canvas) {
-            val dp = button.resources.displayMetrics.density
-            val sp = button.resources.displayMetrics.scaledDensity
-            val glassHeight = minOf(48f * dp, button.height.toFloat())
-            val top = (button.height - glassHeight) / 2f
-            val iconSize = 24f * dp
-            val targetCenterX = visualCenter.takeIf { it.isFinite() } ?: (button.width / 2f)
-            val targetTop = top + 5f * dp
+            val source = glyph ?: return
+            if (button.width <= 0 || button.height <= 0) return
+            val display = button.resources.displayMetrics
+            val dp = display.density
+            val availableHeight = minOf(48f * dp, button.height.toFloat())
+            paint.color = count.currentTextColor
+            paint.textSize = minOf(10f * display.scaledDensity, availableHeight / 2f)
+            paint.getFontMetrics(fontMetrics)
+            val lineHeight = fontMetrics.descent - fontMetrics.ascent
+            val gap = minOf(3f * dp, (availableHeight - lineHeight).coerceAtLeast(0f))
+            val iconHeight = minOf(18f * dp, availableHeight - lineHeight - gap).coerceAtLeast(0f)
+            val centerX = if (actionCapsule.isEmpty) button.width / 2f else
+                actionCapsule.left + actionCapsule.width() * (index + 0.5f) / 3f - button.left
+            val centerY = button.height / 2f
+            val stackTop = centerY - (iconHeight + gap + lineHeight) / 2f
+            val baseline = stackTop + iconHeight + gap - fontMetrics.ascent
             val feedbackSave = canvas.save()
             val pressScale = feedback?.actionScale() ?: 1f
-            val pressPivotX = feedback?.actionPivotX()?.minus(button.left) ?: targetCenterX
-            canvas.scale(pressScale, pressScale, pressPivotX, button.height / 2f)
-            // Unlike the other icons, the heart occupies only a small part of
-            // its animation canvas. Center its measured visible artwork, then
-            // map it to the exact same targetCenterX used by the count below.
-            val sourceSize = if (lottie) glyphSize else minOf(icon.width, icon.height).toFloat()
-            if (sourceSize > 0f && icon.width > 0 && icon.height > 0) {
-                val sourceX = if (lottie) glyphX else icon.width / 2f
-                val sourceY = if (lottie) glyphY else icon.height / 2f
-                val save = canvas.save()
-                // The heart's burst/bounce intentionally exceeds its resting
-                // 24dp glyph. Keep the anchor/scale but don't crop animation.
-                if (!lottie) canvas.clipRect(targetCenterX - iconSize / 2f, targetTop,
-                    targetCenterX + iconSize / 2f, targetTop + iconSize)
-                canvas.translate(targetCenterX, targetTop + iconSize / 2f)
-                canvas.scale(iconSize / sourceSize, iconSize / sourceSize)
-                canvas.translate(-sourceX, -sourceY)
-                // Icon and count share targetCenterX; preserve native drawing.
+            val pivotX = if (actionCapsule.isEmpty) centerX else actionCapsule.centerX() - button.left
+            val pivotY = if (actionCapsule.isEmpty) centerY else actionCapsule.centerY() - button.top
+            canvas.scale(pressScale, pressScale, pivotX, pivotY)
+            if (iconHeight > 0f) {
+                val iconSave = canvas.save()
+                val scale = iconHeight / source.height()
+                canvas.translate(centerX, stackTop + iconHeight / 2f)
+                canvas.scale(scale, scale)
+                canvas.translate(-source.centerX(), -source.centerY())
                 icon.draw(canvas)
-                canvas.restoreToCount(save)
+                canvas.restoreToCount(iconSave)
             }
-            paint.color = count.currentTextColor
-            paint.textSize = 11f * sp
-            paint.typeface = count.typeface
-            val metrics = paint.fontMetrics
-            val textCenterY = top + 38f * dp
-            canvas.drawText(count.text.toString(), targetCenterX,
-                textCenterY - (metrics.ascent + metrics.descent) / 2f, paint)
+            canvas.drawText(count.text.toString(), centerX, baseline, paint)
             canvas.restoreToCount(feedbackSave)
         }
+
         fun restore() {
+            if (!active) return
+            active = false
             artworkOwners.remove(icon)
-            if (button.foreground === this) button.foreground = oldForeground
+            if (button.foreground === this) button.foreground = null
             if (icon.alpha == 0f) icon.alpha = iconAlpha
             if (count.alpha == 0f) count.alpha = countAlpha
         }
+
         override fun setAlpha(alpha: Int) = Unit
         override fun setColorFilter(colorFilter: ColorFilter?) = Unit
         @Deprecated("Deprecated in Java") override fun getOpacity() = PixelFormat.TRANSLUCENT
+
         companion object {
-            fun create(button: ViewGroup): VerticalButtonSkin? {
-                val children = (0 until button.childCount).map { button.getChildAt(it) }
-                val icon = children.filterIsInstance<ImageView>().firstOrNull() ?: return null
-                val text = children.filterIsInstance<TextView>().firstOrNull() ?: return null
+            fun create(button: ViewGroup, actionCapsule: RectF, index: Int): VerticalButtonSkin? {
                 if (button.foreground != null) return null
-                return VerticalButtonSkin(button, icon, text)
+                val children = (0 until button.childCount).map(button::getChildAt)
+                val icon = children.filterIsInstance<ImageView>().singleOrNull() ?: return null
+                val count = children.filterIsInstance<TextView>().singleOrNull() ?: return null
+                return VerticalButtonSkin(button, icon, count, actionCapsule, index)
             }
         }
     }
 
     private class DetailBackground(
-        private val row: ViewGroup, private val label: View, private val actions: List<View>,
+        private val row: ViewGroup, private val label: View, private val actionCapsule: RectF,
     ) : Drawable() {
         var feedback: XhsPressFeedback? = null
-        private class Capsule(index: Int) {
-            val node = RenderNode("LiquidTab-XhsDetail-$index")
-            val shadow = RenderNode("LiquidTab-XhsDetailShadow-$index")
-            var shadowKey = ""
-            val lens = runCatching { io.github.offlineglass.rendering.PostureGlass.shader(KYANT_LENS_SHADER) }.onFailure {
-                android.util.Log.e("LiquidTabInject", "XHS lens creation failed", it)
-            }.getOrNull()
-            var effectKey = ""
-        }
-        private val capsules = List(2) { Capsule(it) }
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val clip = Path()
+        private val capsules = List(2) { XhsNoteCapsule(row, "detail-$it") }
         private val location = IntArray(2)
         private val rowLocation = IntArray(2)
         private var config = GlassConfig()
-        private val nodeField = runCatching {
-            View::class.java.getDeclaredField("mRenderNode").apply { isAccessible = true }
-        }.getOrNull()
         private var trackingTilt = false
-        private val bloom = runCatching { RuntimeShader(GlassHostLayout.BLOOM_STROKE_DUAL_SHADER) }.getOrNull()
-        private val lightingPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val lightingPath = Path()
         fun update(value: GlassConfig) {
             if (config != value) { config = value; invalidateSelf() }
             val track = value.enabled && value.liquidGlassEnabled && !value.solidBarEnabled &&
@@ -659,189 +666,64 @@ internal object XhsDetailGlass {
             // Kyant0 catalog LiquidButton: height(48.dp), capsule shape.
             val height = minOf(48f * density, row.height.toFloat())
             if (height <= 0) return
-            val first = actions.first()
-            val last = actions.last()
             val y = (row.height - height) / 2f
             val left = RectF(label.left.toFloat(), y, label.right.toFloat(), y + height)
-            val right = RectF(first.left + 4f * density, y,
-                last.right.toFloat(), y + height)
             val dark = isDarkPage()
-            for ((index, rect) in listOf(left, right).withIndex()) {
-                if (rect.width() <= 0) continue
+            for ((index, rect) in listOf(left, actionCapsule).withIndex()) {
+                if (rect.isEmpty) continue
                 val feedbackSave = canvas.save()
                 val scale = if (index == 0) feedback?.scale(0) ?: 1f
                     else feedback?.actionScale() ?: 1f
                 canvas.scale(scale, scale, rect.centerX(), rect.centerY())
-                clip.setBottomBarSquircle(rect, height / 2f, config.cornerSmoothing)
-                if (!dark) drawShadow(canvas, rect, density, capsules[index])
-                val save = canvas.save()
-                canvas.clipPath(clip)
-                if (!config.solidBarEnabled) drawBackdrop(canvas, rect, density, dark, capsules[index])
-                paint.style = Paint.Style.FILL
-                // Native page tint follows app theme changes without screenshot sampling.
-                paint.color = pageTint(dark)
-                paint.alpha = if (config.solidBarEnabled) 255 else
-                    (config.lightAlpha * 255).toInt()
-                canvas.drawRect(rect, paint)
-                feedback?.drawLight(canvas, rect, index)
-                canvas.restoreToCount(save)
-                if (config.outlineEnabled) {
-                    paint.style = Paint.Style.STROKE; paint.strokeWidth = density * 0.6f
-                    paint.color = Color.WHITE
-                    paint.alpha = 10
-                    canvas.drawPath(clip, paint)
-                    if (config.liquidGlassEnabled && !config.solidBarEnabled && config.outlineEnabled) drawHighlight(canvas, rect, density, dark)
-                }
+                val page = pageTint(dark)
+                val alpha = if (config.solidBarEnabled) 255 else (config.lightAlpha * 255).toInt()
+                val tint = (page and 0x00ffffff) or (alpha shl 24)
+                capsules[index].draw(canvas, rect, config, dark, tint, page,
+                    recordBackdrop = ::recordBackdrop,
+                    drawPress = { feedback?.drawLight(it, rect, index) })
                 canvas.restoreToCount(feedbackSave)
             }
         }
-        private fun drawShadow(canvas: Canvas, rect: RectF, density: Float, capsule: Capsule) {
-            val pad = (30f * density).toInt()
-            val width = kotlin.math.ceil(rect.width()).toInt() + pad * 2
-            val height = kotlin.math.ceil(rect.height()).toInt() + pad * 2
-            val key = "$width:$height:$density:${config.cornerSmoothing}"
-            if (capsule.shadowKey != key || !capsule.shadow.hasDisplayList()) {
-                capsule.shadowKey = key
-                capsule.shadow.setPosition(0, 0, width, height)
-                capsule.shadow.setRenderEffect(RenderEffect.createBlurEffect(
-                    10f * density, 10f * density, Shader.TileMode.DECAL))
-                val recording = capsule.shadow.beginRecording(width, height)
-                try {
-                    val path = Path().apply {
-                        setBottomBarSquircle(RectF(pad.toFloat(), pad.toFloat(),
-                            pad + rect.width(), pad + rect.height()), rect.height() / 2f, config.cornerSmoothing)
-                    }
-                    recording.drawPath(path, Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.argb(48, 0, 0, 0)
-                    })
-                } finally { capsule.shadow.endRecording() }
-            }
-            val save = canvas.save()
-            // Shadow only surrounds the capsule; never darken transparent glass.
-            canvas.clipOutPath(clip)
-            canvas.translate(rect.left - pad, rect.top - pad)
-            io.github.offlineglass.rendering.PostureGlass.shadow(canvas, row,
-                RectF(pad.toFloat(), pad.toFloat(), pad + rect.width(), pad + rect.height()), 30f * density) {
-                canvas.drawRenderNode(capsule.shadow)
-            }
-            canvas.restoreToCount(save)
-        }
-        private fun drawBackdrop(canvas: Canvas, rect: RectF, density: Float, dark: Boolean, capsule: Capsule) {
-            val node = capsule.node
-            val lens = capsule.lens
-            val padding = (24f * density).toInt()
-            val w = rect.width().toInt() + padding * 2
-            val h = rect.height().toInt() + padding * 2
-            node.setPosition(0, 0, w, h)
-            lens?.let { io.github.offlineglass.rendering.PostureGlass.sync(
-                it, row, config.postureEffectsEnabled && config.liquidGlassEnabled && !config.solidBarEnabled,
-                config.liquidViscosity,
-                config.flowHorizontalStrength, config.flowVerticalStrength,
-            ) }
-            val key = "$w:$h:${config.blurRadius}:${config.liquidGlassEnabled}"
-            val postureChanged = lens?.let { io.github.offlineglass.rendering.PostureGlass.effectChanged(it) } == true
-            if (capsule.effectKey != key || postureChanged) {
-                capsule.effectKey = key
-                // Detail controls favor near-clear optics; do not change global bars.
-                val radius = minOf(config.blurRadius, 0.5f) * density
-                val blur = if (radius > 0f) RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP) else null
-                val refraction = if (config.liquidGlassEnabled) lens?.let {
-                    it.setFloatUniform("size", rect.width(), rect.height())
-                    it.setFloatUniform("offset", -padding.toFloat(), -padding.toFloat())
-                    it.setFloatUniform("cornerRadii", FloatArray(4) { rect.height() / 2f })
-                    it.setFloatUniform("refractionHeight", 12f * density)
-                    // Kyant0 LiquidButton's reference lens(12.dp, 24.dp).
-                    it.setFloatUniform("refractionAmount", -24f * density)
-                    it.setFloatUniform("depthEffect", 0f)
-                    RenderEffect.createRuntimeShaderEffect(it, "content")
-                } else null
-                node.setRenderEffect(if (blur != null && refraction != null)
-                    RenderEffect.createChainEffect(refraction, blur) else refraction ?: blur)
-            }
+        private fun recordBackdrop(recording: Canvas) {
             row.getLocationInWindow(rowLocation)
-            val recording = node.beginRecording(w, h)
-            try {
-                recording.drawColor(pageTint(dark))
-                // Replay disjoint sibling display lists only. Never capture an ancestor
-                // containing this drawable: that would create recursive feedback.
-                val layers = ArrayList<Pair<View, ViewGroup>>()
-                var branch: View = row
-                var parent = branch.parent as? ViewGroup
-                while (parent != null) {
-                    layers.add(branch to parent)
-                    branch = parent
-                    parent = branch.parent as? ViewGroup
-                }
-                // Composite far ancestors first. Only siblings behind the branch
-                // belong to the backdrop; later siblings are foreground overlays.
-                for ((currentBranch, currentParent) in layers.asReversed()) {
-                    // A parent's background is not part of any sibling display
-                    // list. Composite it first so uncovered areas retain the
-                    // actual page color rather than a different fallback grey.
-                    currentParent.background?.let { background ->
-                        currentParent.getLocationInWindow(location)
-                        val save = recording.save()
-                        recording.translate(location[0] - rowLocation[0] - rect.left + padding,
-                            location[1] - rowLocation[1] - rect.top + padding)
-                        background.draw(recording)
-                        recording.restoreToCount(save)
-                    }
-                    for (i in 0 until currentParent.childCount) {
-                        val source = currentParent.getChildAt(i)
-                        if (source === currentBranch) break
-                        if (!source.isShown || source.alpha <= 0f) continue
-                        val sourceNode = runCatching { nodeField?.get(source) as? RenderNode }.getOrNull() ?: continue
-                        if (!sourceNode.hasDisplayList()) continue
-                        source.getLocationInWindow(location)
-                        val save = recording.save()
-                        recording.translate(location[0] - rowLocation[0] - rect.left + padding - source.left - source.translationX,
-                            location[1] - rowLocation[1] - rect.top + padding - source.top - source.translationY)
-                        recording.drawRenderNode(sourceNode)
-                        recording.restoreToCount(save)
-                    }
-                }
-            } finally { node.endRecording() }
-            val save = canvas.save()
-            canvas.translate(rect.left - padding, rect.top - padding)
-            canvas.drawRenderNode(node)
-            canvas.restoreToCount(save)
-        }
-        private fun drawHighlight(canvas: Canvas, rect: RectF, density: Float, dark: Boolean) {
-            val shader = bloom ?: return
-            var gx = if (config.postureEffectsEnabled) BloomTiltTracker.gravityX else 0f
-            var gy = if (config.postureEffectsEnabled) BloomTiltTracker.gravityY else 0f
-            when (row.display?.rotation) {
-                android.view.Surface.ROTATION_90 -> { val x = gx; gx = -gy; gy = x }
-                android.view.Surface.ROTATION_180 -> { gx = -gx; gy = -gy }
-                android.view.Surface.ROTATION_270 -> { val x = gx; gx = gy; gy = -x }
+            recording.translate(-rowLocation[0].toFloat(), -rowLocation[1].toFloat())
+            // Replay disjoint sibling display lists only. Never capture an ancestor
+            // containing this drawable: that would create recursive feedback.
+            val layers = ArrayList<Pair<View, ViewGroup>>()
+            var branch: View = row
+            var parent = branch.parent as? ViewGroup
+            while (parent != null) {
+                layers.add(branch to parent)
+                branch = parent
+                parent = branch.parent as? ViewGroup
             }
-            val length = kotlin.math.sqrt(gx * gx + gy * gy)
-            if (length > 0.1f) { gx /= length; gy /= length } else { gx = 0f; gy = -1f }
-            val c = 0.70710677f
-            shader.setFloatUniform("halfView", rect.width() / 2f, rect.height() / 2f)
-            // Detail buttons intentionally sit below the bar's minimum 0.5.
-            shader.setFloatUniform("highlightAlpha", 0.25f)
-            shader.setColorUniform("strokeColor", Color.WHITE)
-            shader.setFloatUniform("strokeAlphaMul", 0.12f)
-            shader.setFloatUniform("lightDir1", c * gx + c * gy, -c * gx + c * gy, -0.05f)
-            shader.setColorUniform("lightColor1", Color.WHITE)
-            shader.setFloatUniform("lightIntensity1", 1f)
-            shader.setFloatUniform("lightDir2", 0f, 0.19611613f, -0.9805807f)
-            shader.setColorUniform("lightColor2", Color.WHITE)
-            shader.setFloatUniform("lightIntensity2", 0.4f)
-            lightingPaint.shader = shader
-            // On a light page SRC_OVER's dim shader lobes look like black edges.
-            // Screen blending makes the white lighting additive, never darkening.
-            lightingPaint.blendMode = BlendMode.SCREEN
-            lightingPaint.style = Paint.Style.STROKE
-            lightingPaint.strokeWidth = density
-            lightingPath.setBottomBarSquircle(RectF(0f, 0f, rect.width(), rect.height()), rect.height() / 2f, config.cornerSmoothing)
-            val save = canvas.save()
-            canvas.translate(rect.left, rect.top)
-            canvas.drawPath(lightingPath, lightingPaint)
-            canvas.restoreToCount(save)
-            lightingPaint.shader = null
-            lightingPaint.blendMode = BlendMode.SRC_OVER
+            // Composite far ancestors first. Only siblings behind the branch
+            // belong to the backdrop; later siblings are foreground overlays.
+            for ((currentBranch, currentParent) in layers.asReversed()) {
+                // A parent's background is not part of any sibling display
+                // list. Composite it first so uncovered areas retain the
+                // actual page color rather than a different fallback grey.
+                currentParent.background?.let { background ->
+                    currentParent.getLocationInWindow(location)
+                    val save = recording.save()
+                    recording.translate(location[0].toFloat(), location[1].toFloat())
+                    background.draw(recording)
+                    recording.restoreToCount(save)
+                }
+                for (i in 0 until currentParent.childCount) {
+                    val source = currentParent.getChildAt(i)
+                    if (source === currentBranch) break
+                    if (!source.isShown || source.alpha <= 0f) continue
+                    val sourceNode = XhsNoteCapsule.renderNode(source) ?: continue
+                    if (!sourceNode.hasDisplayList()) continue
+                    source.getLocationInWindow(location)
+                    val save = recording.save()
+                    recording.translate(location[0] - source.left - source.translationX,
+                        location[1] - source.top - source.translationY)
+                    recording.drawRenderNode(sourceNode)
+                    recording.restoreToCount(save)
+                }
+            }
         }
         fun isDarkPage(): Boolean = when (config.themeMode) {
             GlassConfig.THEME_LIGHT -> false
@@ -866,7 +748,7 @@ internal object XhsDetailGlass {
             if (trackingTilt) BloomTiltTracker.unregister(row)
             trackingTilt = false
         }
-        fun release() { pause(); capsules.forEach { it.node.discardDisplayList(); it.shadow.discardDisplayList() } }
+        fun release() { pause(); capsules.forEach { it.release() } }
         override fun setAlpha(alpha: Int) = Unit
         override fun setColorFilter(colorFilter: ColorFilter?) = Unit
         @Deprecated("Deprecated in Java") override fun getOpacity() = PixelFormat.TRANSLUCENT

@@ -8,19 +8,53 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class XposedHelpers {
     private XposedHelpers() {}
     private record Key(Class<?> type, String name, java.util.List<Class<?>> arguments) {}
-    private static final ConcurrentHashMap<Key, Method> cache = new ConcurrentHashMap<>();
+    private record Resolution(Method method) {}
+    // A missing method is immutable for a loaded Class, unlike a failed invocation.
+    // Bound retained class/signature keys; reads stay lock-free on the render path.
+    private static final int MAX_RESOLUTIONS = 512;
+    private static final Resolution ABSENT = new Resolution(null);
+    private static final ConcurrentHashMap<Key, Resolution> cache = new ConcurrentHashMap<>();
+    private static final java.util.ArrayDeque<Key> insertionOrder = new java.util.ArrayDeque<>();
     private static final class NullArgument {}
     public static Class<?> findClass(String name, ClassLoader loader) {
         try { return Class.forName(name, false, loader); }
         catch (ClassNotFoundException error) { throw new IllegalArgumentException(name, error); }
     }
     public static Object callMethod(Object object, String name, Object... args) {
-        var types = new java.util.ArrayList<Class<?>>();
-        for (Object arg : args) types.add(arg == null ? NullArgument.class : arg.getClass());
-        Method method = cache.computeIfAbsent(new Key(object.getClass(), name, types), key -> resolve(key.type, name, args));
+        Method method = resolution(object.getClass(), name, args).method;
+        if (method == null) throw new IllegalArgumentException("No matching method: " + object.getClass().getName() + "." + name);
         try { return method.invoke(object, args); }
         catch (InvocationTargetException error) { return sneakyThrow(error.getCause()); }
         catch (ReflectiveOperationException error) { throw new IllegalStateException(error); }
+    }
+    /** Same overload/accessibility contract as callMethod, without invoking application code.
+     * Only a deterministic no-compatible-method result returns false. Access failures escape.
+     */
+    public static boolean hasMethod(Object object, String name, Object... args) {
+        return resolution(object.getClass(), name, args).method != null;
+    }
+    /** Capability probe before allocating a platform view or other target instance. */
+    public static boolean hasMethod(Class<?> type, String name, Object... args) {
+        return resolution(type, name, args).method != null;
+    }
+    private static Resolution resolution(Class<?> type, String name, Object[] args) {
+        var types = new java.util.ArrayList<Class<?>>();
+        for (Object arg : args) types.add(arg == null ? NullArgument.class : arg.getClass());
+        Key key = new Key(type, name, types);
+        Resolution cached = cache.get(key);
+        if (cached != null) return cached;
+        synchronized (cache) {
+            cached = cache.get(key);
+            if (cached != null) return cached;
+            // Accessibility/reflection errors are not cached. A later call must
+            // be allowed to retry if the platform or caller access changes.
+            Method method = resolve(type, name, args);
+            Resolution result = method == null ? ABSENT : new Resolution(method);
+            if (cache.size() >= MAX_RESOLUTIONS) cache.remove(insertionOrder.removeFirst());
+            cache.put(key, result);
+            insertionOrder.addLast(key);
+            return result;
+        }
     }
     private static Method resolve(Class<?> type, String name, Object[] args) {
         Method best = null;
@@ -45,7 +79,7 @@ public final class XposedHelpers {
                 }
                 if (score < bestScore) { best = method; bestScore = score; }
             }
-        if (best == null) throw new IllegalArgumentException("No matching method: " + type.getName() + "." + name);
+        if (best == null) return null;
         best.setAccessible(true);
         return best;
     }

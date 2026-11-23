@@ -19,7 +19,8 @@ internal object ZhihuAdapter : TargetAdapter {
     override val drawsNavigationInOptics = true
     override val usesNavigationOpticalMix = true
     override val persistentNavigationOpticalMix = true
-    override val foregroundMaskInsetDp = 0f
+    override val foregroundUsesRenderedSelectionOutline = true
+    override val foregroundRequiresSubmittedIndicatorArtwork = true
     override val suppressPlatformElevation = true
     override val actionOnlyIndices = setOf(2)
     override val foregroundNavigationOverSelection = true
@@ -29,12 +30,7 @@ internal object ZhihuAdapter : TargetAdapter {
     override val preserveNativeSourceMetrics = true
     override val managesNativeTabVisibility = true
     override val usesContentDarkMode = true
-    override val usesOpticalSurfacePipeline = true
-    override val usesDirectOpticalBackdropMode = true
-    override val keepsOpticalSurfaceDuringBarAnimation = true
-    override val deferOpticalRenderDuringBarAnimation = true
     override val reuseOpticalBlur = true
-    override val reuseSurfaceBlurDuringBarAnimation = true
     override val allowsSystemBackgroundBlur = false
     private var cachedBarLayout: io.github.offlineglass.hook.adapters.AdapterBarLayout? = null
     private var cachedBarWidth = 0
@@ -61,7 +57,6 @@ internal object ZhihuAdapter : TargetAdapter {
             cachedBarDensity = density; cachedBarMask = config.hiddenMask
         }
     }
-    override fun isOpticalSurfaceTab(selectedIndex: Int) = true
     override fun createNavigationState(context: android.content.Context,
         host: io.github.offlineglass.hook.GlassHostLayout) = ZhihuNavigationState(host)
     override fun installHooks(lpparam: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam,
@@ -95,17 +90,6 @@ internal object ZhihuAdapter : TargetAdapter {
             }
             parent = view.parent as? View
         }
-    }
-
-    override fun opticalCaptureGeometry(rootWidth: Int, rootHeight: Int, left: Int, top: Int,
-        width: Int, height: Int, padding: Int): io.github.offlineglass.hook.adapters.OpticalCaptureGeometry? {
-        val rect = android.graphics.Rect((left - padding).coerceAtLeast(0),
-            (top - padding).coerceAtLeast(0), (left + width + padding).coerceAtMost(rootWidth),
-            (top + height + padding).coerceAtMost(rootHeight))
-        if (rect.isEmpty) return null
-        return io.github.offlineglass.hook.adapters.OpticalCaptureGeometry(rect, rect.width(), rect.height(),
-            android.graphics.Rect(left - rect.left, top - rect.top,
-                left - rect.left + width, top - rect.top + height))
     }
 
     const val MENU_CLASS = "com.zhihu.android.bottomnav.core.BottomNavMenuView"

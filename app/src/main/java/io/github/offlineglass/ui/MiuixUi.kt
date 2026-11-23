@@ -1,5 +1,6 @@
 package io.github.offlineglass.ui
 
+
 import io.github.offlineglass.rendering.postureDropShadow
 
 import androidx.activity.compose.BackHandler
@@ -172,6 +173,8 @@ fun MiuixManager(
                 liquidGlassEnabled = settings.liquidGlassEnabled,
                 solidBarEnabled = settings.solidBarEnabled,
                 postureEffectsEnabled = settings.glass.postureEffectsEnabled,
+                indicatorInteractionLightEnabled = settings.glass.indicatorInteractionLightEnabled,
+                simplifyTabSwitch = settings.glass.simplifyTabSwitch,
                 outlineEnabled = settings.outlineEnabled,
                 blurRadius = previewGlass.blurRadius,
                 cornerRadiusPercent = previewGlass.cornerRadiusPercent,
@@ -181,6 +184,7 @@ fun MiuixManager(
                 lightAlpha = previewGlass.lightAlpha,
                 darkAlpha = previewGlass.darkAlpha,
                 classicNavigation = previewGlass.classicNavigation,
+                iconOnly = previewGlass.bottomBarIconOnly,
             )
             }
         },
@@ -479,7 +483,9 @@ private fun MiuixAppList(
             Card(Modifier.fillMaxWidth(), allowTilt = false) {
                     ArrowPreference(
                         title = target.displayName,
-                        summary = "${target.packageName} · 底栏入口设置",
+                        summary = when (target.key) {
+                            else -> "${target.packageName} · 底栏入口设置"
+                        },
                         startAction = { AppIcon(target.packageName, target.displayName, Modifier.padding(end = 8.dp)) },
                         endActions = {
                             ManagerStyleSwitch(
@@ -507,9 +513,10 @@ private fun MiuixAppEntries(
 ) {
     val labels = if (target.key == "spotify") emptyList() else entryLabels(target.key, settings)
     val config = settings.appConfigs[target.packageName] ?: settings.glass
-    val enabledCount = labels.indices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
+    val toggleIndices = labels.indices.filter { labels[it].isNotBlank() }
+    val enabledCount = toggleIndices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
     MiuixList(padding) {
-        items(labels.indices.toList()) { index ->
+        items(toggleIndices) { index ->
             val enabled = config.hiddenMask and (1 shl index) == 0
             Card(Modifier.fillMaxWidth()) {
                 SwitchPreference(
@@ -525,7 +532,8 @@ private fun MiuixAppEntries(
                         } else {
                             config.hiddenMask or (1 shl index)
                         }
-                        actions.setAppConfig(target.packageName, config.copy(hiddenMask = mask))
+                        actions.setAppConfig(target.packageName, if (target.key == "youtube") config.withEntryVisibilityMask(target.key, mask)
+                                    else config.copy(hiddenMask = mask))
                     },
                 )
             }
@@ -590,9 +598,11 @@ private fun MiuixTikTokTopChannels(target: TargetSpec, settings: ManagerSettings
 @Composable
 private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padding: PaddingValues, actions: UiActions,
     onTopChannels: () -> Unit) {
+    val context = LocalContext.current
     val config = settings.appConfigs[target.packageName] ?: settings.glass
     val labels = if (target.key == "spotify") emptyList() else entryLabels(target.key, settings)
-    val enabledCount = labels.indices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
+    val toggleIndices = labels.indices.filter { labels[it].isNotBlank() }
+    val enabledCount = toggleIndices.count { it !in target.automaticEntryIndices && config.hiddenMask and (1 shl it) == 0 }
     MiuixList(padding) {
         if (target.key == "wechat") {
             item {
@@ -663,12 +673,14 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                     SwitchPreference(title = "液态玻璃顶栏", summary = "保留原生频道和点击操作，使用胶囊顶栏与完整频道菜单。",
                         checked = config.tiktokTopBar,
                         onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(tiktokTopBar = it)) })
-                    SwitchPreference(
-                        title = "发布键独立到右侧",
-                        summary = "四个页面在左，无底色的液态玻璃发布键独立在右；左右屏幕边距不变。",
-                        checked = config.detachedPublish,
-                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
-                    )
+                    if (config.hiddenMask and (1 shl 2) == 0) {
+                        SwitchPreference(
+                            title = "发布键独立到右侧",
+                            summary = "四个页面在左，无底色的液态玻璃发布键独立在右；左右屏幕边距不变。",
+                            checked = config.detachedPublish,
+                            onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
+                        )
+                    }
                     SwitchPreference(
                         title = "竖屏视频上下铺满（实验）",
                         summary = "对 9:16 及更修长的视频等比缩放至屏幕上下边界，可能裁切左右；关闭恢复完整居中。切换后重新进入视频生效。",
@@ -687,12 +699,14 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                         checked = config.douyinTopBar,
                         onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(douyinTopBar = it)) },
                     )
-                    SwitchPreference(
-                        title = "发布键独立到右侧",
-                        summary = "关闭使用原布局；开启后四个页面在左，发布键独立在右，整体左右边距不变。",
-                        checked = config.detachedPublish,
-                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
-                    )
+                    if (config.hiddenMask and (1 shl 2) == 0) {
+                        SwitchPreference(
+                            title = "发布键独立到右侧",
+                            summary = "关闭使用原布局；开启后四个页面在左，发布键独立在右，整体左右边距不变。",
+                            checked = config.detachedPublish,
+                            onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
+                        )
+                    }
                 }
             }
         }
@@ -704,6 +718,12 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                         summary = "关闭后恢复 Bilibili 原生首页顶栏；底栏仍由应用列表中的开关控制。",
                         checked = config.bilibiliTopBar,
                         onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(bilibiliTopBar = it)) },
+                    )
+                    SwitchPreference(
+                        title = "取消首页信息流左右边距",
+                        summary = "让双列卡片和通栏视频卡片贴近屏幕两侧，保留两列之间的间距。",
+                        checked = config.bilibiliEdgeToEdgeFeed,
+                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(bilibiliEdgeToEdgeFeed = it)) },
                     )
                 }
             }
@@ -729,6 +749,24 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
         if (target.key == "bilibili") {
             item {
                 Card(Modifier.fillMaxWidth()) {
+                    val searchBlocked = config.hiddenMask and 31 == 0
+                    val notifySearchBlocked = {
+                        android.widget.Toast.makeText(context, "请至少关闭一个页面开关", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    Box(Modifier.fillMaxWidth()) {
+                        SwitchPreference(title = "独立搜索键",
+                            summary = "将首页搜索栏改为底栏右侧的独立液态搜索键，开启时自动关闭独立发布键。",
+                            checked = config.bilibiliDetachedSearch, enabled = !searchBlocked,
+                            onCheckedChange = { checked ->
+                                if (checked && searchBlocked) notifySearchBlocked()
+                                else actions.setAppConfig(target.packageName, config.copy(
+                                    bilibiliDetachedSearch = checked,
+                                    detachedPublish = if (checked) false else config.detachedPublish,
+                                ))
+                            })
+                        if (searchBlocked) Box(Modifier.matchParentSize().clickable(
+                            onClickLabel = "请至少关闭一个页面开关", onClick = notifySearchBlocked))
+                    }
                     SwitchPreference(title = "播放页状态栏氛围背景",
                         summary = "以低频画面取样生成柔和模糊背景，保留系统状态栏图标；默认关闭。",
                         checked = config.bilibiliVideoAmbient,
@@ -745,6 +783,12 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                         checked = config.xhsTopBar,
                         onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(xhsTopBar = it)) },
                     )
+                    SwitchPreference(
+                        title = "取消首页信息流左右边距",
+                        summary = "让关注、发现、同城的信息流贴近屏幕两侧，保留列间距。",
+                        checked = config.xhsEdgeToEdgeFeed,
+                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(xhsEdgeToEdgeFeed = it)) },
+                    )
                 }
             }
         }
@@ -760,19 +804,22 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                 }
             }
         }
-        if (target.key == "youtube") {
+        if (target.key == "youtube" && config.isYouTubeCreateVisible()) {
             item {
                 Card(Modifier.fillMaxWidth()) {
                     SwitchPreference(
-                        title = "重构顶栏",
-                        summary = "关闭后恢复 YouTube 原生首页顶栏；底栏仍由应用列表中的开关控制。",
-                        checked = config.youtubeTopBar,
-                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(youtubeTopBar = it)) },
+                        title = "独立创作键",
+                        summary = "开启后将创作入口放在底栏右侧的独立圆形按钮。",
+                        checked = config.detachedPublish,
+                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
                     )
                 }
             }
         }
-        if (target.key == "bilibili" || target.key == "xhs" || target.key == "zhihu" || target.key == "xianyu") {
+        if (((target.key == "bilibili" || target.key == "xhs" || target.key == "zhihu") &&
+            config.hiddenMask and (1 shl 2) == 0) ||
+            (target.key == "xianyu" && config.hiddenMask and (1 shl 2) == 0) ||
+            (target.key == "tieba" && config.isTiebaPublishVisible())) {
             item {
                 Card(Modifier.fillMaxWidth()) {
                     SwitchPreference(
@@ -780,9 +827,13 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                         summary = if (target.key == "xianyu") "开启后四个页面在左，黄色液态玻璃拍照键独立在右，底色跟随底栏透明度设置。"
                             else if (target.key == "zhihu") "开启后四个页面在左，半透明蓝色发布键独立在右，两部分分别绘制阴影。"
                             else if (target.key == "xhs") "开启后四个页面在左，红色发布键独立在右，两部分分别绘制阴影。"
+                            else if (target.key == "tieba") "开启后四个页面在左，蓝色发布键独立在右，整体左右边距不变。"
                             else "开启后四个页面在左，粉色发布键独立在右，整体左右边距不变。",
                         checked = config.detachedPublish,
-                        onCheckedChange = { actions.setAppConfig(target.packageName, config.copy(detachedPublish = it)) },
+                        onCheckedChange = { checked -> actions.setAppConfig(target.packageName, config.copy(
+                            detachedPublish = checked,
+                            bilibiliDetachedSearch = if (target.key == "bilibili" && checked) false else config.bilibiliDetachedSearch,
+                        )) },
                     )
                 }
             }
@@ -892,7 +943,7 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
         } else if (labels.isNotEmpty() && target.key != "meituan_main") {
             item {
                 Card(Modifier.fillMaxWidth()) {
-                    labels.indices.filterNot { it in target.automaticEntryIndices }.forEach { index ->
+                    toggleIndices.filterNot { it in target.automaticEntryIndices }.forEach { index ->
                     val enabled = config.hiddenMask and (1 shl index) == 0
                     SwitchPreference(
                         title = labels[index],
@@ -904,7 +955,7 @@ private fun MiuixAppOverride(target: TargetSpec, settings: ManagerSettings, padd
                         onCheckedChange = { checked ->
                             val mask = if (checked) config.hiddenMask and (1 shl index).inv()
                             else config.hiddenMask or (1 shl index)
-                            actions.setAppConfig(target.packageName, config.copy(hiddenMask = mask))
+                            actions.setAppConfig(target.packageName, config.withEntryVisibilityMask(target.key, mask))
                         },
                     )
                     }
@@ -950,6 +1001,7 @@ private fun MiuixSearchBox(value: String, onChange: (String) -> Unit, settings: 
     val fill = CardDefaults.defaultColors().color
     val dark = LocalIosDark.current
     val optical = settings.liquidGlassEnabled && !settings.solidBarEnabled
+    val searchEdge = remember { ManagerGlassEdge() }
     val dynamicHighlight = if (optical) rememberGravityRotatedHighlight(
         iosIndicatorSpecular, -45f, settings.glass.postureEffectsEnabled,
     ) else iosIndicatorSpecular
@@ -979,8 +1031,7 @@ private fun MiuixSearchBox(value: String, onChange: (String) -> Unit, settings: 
                 if (settings.liquidGlassEnabled) managerLens((12 + 4 * press).dp.toPx(), (12 + 4 * press).dp.toPx())
             }
         },
-        highlight = { dynamicHighlight.copy(
-            alpha = if (optical && settings.outlineEnabled) 0.22f + 0.18f * press else 0f) },
+        highlight = { iosIndicatorSpecular.copy(alpha = 0f) },
         layerBlock = {
             val scale = if (settings.liquidGlassEnabled && !settings.solidBarEnabled) 1f + 0.035f * press else 1f
             scaleX = scale; scaleY = scale
@@ -990,6 +1041,10 @@ private fun MiuixSearchBox(value: String, onChange: (String) -> Unit, settings: 
             if (optical && press > 0.001f) drawRect(androidx.compose.ui.graphics.Brush.radialGradient(
                 colors = listOf(Color.White.copy(alpha = 0.20f * press.coerceIn(0f, 1f)), Color.Transparent),
                 center = touch, radius = 140.dp.toPx()))
+            if (optical && settings.outlineEnabled) {
+                val light = (dynamicHighlight.style as top.yukonga.miuix.kmp.blur.highlight.BloomStroke).primaryLight.position
+                searchEdge.draw(this, shape, dark, (.22f + .18f * press) * 2f * settings.glass.darkBarHighlightStrength, light.x, light.y)
+            }
         },
     )) {
         Row(
@@ -1094,6 +1149,7 @@ private fun MiuixEffectSlider(
     valueSuffix: String = "",
     detents: List<SliderDetent> = emptyList(),
     onPreview: (Float) -> Unit = {},
+    valueFormatter: ((Float) -> String)? = null,
     onChange: (Float) -> Unit,
 ) {
     var localValue by remember(value) { mutableFloatStateOf(value) }
@@ -1123,7 +1179,7 @@ private fun MiuixEffectSlider(
                 if ('\n' in localizedTitle) ManagerCardDescription(localizedTitle.substringAfter('\n'))
             }
             Text(
-                if (valueSuffix.isEmpty()) "${"%.1f".format(localValue)}" else "${localValue.toInt()}$valueSuffix",
+                valueFormatter?.invoke(localValue) ?: if (valueSuffix.isEmpty()) "${"%.1f".format(localValue)}" else "${localValue.toInt()}$valueSuffix",
                 color = MiuixTheme.colorScheme.primary,
                 fontWeight = FontWeight.Medium,
             )
@@ -1205,10 +1261,28 @@ private fun MiuixSettings(settings: ManagerSettings, padding: PaddingValues, act
                     onCheckedChange = { actions.setGlassConfig(settings.glass.copy(postureEffectsEnabled = it)) },
                 )
                 SwitchPreference(
+                    title = "简化切页动画",
+                    summary = "开启时滑块保持原尺寸平移并保留折射；关闭后恢复放大。冷切页等待不变。",
+                    checked = settings.glass.simplifyTabSwitch,
+                    onCheckedChange = { actions.setGlassConfig(settings.glass.copy(simplifyTabSwitch = it)) },
+                )
+                SwitchPreference(
+                    title = "滑块照亮效果",
+                    summary = "关闭后取消底栏滑块交互时的照亮和阴影。",
+                    checked = settings.glass.indicatorInteractionLightEnabled,
+                    onCheckedChange = { actions.setGlassConfig(settings.glass.copy(indicatorInteractionLightEnabled = it)) },
+                )
+                SwitchPreference(
                     title = "描边",
                     summary = "控制纯模糊/纯色底栏的反色描边，以及液态底栏的高光描边。",
                     checked = settings.outlineEnabled,
                     onCheckedChange = actions.setOutlineEnabled,
+                )
+                SwitchPreference(
+                    title = "底栏无字模式",
+                    summary = "有图标和文字的底栏只显示图标，并垂直居中。",
+                    checked = settings.glass.bottomBarIconOnly,
+                    onCheckedChange = { actions.setGlassConfig(settings.glass.copy(bottomBarIconOnly = it)) },
                 )
                 SwitchPreference(
                     title = "使用经典导航键",
@@ -1226,7 +1300,8 @@ private fun MiuixSettings(settings: ManagerSettings, padding: PaddingValues, act
         }
         // Hide only the posture controls; preserve their saved values and stable item keys.
         val firstSliderIndex = if (settings.glass.postureEffectsEnabled) 0 else 3
-        val sliderIndices = (firstSliderIndex..6).filterNot { settings.solidBarEnabled && (it == 3 || it == 4 || it == 6) }
+        val sliderIndices = (firstSliderIndex..6).filterNot { settings.solidBarEnabled && (it == 3 || it == 4 || it == 6) } +
+            (if (settings.liquidGlassEnabled && !settings.solidBarEnabled) listOf(8, 7) else emptyList())
         if (settings.iosStyle) {
             // Separate cards must be separate lazy items, not one eager column.
             items(sliderIndices.size, key = { "settings-slider-${sliderIndices[it]}" }, contentType = { "settings-slider" }) { index ->
@@ -1272,7 +1347,7 @@ private fun MiuixSettingsSlider(index: Int, settings: ManagerSettings, actions: 
         3 -> MiuixEffectSlider(
                     title = "底色透明度\n深浅色统一 · 100% 为完全透明",
                     value = (1f - settings.glass.lightAlpha) * 100f,
-                    range = 20f..100f, valueSuffix = "%", hapticTriggerValue = 100f,
+                    range = 20f..100f, valueSuffix = "%", hapticTriggerValue = GlassConfig.DEFAULT_BAR_TRANSPARENCY_PERCENT,
                     onChange = { actions.setGlassConfig(settings.glass.copy(
                         lightAlpha = 1f - it / 100f, darkAlpha = 1f - it / 100f)) },
                 )
@@ -1280,7 +1355,7 @@ private fun MiuixSettingsSlider(index: Int, settings: ManagerSettings, actions: 
                     title = "模糊半径\n默认 0.0",
                     value = settings.glass.blurRadius,
                     range = 0f..16f,
-                    hapticTriggerValue = 0f,
+                    hapticTriggerValue = GlassConfig.DEFAULT_BLUR_RADIUS,
                     onChange = {
                         actions.setGlassConfig(settings.glass.copy(blurRadius = it))
                     },
@@ -1289,16 +1364,28 @@ private fun MiuixSettingsSlider(index: Int, settings: ManagerSettings, actions: 
                     title = "底栏高度\n50–64 dp",
                     value = settings.glass.barHeight,
                     range = GlassConfig.MIN_BAR_HEIGHT..GlassConfig.MAX_BAR_HEIGHT,
-                    hapticTriggerValue = 50f,
+                    hapticTriggerValue = GlassConfig.DEFAULT_BAR_HEIGHT,
                     onChange = {
                         actions.setGlassConfig(settings.glass.copy(barHeight = it))
                     },
                 )
+        8 -> MiuixEffectSlider(
+            title = "高光透明度\n深浅色同时生效 · 默认 45% · 100% 隐藏高光",
+            value = settings.glass.highlightTransparency * 100f,
+            range = 0f..100f, valueSuffix = "%", hapticTriggerValue = GlassConfig.DEFAULT_HIGHLIGHT_TRANSPARENCY_PERCENT,
+            onChange = { actions.setGlassConfig(settings.glass.copy(highlightTransparency = it / 100f)) },
+        )
+        7 -> MiuixEffectSlider(
+            title = "折射强度\n默认 120% · 100% 原有强度 · 最高 200% · 不影响桌面",
+            value = settings.glass.refractionStrength,
+            range = 0f..200f, valueSuffix = "%", hapticTriggerValue = GlassConfig.DEFAULT_REFRACTION_STRENGTH,
+            onChange = { actions.setGlassConfig(settings.glass.copy(refractionStrength = it)) },
+        )
         6 -> MiuixEffectSlider(
-                    title = "深色模式高光描边强度\n仅调整底栏外框 · 默认 50%",
+                    title = "高光描边强度\n适用于深浅色液态玻璃控件 · 默认 60%",
                     value = settings.glass.darkBarHighlightStrength * 100f,
-                    range = 50f..170f,
-                    hapticTriggerValue = 50f,
+                    range = 0f..170f,
+                    hapticTriggerValue = GlassConfig.DEFAULT_HIGHLIGHT_STRENGTH_PERCENT,
                     onChange = {
                         actions.setGlassConfig(settings.glass.copy(darkBarHighlightStrength = it / 100f))
                     },
@@ -1325,4 +1412,5 @@ private fun MiuixList(
         content = content,
     )
 }
+
 

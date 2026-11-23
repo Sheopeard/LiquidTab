@@ -30,6 +30,10 @@ internal class DouyinPageController(private val context: Context) {
         DouyinControlMarginGuard.release(layer)
     }
     private val listPages = DouyinListPages.Layout(context.classLoader)
+    private data class CouponOffset(val original: Float, var applied: Float)
+    private val grouponCouponOffsets = WeakHashMap<View, CouponOffset>()
+    private val grouponCouponPosition = IntArray(2)
+    private val grouponBarPosition = IntArray(2)
     private val feedCornerMasks = DouyinFeedCornerMasks()
     // Classification only: refreshed every layout-maintenance pass so newly
     // attached players and page changes never inherit an old negative result.
@@ -66,6 +70,9 @@ internal class DouyinPageController(private val context: Context) {
     private val density = context.resources.displayMetrics.density
     private var currentRoot: ViewGroup? = null
     private var currentBarHeightPx = 0
+    private val videoControlAnchors = java.util.WeakHashMap<View, Int>()
+    private val barPosition = IntArray(2)
+    private val barRootPosition = IntArray(2)
     private var progressGapReported = false
     private val progressTrackPosition = IntArray(2)
     private val diagnosticsEnabled = java.io.File(context.getExternalFilesDir(null), "dy_diagnostics").exists()
@@ -173,7 +180,10 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
         // A cached visible secondary profile owns its native layout. Keep the
         // cheap visibility check alive for immediate return animations, but
         // avoid rediscovering the entire profile grid on every draw.
-        if (otherProfilePageActive()) return
+        if (otherProfilePageActive()) {
+            context.findActivity()?.let { DouyinCommentLayoutHooks.updateNavigationAppearance(it, root) }
+            return
+        }
 
         // Douyin may restore its navigation-bar inset while changing feed tabs.
 
@@ -181,7 +191,10 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
 
         // whether the liquid host itself is temporarily visible.
 
-        context.findActivity()?.let(GlassInstaller::ensureNavigationBarImmersion)
+        context.findActivity()?.let { activity ->
+            GlassInstaller.setNavigationBarImmersion(activity, !DouyinCommentLayoutHooks.requiresNativeNavigationFit(root))
+            DouyinCommentLayoutHooks.updateNavigationAppearance(activity, root)
+        }
 
         val now = SystemClock.uptimeMillis()
 
@@ -202,6 +215,17 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
         }
 
 
+
+        val mall = listPages.activeMallRoot
+        douyinShopPageActive = mall != null
+        adjustDouyinShopBackToTop(root, mall, (root.height - barHeightPx).coerceAtLeast(0))
+        if (mall != null) return
+
+        listPages.activeGrouponRoot?.let { group ->
+            douyinShopPageActive = false
+            updateGrouponOverlay(group, root, host, now)
+            return
+        }
 
         var bottomSpace = douyinBottomSpace?.get()?.takeIf { it.isAttachedToWindow }
 
@@ -228,7 +252,6 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
 
             .coerceAtLeast(0)
 
-        adjustDouyinShopBackToTop(root, clearanceTop)
 
         val douyinPagerCandidates = ArrayList<View>()
 
@@ -236,7 +259,6 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
         // Reuse this pass for subpage discovery instead of walking the same
         // (potentially thousands of list item) views separately for each page.
         var groupBuySelected = false
-        var groupBuyContent: View? = null
         var groupBuyBackToTop: View? = null
         var messageTitle: View? = null
         var messageList: View? = null
@@ -250,12 +272,11 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
         stack.clear()
         stack.push(root, 0)
 
-        douyinShopPageActive = false
-        val rootScreen = IntArray(2).also(root::getLocationOnScreen)
 
         while (stack.isNotEmpty() && visited++ < DOUYIN_LAYOUT_MAX_VIEWS) {
 
             val (view, depth) = stack.removeLast()
+            if (listPages.isGrouponViewport(view)) continue
 
             val idName = viewResourceEntryName(view)
             DouyinFeedViewport.fillFromPage(view, releaseViewportLift)
@@ -309,13 +330,6 @@ private val douyinAdvertisementCache = java.util.WeakHashMap<View, Pair<Long, Bo
                     view.requestLayout()
                 }
                 douyinMarginTargets.remove(view)
-            }
-
-            if (idName == "pmr" && view.isShown && view.width >= root.width * 0.85f) {
-                val shopScreen = IntArray(2).also(view::getLocationOnScreen)
-                if (kotlin.math.abs(shopScreen[0] - rootScreen[0]) < root.width * 0.5f) {
-                    douyinShopPageActive = true
-                }
             }
 
             if (view.isShown && view.width >= root.width * 0.85f &&
@@ -573,6 +587,7 @@ if (relatedHit && view.isAttachedToWindow) {
                 for (index in 0 until pageHost.childCount) {
                     val page = pageHost.getChildAt(index)
                     if (isUnderProfileContent(page)) continue
+                    if (DouyinListPages.role(page) == "homepage_groupon") continue
                     if (!page.isAttachedToWindow || page.width < root.width * 0.85f ||
                         douyinPageLooksLikeAdvertisement(page) ||
                         douyinPageContainsCouponRoot(page)
@@ -606,7 +621,7 @@ if (relatedHit && view.isAttachedToWindow) {
         douyinExpandedPagers.retainAll(aliveCodes)
 
         adjustDouyinCouponPage(root, clearanceTop)
-        adjustDouyinGroupBuyPage(root, groupBuySelected, groupBuyContent, groupBuyBackToTop)
+        adjustDouyinGroupBuyPage(root, groupBuySelected, groupBuyBackToTop)
         adjustDouyinMessagePage(root, messageTitle, messageList)
         // Compound comments are handled in their own window by DouyinCommentLayoutHooks.
 
@@ -621,7 +636,7 @@ if (relatedHit && view.isAttachedToWindow) {
                     // These list pages have their own fill-to-bottom rules and
                     // no video overlay to lift. Do not run the nested geometry
                     // fallback over their cards on every maintenance pass.
-                    if (groupBuyContent?.let { douyinContainsView(page, it) } == true ||
+                    if (DouyinListPages.role(page) == "homepage_groupon" ||
                         messageList?.let { douyinContainsView(page, it) } == true) continue
                     // Nested pagers inside a controls root do not own a
                     // second lift. In early layout they can otherwise cache
@@ -683,6 +698,25 @@ if (relatedHit && view.isAttachedToWindow) {
         // page-relative position fixed, so swiping slides the controls
         // together with the video exactly like the native feed.
 
+        val measuredVideoBar = host is GlassHostLayout && host.height > 0 && host.isShown
+        val videoControlTop = if (measuredVideoBar) {
+            host.getLocationOnScreen(barPosition)
+            root.getLocationOnScreen(barRootPosition)
+            // Use the laid-out panel edge without the transient exit animation offset.
+            barPosition[1] - barRootPosition[1] - host.translationY.roundToInt()
+        } else {
+            clearanceTop
+        }
+
+        val videoControlGap = if (measuredVideoBar) {
+            val bottomGap = (root.height - videoControlTop - host.height).coerceAtLeast(0)
+            2 * (bottomGap / 2)
+        } else {
+            (20f * density).roundToInt()
+        }
+        val videoControlBottom = videoControlTop - videoControlGap
+        val videoControlExtra = videoControlGap - (DOUYIN_CONTROL_SAFE_GAP_DP * density).roundToInt()
+
         for (target in controlsRoots.keys) {
             val name = viewResourceEntryName(target)
             val namedRoot = douyinIsVideoControlsRoot(target)
@@ -702,12 +736,12 @@ if (relatedHit && view.isAttachedToWindow) {
                 !douyinContainsFullWidthPhoto(target, root) &&
                 !douyinContainsGroupBuyContent(target)
             ) {
+                updateVideoControlAnchor(target, videoControlBottom)
                 liftDouyinControlByMargin(
                     target,
                     root,
-                    clearanceTop,
-                    ((DOUYIN_CONTROLS_EXTRA_LIFT_DP +
-                        if (classicNavigationLift) DOUYIN_CLASSIC_CONTROLS_EXTRA_DP else 0f) * density).roundToInt(),
+                    videoControlTop,
+                    videoControlExtra,
                 )
             }
         }
@@ -766,8 +800,7 @@ if (relatedHit && view.isAttachedToWindow) {
             for (target in relatedSearchChips) {
                 if (target === progressControl) continue
                 if (douyinContainsGroupBuyContent(target)) continue
-                val name = viewResourceEntryName(target)
-                if (name == DOUYIN_CONTROLS_ROOT_ID || name == DOUYIN_CONTROLS_ROOT_ID_ALT) continue
+                if (douyinIsVideoControlsRoot(target)) continue
                 chip = target
                 douyinCachedChipRef = WeakReference(target)
                 break
@@ -777,7 +810,8 @@ if (relatedHit && view.isAttachedToWindow) {
         // A structural controls root is already raised above with its extra
         // clearance. Never apply the independent-pill lift to that same View.
         if (chip != null && douyinPageControlsCache.values.none { it === chip }) {
-            liftDouyinControlByMargin(chip!!, root, clearanceTop)
+            updateVideoControlAnchor(chip, videoControlBottom)
+            liftDouyinControlByMargin(chip, root, videoControlTop, videoControlExtra)
         }
 
         val diagNow = SystemClock.uptimeMillis()
@@ -945,21 +979,12 @@ if (relatedHit && view.isAttachedToWindow) {
         view.javaClass.simpleName == "MonitorScrollFrameLayout"
 
     private fun douyinIsVideoControlsRoot(view: View): Boolean {
-        val name = viewResourceEntryName(view)
-        if (name == DOUYIN_CONTROLS_ROOT_ID || name == DOUYIN_CONTROLS_ROOT_ID_ALT) return true
-        // 40.6.0 runtime records identify i6 as the actual controls root.
-        // Its loading children (e.g. i-6) must never become a second lift owner.
         val parent = view.parent as? View ?: return false
-        if (name == "i-6" && view.javaClass.simpleName == "MeasureOnceCheckDrawChildRelativeLayout" &&
-            viewResourceEntryName(parent) == "i6" &&
-            parent.javaClass.simpleName == "PenetrateTouchRelativeLayout") {
-            val frame = parent.parent as? View ?: return false
-            return frame.javaClass.simpleName == "MonitorScrollFrameLayout" &&
-                (frame.parent as? View)?.javaClass?.simpleName == "VideoViewHolderRootView"
-        }
-        return name == "i6" && view.javaClass.simpleName == "PenetrateTouchRelativeLayout" &&
-            parent.javaClass.simpleName == "MonitorScrollFrameLayout" &&
-            (parent.parent as? View)?.javaClass?.simpleName == "VideoViewHolderRootView"
+        val controls = if (view.javaClass.simpleName == "MeasureOnceCheckDrawChildRelativeLayout") parent else view
+        val frame = controls.parent as? View ?: return false
+        return controls.javaClass.simpleName == "PenetrateTouchRelativeLayout" &&
+            frame.javaClass.simpleName == "MonitorScrollFrameLayout" &&
+            (frame.parent as? View)?.javaClass?.simpleName == "VideoViewHolderRootView"
     }
 
     private fun douyinIsFeaturedFeedRoot(view: View): Boolean =
@@ -1011,23 +1036,30 @@ if (relatedHit && view.isAttachedToWindow) {
 
     private fun adjustDouyinShopBackToTop(
         root: ViewGroup,
+        mall: View?,
         clearanceTop: Int,
-        forceSearch: Boolean = false,
+
     ) {
         fun inShopContainer(view: View): Boolean {
             var current: View? = view
             while (current != null && current !== root) {
-                if (viewResourceEntryName(current) == "pmr") return true
+                if (current === mall) return true
                 current = current.parent as? View
             }
             return false
         }
 
         val previous = douyinShopBackToTopRef?.get()
+        if (mall == null) {
+            if (previous?.isAttachedToWindow == true) previous.translationY = douyinShopBackToTopBaseTranslation
+            douyinShopBackToTopRef = null
+            douyinShopBackToTopLastSearchAt = 0L
+            return
+        }
         var button = previous?.takeIf { it.isAttachedToWindow && it.isShown &&
             inShopContainer(it) }
         val now = SystemClock.uptimeMillis()
-        if (button == null && !forceSearch && now - douyinShopBackToTopLastSearchAt < 400L) {
+        if (button == null && now - douyinShopBackToTopLastSearchAt < 400L) {
             if (previous != null && previous.isAttachedToWindow) {
                 previous.translationY = douyinShopBackToTopBaseTranslation
             }
@@ -1037,11 +1069,12 @@ if (relatedHit && view.isAttachedToWindow) {
         if (button == null) {
             douyinShopBackToTopLastSearchAt = now
             val stack = ArrayDeque<Pair<View, Int>>()
-            stack += root to 0
+            stack += mall to 0
             var visited = 0
-            while (stack.isNotEmpty() && visited++ < DOUYIN_LAYOUT_MAX_VIEWS) {
+            while (stack.isNotEmpty() && visited++ < 512) {
                 val (view, depth) = stack.removeLast()
-                if (view.isShown && view.contentDescription?.toString()?.contains("返回顶部") == true &&
+                if (!view.isShown || listPages.isRecycler(view) || view is android.webkit.WebView) continue
+                if (view.contentDescription?.toString()?.contains("返回顶部") == true &&
                     view.width < root.width * 0.2f && inShopContainer(view)
                 ) {
                     button = view.parent as? View ?: view
@@ -1096,10 +1129,63 @@ if (relatedHit && view.isAttachedToWindow) {
     private fun douyinContainsGroupBuyContentUncached(container: View): Boolean =
         DouyinListPages.contains(container)
 
+    val grouponPageActive: Boolean get() = listPages.activeGrouponRoot != null
+    private var grouponOverlayRoot = WeakReference<View>(null)
+    private var grouponCoupon = WeakReference<View>(null)
+    private var grouponBackButton = WeakReference<View>(null)
+    private var grouponOverlayProbeAt = Long.MIN_VALUE
+
+    private fun updateGrouponOverlay(group: View, root: ViewGroup, host: View, now: Long) {
+        if (grouponOverlayRoot.get() !== group || now - grouponOverlayProbeAt >= 250L) {
+            grouponOverlayProbeAt = now
+            grouponOverlayRoot = WeakReference(group)
+            var coupon: View? = null
+            var ambiguousCoupon = false
+            var button: View? = null
+            val stack = rootScan
+            stack.clear()
+            stack.push(group, 0)
+            var visited = 0
+            while (stack.isNotEmpty() && visited++ < 512) {
+                val (view, depth) = stack.removeLast()
+                if (!view.isShown || listPages.isRecycler(view)) continue
+                if (isGrouponCoupon(view)) {
+                    if (coupon == null) coupon = view else ambiguousCoupon = true
+                    continue
+                }
+                if (view.isClickable && view.contentDescription?.toString()?.contains("回到顶部") == true) {
+                    button = view
+                }
+                if (view is ViewGroup && depth < 24) {
+                    for (index in 0 until view.childCount) stack.push(view.getChildAt(index), depth + 1)
+                }
+            }
+            stack.clear()
+            grouponCoupon = WeakReference(coupon.takeUnless { ambiguousCoupon })
+            grouponBackButton = WeakReference(button)
+        }
+        adjustDouyinGroupBuyPage(root, true, grouponBackButton.get()?.takeIf { it.isAttachedToWindow && it.isShown })
+        val coupon = grouponCoupon.get()?.takeIf { it.isAttachedToWindow && it.isShown && isGrouponCoupon(it) } ?: return
+        if (!host.isLaidOut || host.height <= 0 || coupon.height <= 0) return
+        val previous = grouponCouponOffsets[coupon]
+        val native = if (previous != null && previous.applied == coupon.translationY) previous.original else coupon.translationY
+        coupon.getLocationOnScreen(grouponCouponPosition)
+        host.getLocationOnScreen(grouponBarPosition)
+        val nativeBottom = grouponCouponPosition[1] + coupon.height - (coupon.translationY - native)
+        val desired = native + (grouponBarPosition[1] - 8f * density - nativeBottom).coerceAtMost(0f)
+        if (kotlin.math.abs(desired - coupon.translationY) > 1f) {
+            grouponCouponOffsets[coupon] = CouponOffset(native, desired)
+            coupon.translationY = desired
+        }
+    }
+
+    private fun isGrouponCoupon(view: View): Boolean =
+        view.javaClass.name == "com.bytedance.locallife.groupon.bizmodule.popup.grouponcommonfloat.GrouponCommonFloatAnnieXView" &&
+            (view.parent as? View)?.javaClass?.name == "com.bytedance.locallife.groupon.bizmodule.popup.feeddialog.NearbyCommonDialogContainer"
+
     private fun adjustDouyinGroupBuyPage(
         root: ViewGroup,
         selected: Boolean,
-        content: View?,
         backToTop: View?,
     ) {
         if (!selected) {
@@ -1558,6 +1644,10 @@ if (relatedHit && view.isAttachedToWindow) {
      *  The lift derives from the layout position without the current
 
      *  margin, which keeps the target self-stable frame to frame. */
+
+    private fun updateVideoControlAnchor(view: View, top: Int) {
+        if (videoControlAnchors.put(view, top) != top) douyinMarginTargets.remove(view)
+    }
 
     private fun liftDouyinControlByMargin(
         view: View,
@@ -2582,6 +2672,12 @@ if (relatedHit && view.isAttachedToWindow) {
 
 
     fun dispose() {
+        currentRoot?.let { adjustDouyinShopBackToTop(it, null, 0) }
+        douyinShopPageActive = false
+        grouponCouponOffsets.forEach { (view, offset) ->
+            if (view.translationY == offset.applied) view.translationY = offset.original
+        }
+        grouponCouponOffsets.clear()
         listPages.dispose()
         douyinMarginTargets.keys.forEach(DouyinControlMarginGuard::release)
         videoContainerProbe.clear()
@@ -2620,12 +2716,8 @@ if (relatedHit && view.isAttachedToWindow) {
         const val DOUYIN_LAYOUT_MAX_DEPTH = 24
         const val DOUYIN_BOTTOM_SPACE_ID = "bottom_space"
         const val DOUYIN_FEED_PAGER_ID = "viewpager"
-        const val DOUYIN_CONTROLS_ROOT_ID = "i7"
-        const val DOUYIN_CONTROLS_ROOT_ID_ALT = "ja"
         const val DOUYIN_PROGRESS_TRACK = "com.ss.android.ugc.aweme.o.seekbar.views.seekbar.ProSeekBarView"
         const val DOUYIN_PROGRESS_OWNER = "com.ss.android.ugc.aweme.o.seekbar.DProSeekBar"
-        const val DOUYIN_CONTROLS_EXTRA_LIFT_DP = 40f
-        const val DOUYIN_CLASSIC_CONTROLS_EXTRA_DP = 16f
         const val DOUYIN_PROGRESS_EXTRA_LIFT_DP = 10f
         const val DOUYIN_CONTROL_SAFE_GAP_DP = 3f
         const val DOUYIN_PADDING_EXTRA_LIFT_DP = 60f

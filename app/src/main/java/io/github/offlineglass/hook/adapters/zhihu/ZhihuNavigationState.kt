@@ -39,7 +39,7 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
     private var blurredConfig: io.github.offlineglass.config.GlassConfig? = null
     override fun opticalBlurNodeNeedsRecord(prepared: Boolean, backdrop: android.graphics.Bitmap?,
         width: Int, height: Int, effect: android.graphics.RenderEffect?): Boolean =
-        !prepared || blurredBitmap !== backdrop || blurredGeneration != (backdrop?.generationId ?: -1) ||
+        backdrop == null || !prepared || blurredBitmap !== backdrop || blurredGeneration != (backdrop?.generationId ?: -1) ||
             blurredWidth != width || blurredHeight != height || blurredEffect !== effect || blurredConfig != host.config
     override fun onOpticalBlurNodeRecorded(backdrop: android.graphics.Bitmap?, width: Int,
         height: Int, effect: android.graphics.RenderEffect?) {
@@ -106,16 +106,6 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
     }
     override fun pageAllowsNavigation(root: View?): Boolean = ZhihuSettingsVisibility.allowsNavigation(root)
     override val allowsSoftwareBackdropCapture = false
-    // Both readback completion and optical rendering must draw native leaves on the UI thread.
-    override fun opticalSurfaceCopyHandler() = mainHandler
-    override fun skipLiveBackdrop(selectedIndex: Int) = true
-    override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
-        if (host.liveBackdropActiveForAdapter) host.clearLiveBackdropForAdapter()
-        host.disableOpticalSurfaceNativeBlurForAdapter()
-        host.enableOpticalSurfaceRendererForAdapter()
-        return true
-    }
-
     override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) {
         val now = SystemClock.uptimeMillis()
         val count = source?.let(ZhihuAdapter::tabCount) ?: 0
@@ -228,8 +218,8 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
         val frame = AdapterNavigationFrame(host.context, 1f, items.size, host.width, host.height,
             boxSize, density, config.iconScale, config.textSize,
             host.resources.displayMetrics.scaledDensity, selectedIndex, items.indices.toList(),
-            config.iconOnly, dark, 0)
-        drawSlot(canvas, index, centerX, centerY, frame, 1f)
+            config.iconOnly || config.bottomBarIconOnly, dark, 0)
+        drawSlot(canvas, index, centerX, if (frame.iconOnly) host.height / 2f else centerY, frame, 1f)
         return true
     }
 
@@ -243,7 +233,7 @@ internal class ZhihuNavigationState(private val host: GlassHostLayout) : AppNavi
             ?: item.animation?.takeIf { it.visibility == View.VISIBLE && it.width > 0 && it.height > 0 }
             ?: item.icon?.takeIf { it.visibility == View.VISIBLE && it.width > 0 && it.height > 0 }
         val isCenterAction = items.size == 5 && index == 2
-        val label = item.label?.takeIf { !isCenterAction && !frame.iconOnly && it.visibility == View.VISIBLE && it.text.isNotEmpty() }
+        val label = item.label?.takeIf { !isCenterAction && (!frame.iconOnly || icon == null) && it.visibility == View.VISIBLE && it.text.isNotEmpty() }
         val enlargePageIcon = items.size == 5 && index in listOf(0, 1, 3)
         val iconMultiplier = if (isCenterAction) 1.6f * 1.2f * 1.15f else if (enlargePageIcon) 1.2f * 1.12f else 1.2f
         val iconSize = if (icon == null) 0f else 24f * frame.density * frame.iconScale * iconMultiplier

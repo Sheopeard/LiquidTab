@@ -61,12 +61,26 @@ data class UiActions(
 
 internal fun entryLabels(targetKey: String, settings: io.github.offlineglass.config.ManagerSettings? = null): List<String> {
     val spec = TargetSpecRegistry.all.firstOrNull { it.key == targetKey }
-    settings?.appEntryLabels?.get(spec?.packageName)?.takeIf { it.isNotEmpty() }?.let { return it }
+    // YouTube controls retain semantic bit positions, with unavailable roles omitted.
+    if (targetKey == "youtube") return spec?.entryLabels.orEmpty()
+    settings?.appEntryLabels?.get(spec?.packageName)?.takeIf { it.isNotEmpty() }?.let { labels ->
+        return if (targetKey == "zhihu")
+            labels.mapIndexed { index, label -> if (index == 2) "发布" else label }
+        else labels
+    }
     return when (targetKey) {
     "qq" -> listOf("消息", "联系人", "动态")
     else -> TargetSpecRegistry.all.firstOrNull { it.key == targetKey }?.entryLabels ?: emptyList()
 }
 }
+
+internal fun GlassConfig.withEntryVisibilityMask(targetKey: String, mask: Int): GlassConfig =
+    copy(
+        hiddenMask = mask,
+        detachedPublish = detachedPublish &&
+            !((targetKey == "zhihu" || targetKey == "xianyu" || targetKey == "tiktok" || targetKey == "youtube") &&
+                ((hiddenMask or mask) and (1 shl 2)) != 0),
+    )
 
 internal data class MiMarketTabToggle(
     val key: String,

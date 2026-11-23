@@ -21,8 +21,16 @@ public final class XApkIndex {
         }
         public String key() { return owner+"->"+name+"("+String.join("",args)+")"+result; }
         public String toString() { return key(); }
-        public boolean equals(Object o) { return o instanceof MethodRef && key().equals(((MethodRef)o).key()); }
-        public int hashCode() { return key().hashCode(); }
+        public boolean equals(Object other) {
+            if(this==other) return true;
+            if(!(other instanceof MethodRef)) return false;
+            MethodRef method=(MethodRef)other;
+            return owner.equals(method.owner) && name.equals(method.name) && result.equals(method.result) && args.equals(method.args);
+        }
+        public int hashCode() {
+            int hash=31*owner.hashCode()+name.hashCode();
+            return 31*(31*hash+result.hashCode())+args.hashCode();
+        }
     }
     public final Map<String,List<MethodRef>> matches=new LinkedHashMap<>();
     private final Map<String,Set<String>> tabFields=new HashMap<>();
@@ -65,22 +73,61 @@ public final class XApkIndex {
                 new Dex(data,index).scan();
             }
         }
+        for (MethodRef candidate : index.matches.getOrDefault("bottomShape", Collections.emptyList())) {
+            if (index.semantics.getOrDefault(candidate, Collections.emptySet()).contains("BottomBarOffsetAnimation") ||
+                index.calls.getOrDefault(candidate, Collections.emptyList()).stream().anyMatch(call ->
+                    index.semantics.getOrDefault(call, Collections.emptySet()).contains("BottomBarOffsetAnimation"))) {
+                index.add("bottom", candidate);
+                for (MethodRef call : index.calls.getOrDefault(candidate, Collections.emptyList())) {
+                    if (index.semantics.getOrDefault(call, Collections.emptySet()).contains("BottomBarOffsetAnimation"))
+                        index.add("bottomAnimationDependency", call);
+                }
+            }
+        }
+        index.matches.remove("bottomShape");
         MethodRef bottom=index.unique("bottom");
         for(MethodRef m:index.landingCandidates) {
             long enums=m.args.stream().filter(p->index.tabFields.getOrDefault(p,Collections.emptySet()).containsAll(TAB_NAMES)).count();
             Set<String> anchors=index.semantics.getOrDefault(m,Collections.emptySet());
-            if(enums==1 && Collections.frequency(m.args,FUNCTION1)==1 &&
+            if(enums==1 && m.args.contains(FUNCTION1) &&
                 anchors.contains("onBottomBarHeightChanged") && anchors.contains("onGrokTabTooltipDismissed") &&
                 bottom!=null && index.reaches(m,bottom,3,new HashSet<>())) index.add("landing",m);
         }
         for(MethodRef m:index.fabCandidates)
             if(index.reachesNamespace(m,"Lcom/x/composer/fab/ui/",3,new HashSet<>())) index.add("postFab",m);
+        Set<MethodRef> drawerBranches=new HashSet<>();
+        for (Map.Entry<MethodRef,List<MethodRef>> entry:index.calls.entrySet()) {
+            MethodRef parent=entry.getKey();
+            if(!parent.owner.startsWith("Lcom/x/main/")) continue;
+            for(String type:parent.args) {
+                if(!type.startsWith("Lcom/x/main/api/landing/")) continue;
+                MethodRef identity=new MethodRef(type,"toString","Ljava/lang/String;",Collections.emptyList());
+                if(!index.semantics.getOrDefault(identity,Collections.emptySet()).contains("DrawerState(accounts=")) continue;
+                index.add("drawerModelIdentity",identity);
+                for(MethodRef call:entry.getValue()) if(call.owner.equals(parent.owner)) drawerBranches.add(call);
+            }
+        }
         for (Map.Entry<MethodRef,List<MethodRef>> entry:index.calls.entrySet()) {
             MethodRef container=entry.getKey();
-            if(!container.owner.startsWith("Lcom/x/main/") || !container.args.contains(COMPOSER) ||
-                container.args.stream().filter(p->p.startsWith("Lcom/x/main/api/landing/")).count()<2) continue;
+            if(!container.owner.startsWith("Lcom/x/main/") || !container.args.contains(COMPOSER)) continue;
+            boolean landingDrawerHost=container.args.stream()
+                .filter(p->p.startsWith("Lcom/x/main/api/landing/")).count()>=2 ||
+                drawerBranches.contains(container);
+            if(!landingDrawerHost) continue;
             for(MethodRef renderer:entry.getValue()) {
                 List<String> args=renderer.args;
+                if(renderer.owner.startsWith("Lcom/x/main/drawer/") && renderer.result.equals("V") &&
+                    args.size()==7 && args.get(0).startsWith("Lcom/x/main/drawer/") &&
+                    args.get(1).equals("Z") && args.get(2).equals(args.get(4)) &&
+                    args.get(2).startsWith("Landroidx/compose/runtime/internal/") && args.get(3).equals(MODIFIER) &&
+                    args.subList(5,7).equals(Arrays.asList(COMPOSER,"I"))) {
+                    for(MethodRef reader:index.drawerOpenReaders)
+                        if(reader.owner.equals(args.get(0)) && reader.name.equals("isOpen")) {
+                            index.add("gestureDrawerContainer",container);
+                            index.add("gestureDrawerRenderer",renderer);
+                            index.add("gestureDrawerOpen",reader);
+                        }
+                }
                 if(!renderer.owner.startsWith("Landroidx/compose/material3/") || !renderer.result.equals("V") ||
                     args.size()!=8 || !args.get(1).equals(MODIFIER) || !args.get(0).equals(args.get(5)) ||
                     !args.get(0).startsWith("Landroidx/compose/runtime/internal/") ||
@@ -96,6 +143,12 @@ public final class XApkIndex {
                 }
             }
         }
+        for(MethodRef constructor:index.matches.getOrDefault("detailSlotOwner",Collections.emptyList())) {
+            if(index.calls.getOrDefault(constructor,Collections.emptyList()).stream().anyMatch(call ->
+                call.owner.equals(constructor.owner) && index.matches.getOrDefault("detailDestroy",Collections.emptyList()).contains(call)))
+                index.add("detailConstructor",constructor);
+        }
+        index.matches.remove("detailSlotOwner");
         MethodRef detail=index.unique("detailConstructor");
         List<MethodRef> exits=index.matches.get("detailDestroy");
         if(exits!=null) exits.removeIf(m -> detail==null || !m.owner.equals(detail.owner));
@@ -113,20 +166,49 @@ public final class XApkIndex {
             if(flags!=null) flags.removeIf(m->!m.owner.equals(area.owner));
         }
         MethodRef editor=index.unique("replyComposer"),border=index.unique("replyBorderFactory");
-        if(editor!=null && border!=null) {
+        if(editor!=null) {
             List<MethodRef> layouts=new ArrayList<>();
+            Map<MethodRef,Integer> surfaceDepths=new LinkedHashMap<>();
             for(Map.Entry<MethodRef,List<MethodRef>> entry:index.composerCalls.entrySet())
                 if(entry.getValue().stream().anyMatch(call->call.owner.equals(editor.owner) && call.name.equals("<init>"))) layouts.add(entry.getKey());
-            if(layouts.size()==1) for(Map.Entry<MethodRef,List<MethodRef>> entry:index.composerCalls.entrySet())
-                if(entry.getValue().contains(layouts.get(0)) && entry.getValue().contains(border)) index.add("replyBorderScope",entry.getKey());
+            if(layouts.size()==1) for(Map.Entry<MethodRef,List<MethodRef>> entry:index.composerCalls.entrySet()) {
+                MethodRef surface=entry.getKey();
+                if(surface.args.stream().filter(p->p.startsWith("Ldev/chrisbanes/haze/")).count()!=1) continue;
+                int depth=1;
+                while(depth<=4 && !index.reachesEditorLayout(surface,layouts.get(0),depth,new HashSet<>())) depth++;
+                boolean appliesHaze=entry.getValue().stream().anyMatch(call->call.result.equals(MODIFIER) &&
+                    call.args.stream().anyMatch(p->p.startsWith("Ldev/chrisbanes/haze/") && surface.args.contains(p)));
+                if(depth<=4 && (appliesHaze || entry.getValue().contains(border))) surfaceDepths.put(surface,depth);
+            }
+            int nearest=surfaceDepths.values().stream().min(Integer::compareTo).orElse(Integer.MAX_VALUE);
+            for(Map.Entry<MethodRef,Integer> candidate:surfaceDepths.entrySet()) {
+                if(candidate.getValue()!=nearest) continue;
+                MethodRef surface=candidate.getKey();
+                index.add("replySurface",surface);
+                if(index.composerCalls.get(surface).contains(border)) index.add("replyBorderScope",surface);
+            }
         }
         MethodRef mask=index.unique("replyMaskScope");
+        if(mask==null && !index.matches.containsKey("replyMaskScope") && index.unique("replySurface")!=null) {
+            MethodRef surface=index.unique("replySurface");
+            for(MethodRef wrapper:index.composerCalls.keySet()) {
+                if(wrapper.equals(surface) || !index.reachesEditorLayout(wrapper,surface,4,new HashSet<>())) continue;
+                for(MethodRef helper:index.calls.getOrDefault(wrapper,Collections.emptyList())) {
+                    List<String> p=helper.args;
+                    if(!helper.result.equals(MODIFIER) || p.size()!=5 || !p.containsAll(Arrays.asList(COMPOSER,MODIFIER,FUNCTION0,"I")) ||
+                        p.stream().noneMatch(t->t.startsWith("Ldev/chrisbanes/haze/") && surface.args.contains(t))) continue;
+                    for(MethodRef factory:index.calls.getOrDefault(helper,Collections.emptyList())) {
+                        if(isFooterFactory(factory) && p.contains(factory.args.get(1))) {
+                            index.add("replyMaskOwner",wrapper);
+                            index.add("replyMaskScope",helper);
+                            index.add("replyMaskFactory",factory);
+                        }
+                    }
+                }
+            }
+        }
         if(mask!=null) for(MethodRef call:index.composerCalls.getOrDefault(mask,Collections.emptyList())) {
-            List<String> p=call.args;
-            if(call.result.equals(MODIFIER) && p.size()==12 && p.get(0).equals(MODIFIER) &&
-                p.get(1).startsWith("Ldev/chrisbanes/haze/") && p.get(2).equals("J") &&
-                p.subList(4,7).equals(Arrays.asList("F","Z","F")) && p.get(8).equals(FUNCTION1) &&
-                p.subList(9,12).equals(Arrays.asList(COMPOSER,"I","I"))) index.add("replyMaskFactory",call);
+            if(isFooterFactory(call)) index.add("replyMaskFactory",call);
         }
         MethodRef bounds=index.unique("coordinateBounds");
         if(bounds!=null) for(MethodRef root:index.coordinateRoots.getOrDefault(bounds,Collections.emptyList())) index.add("coordinateRoot",root);
@@ -139,6 +221,27 @@ public final class XApkIndex {
         index.nodeConstructors.clear();index.nodeInvalidations.clear();index.drawInterfaces.clear();
         index.tabFields.clear();index.landingCandidates.clear();index.fabCandidates.clear();
         return index;
+    }
+    private static boolean isFooterFactory(MethodRef call) {
+        List<String> p=call.args;
+        return call.result.equals(MODIFIER) && p.size()==12 && p.get(0).equals(MODIFIER) &&
+            p.get(1).startsWith("Ldev/chrisbanes/haze/") && p.get(2).equals("J") &&
+            p.subList(4,7).equals(Arrays.asList("F","Z","F")) && p.get(8).equals(FUNCTION1) &&
+            p.subList(9,12).equals(Arrays.asList(COMPOSER,"I","I"));
+    }
+    private boolean reachesEditorLayout(MethodRef from,MethodRef layout,int depth,Set<MethodRef> seen) {
+        if(from.equals(layout)) return true;
+        if(depth<=0 || !seen.add(from)) return false;
+        for(MethodRef call:calls.getOrDefault(from,Collections.emptyList())) {
+            if(!call.owner.startsWith("Lcom/x/composer/minimal/")) continue;
+            if(reachesEditorLayout(call,layout,depth-1,seen)) return true;
+            if(call.name.equals("<init>")) {
+                MethodRef invoke=new MethodRef(call.owner,"invoke","Ljava/lang/Object;",
+                    Arrays.asList("Ljava/lang/Object;","Ljava/lang/Object;"));
+                if(reachesEditorLayout(invoke,layout,depth-1,seen)) return true;
+            }
+        }
+        return false;
     }
     private boolean reaches(MethodRef from,MethodRef target,int depth,Set<MethodRef> seen) {
         if(depth<0 || !seen.add(from)) return false;
@@ -158,6 +261,7 @@ public final class XApkIndex {
         private final int stringCount,stringOff,typeCount,typeOff,protoOff,methodCount,methodOff;
         private final String[] strings;
         private final String[] types;
+        private final MethodRef[] methods;
         private final Map<Integer,String> anchors=new HashMap<>();
         Dex(byte[] bytes,XApkIndex index) throws IOException {
             this.b=bytes; this.index=index;
@@ -169,6 +273,7 @@ public final class XApkIndex {
             protoOff=u4(76); methodCount=u4(88); methodOff=u4(92);
             range(stringOff,(long)stringCount*4); range(typeOff,(long)typeCount*4); range(methodOff,(long)methodCount*8);
             strings=new String[stringCount]; types=new String[typeCount];
+            methods=new MethodRef[methodCount];
         }
         void range(int off,long length) throws IOException {
             if(off<0 || length<0 || (long)off+length>b.length) throw new IOException("DEX bounds");
@@ -198,6 +303,7 @@ public final class XApkIndex {
         }
         MethodRef method(int n) throws IOException {
             if(n<0 || n>=methodCount) throw new IOException("DEX method index");
+            if(methods[n]!=null) return methods[n];
             int off=methodOff+n*8,proto=protoOff+u2(off+2)*12;
             range(proto,12); int params=u4(proto+8);
             List<String> args=new ArrayList<>();
@@ -205,7 +311,7 @@ public final class XApkIndex {
                 range(params,4); int count=u4(params); range(params+4,(long)count*2);
                 for(int i=0;i<count;i++) args.add(type(u2(params+4+i*2)));
             }
-            return new MethodRef(type(u2(off)),string(u4(off+4)),type(u4(proto+4)),args);
+            return methods[n]=new MethodRef(type(u2(off)),string(u4(off+4)),type(u4(proto+4)),args);
         }
         void scan() throws IOException {
             for(int i=0;i<stringCount;i++) {
@@ -213,7 +319,7 @@ public final class XApkIndex {
                 if(value.equals("BottomBarOffsetAnimation") || value.equals("inbox_action_button") ||
                     value.equals("inline-composer-slot") || value.equals("android_scribe_conversation_reply_dwell_linger_enabled") ||
                     value.equals("post-detail-reply-text-field") || value.equals("hazeAlpha") || value.equals("onBottomBarHeightChanged") ||
-                    value.equals("onGrokTabTooltipDismissed") || value.startsWith("Attempting to drawContent for a `null` node") ||
+                    value.equals("onGrokTabTooltipDismissed") || value.equals("DrawerState(accounts=") || value.startsWith("Attempting to drawContent for a `null` node") ||
                     value.startsWith("BackgroundElement(") || value.equals("HazeArea(") || value.startsWith("Modifier.hazeEffect nodes cannot draw an ancestor")) anchors.put(i,value);
             }
             int fieldCount=u4(80),fieldOff=u4(84); range(fieldOff,(long)fieldCount*8);
@@ -263,7 +369,7 @@ public final class XApkIndex {
         void inspect(MethodRef m,int code,boolean isStatic) throws IOException {
             range(code,16); int size=u4(code+12),start=code+16; range(start,(long)size*2);
             boolean drawerReader=!isStatic && m.args.isEmpty() && m.result.equals("Z") &&
-                m.owner.startsWith("Landroidx/compose/material3/");
+                (m.owner.startsWith("Landroidx/compose/material3/") || m.owner.startsWith("Lcom/x/main/drawer/"));
             boolean readsOpen=false, readsState=false;
             Set<String> found=new HashSet<>(); int visibleCalls=0;
             List<MethodRef> detailExits=new ArrayList<>();
@@ -272,7 +378,8 @@ public final class XApkIndex {
             Set<String> visibleOwners=new HashSet<>();
             boolean trackCalls=m.args.contains(COMPOSER) || m.owner.startsWith("Lcom/x/main/") ||
                 m.owner.startsWith("Lcom/x/android/main/landing/") || m.owner.startsWith("Lcom/x/composer/fab/") ||
-                m.owner.startsWith("Landroidx/compose/ui/layout/");
+                m.owner.startsWith("Landroidx/compose/ui/layout/") || m.owner.startsWith("Lcom/x/composer/minimal/") ||
+                (m.name.equals("<init>") && m.owner.startsWith("Lcom/x/postdetail/"));
             boolean composerCall=m.owner.startsWith("Lcom/x/composer/minimal/") && m.args.contains(COMPOSER);
             boolean coordinateBounds=m.owner.startsWith("Landroidx/compose/ui/layout/") && m.args.size()==2 &&
                 m.args.get(0).startsWith("Landroidx/compose/ui/layout/") && m.args.get(1).equals("Z") && m.result.startsWith("Landroidx/compose/ui/geometry/");
@@ -368,14 +475,18 @@ public final class XApkIndex {
             }
             if(m.name.equals("toString") && p.isEmpty() && m.result.equals("Ljava/lang/String;") &&
                 m.owner.startsWith("Landroidx/compose/foundation/") && found.stream().anyMatch(v->v.startsWith("BackgroundElement("))) index.add("backgroundElement",m);
-            if(found.contains("BottomBarOffsetAnimation") && m.result.equals("V") && p.size()==11 &&
+            if(isStatic && m.owner.startsWith("Lcom/x/ui/common/") && m.result.equals("V") && p.size()==11 &&
                 p.get(0).startsWith("Landroidx/compose/runtime/internal/") && p.get(0).equals(p.get(4)) && p.get(0).equals(p.get(8)) &&
                 p.get(2).equals(FUNCTION1) && p.get(3).equals(MODIFIER) && p.subList(5,8).equals(Arrays.asList("Z","Z","Z")) &&
-                p.get(9).equals(COMPOSER) && p.get(10).equals("I")) index.add("bottom",m);
-            if(found.contains("inbox_action_button") && m.result.equals("V") && p.size()==4 && p.get(0).equals(FUNCTION0) &&
-                p.get(1).startsWith("Lcom/x/dm/convlist/") && p.get(2).equals(COMPOSER) && p.get(3).equals("I")) index.add("chatFab",m);
-            if(m.name.equals("<init>") && m.owner.startsWith("Lcom/x/postdetail/") &&
-                found.contains("inline-composer-slot") && found.contains("android_scribe_conversation_reply_dwell_linger_enabled")) index.add("detailConstructor",m);
+                p.get(9).equals(COMPOSER) && p.get(10).equals("I")) index.add("bottomShape",m);
+            if(isStatic && found.contains("inbox_action_button") && m.result.equals("V") &&
+                m.owner.startsWith("Lcom/x/dm/convlist/") && Collections.frequency(p,FUNCTION0)==1 &&
+                p.stream().anyMatch(t->t.startsWith("Lcom/x/dm/convlist/")) &&
+                p.size()>=4 && p.subList(p.size()-2,p.size()).equals(Arrays.asList(COMPOSER,"I"))) index.add("chatFab",m);
+            if(m.name.equals("<init>") && m.owner.startsWith("Lcom/x/postdetail/") && found.contains("inline-composer-slot")) {
+                index.add("detailSlotOwner",m);
+                if(found.contains("android_scribe_conversation_reply_dwell_linger_enabled")) index.add("detailConstructor",m);
+            }
             if(visibleCalls==4 && visibleOwners.size()==1 && overlayFields.size()==4 &&
                 overlayFields.stream().allMatch(f->f.owner.equals(p.get(0)) && visibleOwners.contains(f.result))) index.add("toggle",m);
             for(MethodRef exit:detailExits) index.add("detailDestroy",exit);

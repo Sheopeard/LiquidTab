@@ -1,41 +1,62 @@
 package io.github.offlineglass.hook.adapters.wechat
 
-import android.os.Build
 import android.app.Activity
 import android.content.ContextWrapper
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
+import android.os.Build
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
-import android.view.Window
 import android.view.ViewTreeObserver
+import android.view.Window
 import android.view.WindowInsets
+import io.github.offlineglass.hook.HookConfigReader
 import io.github.offlineglass.hook.compat.XC_MethodHook
 import io.github.offlineglass.hook.compat.XposedBridge
-import io.github.offlineglass.hook.compat.XposedHelpers
-import java.util.Collections
 import java.util.WeakHashMap
-import java.lang.ref.WeakReference
 
-/** Keep LauncherUI full height; reserve the gesture edge inside its chat sibling only. */
+/** Keep navigation spacing local to the active conversation layout. */
 internal object WeChatChatInsets {
     private val immersiveRoots = WeakHashMap<View, Boolean>()
-    private val observed = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
     private val nativeNavigationColors = WeakHashMap<View, Int>()
+    private val nativeInsets = WeakHashMap<View, NativeInset>()
+    private data class NativeInset(val width: Int, val height: Int, val bottom: Int)
+    private val observed = WeakHashMap<View, Unit>()
+
     fun configure(decor: View, enabled: Boolean) {
-        var context = decor.context
-        while (context is ContextWrapper && context !is Activity) context = context.baseContext
-        (context as? Activity)?.window?.navigationBarColor?.let { color ->
+        activityOf(decor)?.window?.navigationBarColor?.let { color ->
             if (Color.alpha(color) >= 224) nativeNavigationColors[decor] = color
+        }
+        if (enabled && immersiveRoots[decor] != true) {
+            val insets = decor.rootWindowInsets
+            val bottom = navigationBottom(decor, insets)
+            if (bottom > 0) nativeInsets[decor] = NativeInset(decor.width, decor.height, bottom)
+        } else if (!enabled) {
+            nativeInsets.remove(decor)
         }
         immersiveRoots[decor] = enabled
     }
 
     fun install(loader: ClassLoader) {
-        // Preserve WeChat's requested colour before the immersive host clears
-        // the window bar. Opaque requests also refresh the colour on theme changes.
-        val windowType = XposedHelpers.findClass("com.android.internal.policy.PhoneWindow", loader)
+        val pageType = Class.forName("com.tencent.mm.pluginsdk.ui.chat.ChattingUILayout", false, loader)
+            .asSubclass(ViewGroup::class.java)
+        val embeddedType = Class.forName("com.tencent.mm.ui.tools.TestTimeForChatting", false, loader)
+            .asSubclass(ViewGroup::class.java)
+
+        XposedBridge.hookAllConstructors(pageType, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val page = param.thisObject as? ViewGroup ?: return
+                if (observed.put(page, Unit) != null) return
+                val binding = ChatBinding(page, embeddedType)
+                page.addOnAttachStateChangeListener(binding)
+                if (page.isAttachedToWindow) binding.onViewAttachedToWindow(page)
+            }
+        })
+
+        val windowType = Class.forName("com.android.internal.policy.PhoneWindow", false, loader)
         XposedBridge.hookAllMethods(windowType, "setNavigationBarColor", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val color = param.args.firstOrNull() as? Int ?: return
@@ -44,157 +65,216 @@ internal object WeChatChatInsets {
                 nativeNavigationColors[decor] = color
             }
         })
-        val type = runCatching {
-            XposedHelpers.findClass("com.tencent.mm.ui.tools.TestTimeForChatting", loader)
-        }.getOrNull() ?: return
-        val callback = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                observe(param.thisObject as? View ?: return)
-            }
-        }
-        // The local compile-only bridge stub exposes only hookAllMethods;
-        // resolve the standard Xposed constructor API without changing it.
-        XposedBridge::class.java.getMethod(
-            "hookAllConstructors", Class::class.java, XC_MethodHook::class.java,
-        ).invoke(null, type, callback)
     }
 
-    private fun observe(chat: View) {
-        if (!observed.add(chat)) return
-        val listener = object : ViewTreeObserver.OnPreDrawListener, View.OnAttachStateChangeListener {
-            private var observer: ViewTreeObserver? = null
-            private var nativeBottom = chat.paddingBottom
-            private var appliedBottom: Int? = null
-            private var content = WeakReference<View>(null)
-            private var lastContentBind = 0L
-            private var lastContentLeft = Int.MIN_VALUE
-            private val rootPosition = IntArray(2)
-            private val chatPosition = IntArray(2)
-            private val contentPosition = IntArray(2)
-            private val fill = object : ColorDrawable(Color.TRANSPARENT) {
-                override fun draw(canvas: android.graphics.Canvas) {
-                    val page = content.get() ?: return
-                    if (!page.isShown || !page.isAttachedToWindow) return
-                    chat.getLocationInWindow(chatPosition)
-                    page.getLocationInWindow(contentPosition)
-                    val saved = canvas.save()
-                    // Cancel the common ancestor's transform. The outer overlay
-                    // inherits TestTimeForChatting's legacy animation itself.
-                    canvas.clipRect(contentPosition[0] - chatPosition[0], bounds.top,
-                        contentPosition[0] - chatPosition[0] + page.width, bounds.bottom)
-                    super.draw(canvas)
-                    canvas.restoreToCount(saved)
-                }
-            }
-            private var fillAttached = false
+    private fun activityOf(view: View): Activity? {
+        var context = view.context
+        while (context is ContextWrapper && context !is Activity) {
+            val base = context.baseContext
+            if (base === context) return null
+            context = base
+        }
+        return context as? Activity
+    }
 
+    @Suppress("DEPRECATION")
+    private fun navigationBottom(view: View, insets: WindowInsets?): Int {
+        insets ?: return 0
+        if (Build.VERSION.SDK_INT >= 30) {
+            return maxOf(
+                insets.getInsets(WindowInsets.Type.navigationBars()).bottom,
+                insets.getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars()).bottom,
+                insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom,
+            )
+        }
+        val current = insets.systemWindowInsetBottom
+        val stable = insets.stableInsetBottom
+        // On legacy Android, systemWindowInsetBottom can include the IME.
+        if (current > stable && current - stable > 100 * view.resources.displayMetrics.density) return stable
+        return maxOf(current, stable, if (Build.VERSION.SDK_INT >= 29) insets.mandatorySystemGestureInsets.bottom else 0)
+    }
 
-
-            fun bind() {
-                val next = chat.viewTreeObserver
-                if (observer === next) return
-                observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(this)
-                observer = next
-                next.addOnPreDrawListener(this)
-            }
-
-            override fun onPreDraw(): Boolean {
-                // Preserve the native padding if WeChat has replaced it.
-                if (appliedBottom == null || chat.paddingBottom != appliedBottom) {
-                    nativeBottom = chat.paddingBottom
-                }
-                val root = chat.rootView
-                var bottom = nativeBottom
-                if (immersiveRoots[root] == true && chat.isShown) {
-                    val insets = root.rootWindowInsets ?: return true
-                    val nav = if (Build.VERSION.SDK_INT >= 30) {
-                        if (insets.isVisible(WindowInsets.Type.ime())) 0
-                        // HyperOS force-immersive fitting reports navigationBars
-                        // and its ignoring-visibility value as zero, while the
-                        // actual gesture-handle source remains on screen. Its
-                        // mandatory gesture inset retains that physical height.
-                        else maxOf(
-                            insets.getInsets(WindowInsets.Type.navigationBars()).bottom,
-                            insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom,
-                        )
-                    } else {
-                        @Suppress("DEPRECATION")
-                        maxOf(insets.systemWindowInsetBottom, insets.mandatorySystemGestureInsets.bottom)
-                    }
-                    root.getLocationInWindow(rootPosition)
-                    chat.getLocationInWindow(chatPosition)
-                    // Account for native fitting already performed by a parent;
-                    // reserve only the part of the gesture area covered by chat.
-                    val overlap = (chatPosition[1] + chat.height -
-                        (rootPosition[1] + root.height - nav)).coerceAtLeast(0)
-                    bottom = maxOf(nativeBottom, overlap)
-                } else if (immersiveRoots[root] == true) {
-                    // Keep the outgoing chat's geometry through its animation.
-                    // Visibility must never change the underlying pager fitting.
-                    return true
-                }
-                appliedBottom = bottom
-                val now = android.os.SystemClock.uptimeMillis()
-                if (content.get()?.isAttachedToWindow != true && now - lastContentBind >= 400L) {
-                    lastContentBind = now
-                    // Bind only the semantic chat page, not a private controller
-                    // field or the native callback's obfuscated implementation.
-                    val pending = ArrayDeque<View>()
-                    val candidates = ArrayList<View>()
-                    pending += chat
-                    var visited = 0
-                    while (pending.isNotEmpty() && visited++ < 96) {
-                        val view = pending.removeFirst()
-                        if (view.javaClass.name == "com.tencent.mm.pluginsdk.ui.chat.ChattingUILayout") {
-                            candidates += view
-                            continue
-                        }
-                        if (view is android.widget.AbsListView) continue
-                        if (view is ViewGroup) for (i in 0 until view.childCount) pending += view.getChildAt(i)
-                    }
-                    content = WeakReference(candidates.singleOrNull())
-                }
-                content.get()?.let { page ->
-                    chat.getLocationInWindow(chatPosition)
-                    page.getLocationInWindow(contentPosition)
-                    val left = contentPosition[0] - chatPosition[0]
-                    if (left != lastContentLeft) {
-                        lastContentLeft = left
-                        fill.invalidateSelf()
-                        chat.invalidate()
-                    }
-                }
-                val fillHeight = if (immersiveRoots[root] == true && content.get() != null) bottom else 0
-                if (fillHeight > 0) {
-                    val color = nativeNavigationColors[root] ?: run {
-                        val value = TypedValue()
-                        if (chat.context.theme.resolveAttribute(android.R.attr.navigationBarColor, value, true)) {
-                            value.data
-                        } else Color.TRANSPARENT
-                    }
-                    fill.color = color
-                    fill.setBounds(0, chat.height - fillHeight, chat.width, chat.height)
-                    if (!fillAttached || fill.callback == null) {
-                        chat.overlay.add(fill)
-                        fillAttached = true
-                    }
-                } else if (fillAttached) {
-                    chat.overlay.remove(fill)
-                    fillAttached = false
-                }
-                if (chat.paddingBottom == bottom) return true
-                chat.setPadding(chat.paddingLeft, chat.paddingTop, chat.paddingRight, bottom)
-                // Submit only after this chat subtree has its final dimensions.
-                return false
-            }
-
-            override fun onViewAttachedToWindow(v: View) = bind()
-            override fun onViewDetachedFromWindow(v: View) {
-                observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(this)
-                observer = null
+    private class ChatBinding(
+        private val page: ViewGroup,
+        private val embeddedType: Class<out ViewGroup>,
+    ) : View.OnAttachStateChangeListener, ViewTreeObserver.OnPreDrawListener {
+        private var observer: ViewTreeObserver? = null
+        private var activity: Activity? = null
+        private var owner: View? = null
+        private var nativeBottom = 0
+        private var appliedBottom: Int? = null
+        private val rootPosition = IntArray(2)
+        private val ownerPosition = IntArray(2)
+        private val pagePosition = IntArray(2)
+        private val visibleFrame = Rect()
+        private var metrics: android.view.WindowMetrics? = null
+        private var metricsInsets: WindowInsets? = null
+        private var metricsWidth = 0
+        private var metricsHeight = 0
+        private var metricsConfiguration = 0
+        private var retryMetricsAt = 0L
+        private val fill = object : ColorDrawable(Color.TRANSPARENT) {
+            override fun draw(canvas: android.graphics.Canvas) {
+                val container = owner ?: return
+                if (!page.isShown || !page.isAttachedToWindow) return
+                page.getLocationInWindow(pagePosition)
+                container.getLocationInWindow(ownerPosition)
+                val left = pagePosition[0] - ownerPosition[0]
+                val saved = canvas.save()
+                canvas.clipRect(left, bounds.top, left + page.width, bounds.bottom)
+                super.draw(canvas)
+                canvas.restoreToCount(saved)
             }
         }
-        chat.addOnAttachStateChangeListener(listener)
-        listener.bind()
+        private var fillAttached = false
+        private var lastFillLeft = Int.MIN_VALUE
+
+        override fun onViewAttachedToWindow(v: View) {
+            val container = findOwner() ?: return
+            activity = activityOf(page) ?: return
+            changeOwner(container)
+            observer = page.viewTreeObserver.also { it.addOnPreDrawListener(this) }
+        }
+
+        override fun onViewDetachedFromWindow(v: View) {
+            observer?.takeIf { it.isAlive }?.removeOnPreDrawListener(this)
+            observer = null
+            changeOwner(null)
+            activity = null
+            metrics = null
+            metricsInsets = null
+            retryMetricsAt = 0L
+        }
+
+        private fun changeOwner(next: View?) {
+            if (owner === next) return
+            owner?.let { old ->
+                if (fillAttached) old.overlay.remove(fill)
+                if (appliedBottom == old.paddingBottom) {
+                    old.setPadding(old.paddingLeft, old.paddingTop, old.paddingRight, nativeBottom)
+                }
+            }
+            owner = next
+            nativeBottom = next?.paddingBottom ?: 0
+            appliedBottom = null
+            fillAttached = false
+            lastFillLeft = Int.MIN_VALUE
+        }
+
+        private fun findOwner(): View? {
+            var ancestor = page.parent as? View
+            while (ancestor != null) {
+                if (embeddedType.isInstance(ancestor)) return ancestor
+                ancestor = ancestor.parent as? View
+            }
+            return null
+        }
+
+        override fun onPreDraw(): Boolean {
+            val host = activity ?: return true
+            val root = host.window.peekDecorView() ?: return true
+            val currentOwner = owner ?: return true
+            if (page.rootView !== root || currentOwner.rootView !== root) return true
+            val enabled = HookConfigReader.startupSnapshot("com.tencent.mm")?.enabled != false &&
+                immersiveRoots[root] != false
+            if (!page.isShown || page.height <= 0 || root.height <= 0) {
+                updateFill(currentOwner, root, 0)
+                // Keep the outgoing conversation's measured geometry.
+                if (enabled) return true
+            }
+
+            val retainedPadding = appliedBottom?.takeIf { currentOwner.paddingBottom == it }
+            if (retainedPadding == null) nativeBottom = currentOwner.paddingBottom
+            val ownedPadding = (retainedPadding ?: nativeBottom) - nativeBottom
+            val extra = if (enabled) requiredPadding(host, root, currentOwner, ownedPadding) else 0
+            val target = nativeBottom + extra
+            updateFill(currentOwner, root, extra)
+            if (currentOwner.paddingBottom == target) return true
+
+            // Insets can be reapplied by native layout during a traversal.
+            // Defer only a new geometry, never block drawing on repeated writes.
+            val changedTarget = appliedBottom != target
+            appliedBottom = target
+            if (io.github.offlineglass.BuildConfig.DEBUG && changedTarget) {
+                android.util.Log.d("LiquidTabWeChatInsets", "embedded chat: native=$nativeBottom added=$extra")
+            }
+            currentOwner.setPadding(currentOwner.paddingLeft, currentOwner.paddingTop, currentOwner.paddingRight, target)
+            return !changedTarget
+        }
+
+        private fun requiredPadding(host: Activity, root: View, container: View, ownedPadding: Int): Int {
+            val insets = root.rootWindowInsets
+            if (Build.VERSION.SDK_INT >= 30 && insets?.isVisible(WindowInsets.Type.ime()) == true) return 0
+            root.getLocationOnScreen(rootPosition)
+            container.getLocationOnScreen(ownerPosition)
+            val rootBottom = rootPosition[1] + root.height
+            val window = if (Build.VERSION.SDK_INT >= 30) windowMetrics(host, root, insets) else null
+            val reportedNav = maxOf(navigationBottom(root, insets), navigationBottom(root, window?.windowInsets))
+            val nav = if (reportedNav > 0) reportedNav else nativeInsets[root]?.takeIf {
+                it.width == root.width && it.height == root.height
+            }?.bottom ?: 0
+            if (nav <= 0) return 0
+
+            // Legacy adjustResize and floating-window implementations may
+            // report IME visibility only through the visible display frame.
+            root.getWindowVisibleDisplayFrame(visibleFrame)
+            val keyboardThreshold = maxOf(nav * 2, (80f * root.resources.displayMetrics.density).toInt())
+            if (!visibleFrame.isEmpty && rootBottom - visibleFrame.bottom > keyboardThreshold) return 0
+            val safeBottom = (window?.bounds?.bottom ?: rootBottom) - nav
+            val ownerContentBottom = ownerPosition[1] + container.height - nativeBottom
+            page.getLocationOnScreen(pagePosition)
+            val nativeContentBottom = minOf(
+                ownerContentBottom,
+                pagePosition[1] + page.height + ownedPadding - page.paddingBottom,
+            )
+            return (nativeContentBottom - safeBottom).coerceIn(0, nav)
+        }
+
+        @android.annotation.TargetApi(30)
+        private fun windowMetrics(host: Activity, root: View, insets: WindowInsets?): android.view.WindowMetrics? {
+            val configuration = root.resources.configuration.hashCode()
+            val now = SystemClock.uptimeMillis()
+            if (metricsInsets != insets || metricsWidth != root.width || metricsHeight != root.height ||
+                metricsConfiguration != configuration || (retryMetricsAt != 0L && now >= retryMetricsAt)
+            ) {
+                metricsInsets = insets
+                metricsWidth = root.width
+                metricsHeight = root.height
+                metricsConfiguration = configuration
+                metrics = runCatching { host.windowManager.currentWindowMetrics }.getOrNull()
+                retryMetricsAt = if (navigationBottom(root, metrics?.windowInsets) == 0 && navigationBottom(root, insets) == 0) {
+                    now + 500L
+                } else 0L
+            }
+            return metrics
+        }
+
+        private fun updateFill(container: View, root: View, extra: Int) {
+            if (extra <= 0) {
+                if (fillAttached) container.overlay.remove(fill)
+                fillAttached = false
+                return
+            }
+            val color = nativeNavigationColors[root] ?: run {
+                val value = TypedValue()
+                if (page.context.theme.resolveAttribute(android.R.attr.navigationBarColor, value, true)) {
+                    value.data
+                } else Color.TRANSPARENT
+            }
+            fill.color = color
+            val bottom = container.height - nativeBottom
+            fill.setBounds(0, bottom - extra, container.width, bottom)
+            page.getLocationInWindow(pagePosition)
+            container.getLocationInWindow(ownerPosition)
+            val left = pagePosition[0] - ownerPosition[0]
+            if (left != lastFillLeft) {
+                lastFillLeft = left
+                fill.invalidateSelf()
+            }
+            if (!fillAttached || fill.callback == null) {
+                container.overlay.add(fill)
+                fillAttached = true
+            }
+        }
     }
 }

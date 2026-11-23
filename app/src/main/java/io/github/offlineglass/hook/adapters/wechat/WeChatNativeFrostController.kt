@@ -32,13 +32,9 @@ internal class WeChatNativeFrostController {
 
         val pager = findMainViewPager(hostRoot) ?: return
         removeWeChatNativeTabInset(pager, source.height)
-        val pages = findFrostedPages(pager)
-        if (pages.isEmpty()) return
-
-        // The tab's decompiled onLayout already forwards geometry to every
-        // direct FrostedContentView child. Repair all actual descendants found
-        // below the verified main pager; never infer a page from child index.
-        pages.forEach { page ->
+        for (index in 0 until pager.childCount) {
+            val page = pager.getChildAt(index)
+            if (page.javaClass.name != FROSTED_CONTENT_VIEW_CLASS) continue
             WeChatContactsLayoutRepair.repair(page)
             val oldHeight = runCatching {
                 XposedHelpers.callMethod(page, "getBottomBlurAreaHeight") as? Int
@@ -86,29 +82,6 @@ internal class WeChatNativeFrostController {
         runCatching { XposedHelpers.callMethod(page, "setFrostedColor", 0) }
         runCatching { XposedHelpers.callMethod(page, "setBottomBlurAreaHeight", 0) }
         runCatching { XposedHelpers.callMethod(page, "setTopBlurAreaHeight", 0) }
-    }
-
-    private fun findFrostedPages(pager: ViewGroup): List<View> {
-        val result = ArrayList<View>(4)
-        val stack = ArrayDeque<Pair<View, Int>>()
-        stack += pager to 0
-        while (stack.isNotEmpty()) {
-            val (view, depth) = stack.removeLast()
-            var found = false
-            var type: Class<*>? = view.javaClass
-            while (type != null) {
-                if (type.name == FROSTED_CONTENT_VIEW_CLASS && WeChatLauncherPages.owns(view)) {
-                    result += view
-                    found = true
-                    break
-                }
-                type = type.superclass
-            }
-            if (!found && !isItemContainer(view) && view is ViewGroup && depth < 10) {
-                for (i in 0 until view.childCount) stack += view.getChildAt(i) to (depth + 1)
-            }
-        }
-        return result
     }
 
     private fun removeWeChatNativeTabInset(pager: ViewGroup, nativeTabHeight: Int) {

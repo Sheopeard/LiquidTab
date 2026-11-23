@@ -95,8 +95,10 @@ internal object TikTokAdapter : TargetAdapter {
             "insets" to { TikTokInsets.install() },
             "top bar" to { TikTokTopBar.install(lpparam.classLoader) },
             "comments" to { TikTokCommentVisibility.install(lpparam.classLoader) },
+            "assistant page" to { TikTokAssistantVisibility.install(lpparam.classLoader) },
             "player" to { TikTokPlayerLayout.install(lpparam.classLoader) },
             "photos" to { TikTokPhotoLayout.install(lpparam.classLoader) },
+            "feed assistant" to { TikTokPageLayout.observeAssistantInflation() },
         ).forEach { (name, install) ->
             runCatching(install).onFailure { android.util.Log.w("TikTokGlassDiag", "$name unavailable; retaining navigation", it) }
         }

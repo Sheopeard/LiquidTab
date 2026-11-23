@@ -29,6 +29,7 @@ internal object MiMarketAdapter : TargetAdapter {
     override val hideRedrawnNavigationSource = true
     override val usesContentDarkMode = true
     override val managesNativeTabVisibility = true
+    override val skipBackdropStableDelay = true
     override val usesDirectOpticalBackdropMode = true
     override val usesOpticalSurfacePipeline = true
     override val countsOpticalCompositorCopies = true
@@ -140,6 +141,8 @@ internal object MiMarketAdapter : TargetAdapter {
 
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
         MiMarketUpgradeGlass.install()
+        MiMarketUpgradeRecommendations.install(lpparam.classLoader)
+        MiMarketProfileRecommendations.install(lpparam.classLoader)
         MiMarketWebInsets.install(lpparam.classLoader)
         installMiMarketNavigationHooks(lpparam, spec)
     }

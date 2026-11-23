@@ -203,7 +203,7 @@ internal class TikTokNavigationState(private val host: io.github.offlineglass.ho
         }
         val selectedIndex = resolveSelectedIndex(source, 5) ?: selected()
         TikTokInsets.setFeedStatus(host, selectedIndex in 0..1 && !pageLayout.overlayVisible(host.rootView))
-        pageLayout.update(host, source, selectedIndex, barHeightPx)
+        pageLayout.update(host, source, selectedIndex)
         val now = android.os.SystemClock.uptimeMillis()
         if (cells.isNotEmpty() && now-lastArtworkRead < 80L) return
         lastArtworkRead = now
@@ -290,6 +290,8 @@ internal class TikTokNavigationState(private val host: io.github.offlineglass.ho
     override fun hostPageAllowsNavigation(host: io.github.offlineglass.hook.GlassHostLayout, root: View?): Boolean =
         !pageLayout.overlayVisible(root) &&
             (host.adapterNavigationSource?.let { allowsFeedPage(it, root) && it.isAttachedToWindow && it.isShown && it.width > 0 && it.height > 0 } == true)
+
+    override fun skipNavigationExitAnimation(root: View?): Boolean = TikTokAssistantVisibility.visible(root)
 
     private fun allowsFeedPage(row: ViewGroup, root: View?): Boolean {
         val selected = resolveSelectedIndex(row, 5)

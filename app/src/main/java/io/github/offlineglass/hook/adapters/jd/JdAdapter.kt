@@ -4,6 +4,10 @@ import android.content.Context
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import io.github.offlineglass.hook.NavigationCandidate
+import io.github.offlineglass.targets.TargetSpec
 
 /** JD-specific policy flags live here; shared rendering remains package-agnostic. */
 internal object JdAdapter : TargetAdapter {
@@ -19,10 +23,16 @@ internal object JdAdapter : TargetAdapter {
     // Keep native slot identities: hiding Browse must not renumber cart/messages.
     // No native click or preview capture is requested for this disabled entry.
     override fun isNavigationEntryDisabled(index: Int, slots: Int): Boolean =
-        slots == 5 && index == 1
+        slots == JdNavigationBinding.SLOT_COUNT && index == JdNavigationBinding.BROWSE
+    override val ownsNavigationFinding = true
+    override fun findNavigation(root: View, spec: TargetSpec): NavigationCandidate? =
+        JdNavigationBinding.find(root)?.let { NavigationCandidate(it.view, it.slots.size, 100) }
+    override fun estimateSlotCount(group: ViewGroup, spec: TargetSpec): Int? =
+        JdNavigationBinding.resolve(group)?.slots?.size
     override val honorsBackdropCaptureSetting = true
     override val ownsNavigationDrawing = true
-    override val navigationBehindIndicator = true
+    // The lens samples page content only, on both the host and Surface paths.
+    override val foregroundNavigationOverSelection = true
     override val stagedNavigationSnapshot = true
     override val ownsNavigationSnapshotCapturePolicy = true
     override val supportsScheduledNavigationSnapshotRefresh = true
@@ -49,6 +59,8 @@ internal object JdAdapter : TargetAdapter {
         JdScrollSignals.install(lpparam.classLoader)
         JdStartupAds.install(lpparam.classLoader)
         JdClassicLayout.install(lpparam.classLoader)
+        JdNativeContentBinding.install(lpparam.classLoader)
+        JdHiddenNavigationBlur.install(lpparam.classLoader)
         JdNavigationBootstrap.install(lpparam.classLoader, spec)
         JdNativePageTransitions.install(lpparam.classLoader)
         JdFragmentProbeReuse.install(lpparam.classLoader)
@@ -66,7 +78,6 @@ internal object JdAdapter : TargetAdapter {
     override val retainsLiveOpticalBlur = true
     override val keepsBackdropDuringTapTransition = true
     override val allowsSystemBackgroundBlur = false
-    override val countsOpticalCompositorCopies = true
     override val deferOpticalRenderDuringBarAnimation = true
     override val reuseSurfaceBlurDuringBarAnimation = true
     override val usesContentAlignedOpticalSurface = true
@@ -81,16 +92,6 @@ internal object JdAdapter : TargetAdapter {
     // RenderEffect invalidations when configured on each host pre-draw.
     override val usesNativeOpticalBlur = false
     override val repeatImmersionRestoreWhileInactive = true
-    override fun opticalCaptureGeometry(
-        rootWidth: Int, rootHeight: Int, left: Int, top: Int, width: Int, height: Int, padding: Int,
-    ): io.github.offlineglass.hook.adapters.OpticalCaptureGeometry? =
-        JdCaptureGeometry.calculate(rootWidth, rootHeight, left, top, width, height, padding)
-            ?.let {
-                io.github.offlineglass.hook.adapters.OpticalCaptureGeometry(
-                    it.sourceRect, it.targetWidth, it.targetHeight, it.barSource,
-                )
-            }
-
     override fun opticalSurfaceLayout(
         contentWidth: Int, contentHeight: Int, hostLeft: Int, hostTop: Int,
         hostWidth: Int, hostHeight: Int, overflow: Int,

@@ -83,7 +83,7 @@ internal class DouyinNavigationState(context: Context) : AppNavigationState {
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = renderer.draw(canvas, frame)
     override fun logDiagnostic(message: String) = pageController.logDiagnostic(message)
     override fun requestVideoBackdrop(host: View, pageAllowed: Boolean) =
-        videoSampler.request(host, pageAllowed, blocksBackdropSampling)
+        videoSampler.request(host, pageAllowed, blocksBackdropSampling || pageController.grouponPageActive)
     override fun videoBackdrop(): AppVideoBackdrop? = videoSampler.snapshot()
     override fun pageAllowsNavigation(root: View?): Boolean =
         !pageController.messageComposerVisible() && !pageController.profilePageActive() &&
@@ -98,6 +98,9 @@ internal class DouyinNavigationState(context: Context) : AppNavigationState {
         renderer.drawForeground(canvas, frame, selectionPath, drawSource)
         return true
     }
+
+    override fun forceNavigationBarImmersed(host: io.github.offlineglass.hook.GlassHostLayout) =
+        !DouyinCommentLayoutHooks.requiresNativeNavigationFit(host.rootView)
 
     override fun onHostPreDraw(
         host: View,

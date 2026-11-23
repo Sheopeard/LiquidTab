@@ -37,7 +37,7 @@ import java.lang.ref.WeakReference
 internal class XFloatingFab(
     context: Context,
     /** 采样源：X 的全屏 ComposeView（FAB 与其平级，采样不含 FAB 自身）。 */
-    private val behindRef: WeakReference<View>,
+    behind: View,
 ) : View(context) {
 
     companion object {
@@ -63,7 +63,19 @@ internal class XFloatingFab(
     private val backdropPad = 12f * density
     private val sourceLocation = IntArray(2)
     private val actionLocation = IntArray(2)
+    private var behindRef = WeakReference(behind)
     private val blurNode = RenderNode("XFloatingFabBlur")
+    private var recordedSource: RenderNode? = null
+    private var recordedX = 0
+    private var recordedY = 0
+
+    fun setBackdropSource(source: View) {
+        if (behindRef.get() === source) return
+        behindRef = WeakReference(source)
+        recordedSource = null
+        blurNode.discardDisplayList()
+        invalidate()
+    }
     /** 液态透镜 shader（宿主 ROUNDED_RECT_REFRACTION_SHADER 同源圆形配置）。 */
     private var lensShader: RuntimeShader? = null
     private var lensEffectApplied = false
@@ -76,7 +88,7 @@ internal class XFloatingFab(
     private var currentPanelHeight = 0
 
     internal fun setCollapseGeometry(host: View, progress: Float, fullWidth: Int, panelHeight: Int) {
-        collapseHost = WeakReference(host)
+        if (collapseHost.get() !== host) collapseHost = WeakReference(host)
         collapseProgress = progress
         expandedPanelWidth = fullWidth
         currentPanelHeight = panelHeight
@@ -86,6 +98,8 @@ internal class XFloatingFab(
     private val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val tintPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
+    private val edgeContour = android.graphics.Path()
     private val plusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -120,6 +134,8 @@ internal class XFloatingFab(
     override fun onDetachedFromWindow() {
         runCatching { viewTreeObserver.removeOnPreDrawListener(anchorOnPreDraw) }
         runCatching { viewTreeObserver.removeOnWindowFocusChangeListener(windowFocusPoll) }
+        recordedSource = null
+        blurNode.discardDisplayList()
         super.onDetachedFromWindow()
     }
 
@@ -194,7 +210,7 @@ internal class XFloatingFab(
      * 自锚定，无需依赖外部扫描时机：
      *  - 底边距 = 玻璃条顶 + 间距（严格高于底栏上边界，不被遮挡）；
      *  - 右边距 = 玻璃条右边到屏幕的留白（与底栏相同）；
-     *  - bringToFront 保证 z 序在玻璃条之上（host 后装会盖住先装的键）。
+     *  - XAdapter 统一维护底栏和发布键的相对层级。
      * host 尚未完成 layout（bottom/right 为 0）时视为不存在，跳过锚定
      * ——否则会把本键推到屏幕外。全部幂等。
      */
@@ -235,7 +251,6 @@ internal class XFloatingFab(
             lp.marginEnd = targetEnd
             layoutParams = lp
         }
-        if (content.getChildAt(content.childCount - 1) !== this) bringToFront()
     }
 
     override fun draw(canvas: Canvas) {
@@ -272,11 +287,19 @@ internal class XFloatingFab(
         )
         canvas.drawCircle(cx, cy, r, tintPaint)
 
-        // 4) 1px 边缘光。
-        rimPaint.color = (0x38 shl 24) or 0xFFFFFF
-        rimPaint.style = Paint.Style.STROKE
-        rimPaint.strokeWidth = Math.max(1f, density)
-        canvas.drawCircle(cx, cy, r - rimPaint.strokeWidth / 2f, rimPaint)
+        val edgeConfig = liveConfig
+        if (edgeConfig?.liquidGlassEnabled == true && !edgeConfig.solidBarEnabled) {
+            if (edgeConfig.outlineEnabled) {
+                edgeContour.rewind()
+                edgeContour.addCircle(cx, cy, r, android.graphics.Path.Direction.CW)
+                glassEdge.draw(canvas, edgeContour, density, edgeConfig.systemDark, (if (pressed) .50f else .36f) * 2f * edgeConfig.darkBarHighlightStrength)
+            }
+        } else {
+            rimPaint.color = (0x38 shl 24) or 0xFFFFFF
+            rimPaint.style = Paint.Style.STROKE
+            rimPaint.strokeWidth = Math.max(1f, density)
+            canvas.drawCircle(cx, cy, r - rimPaint.strokeWidth / 2f, rimPaint)
+        }
 
         // Same glass component, separate native actions: envelope in Chat, plus elsewhere.
         plusPaint.color = Color.WHITE
@@ -318,22 +341,27 @@ internal class XFloatingFab(
                 val pad = backdropPad
                 val nodeW = width + pad.toInt() * 2
                 val nodeH = height + pad.toInt() * 2
-                blurNode.setPosition(0, 0, nodeW, nodeH)
-                val recording = blurNode.beginRecording()
-                recording.save()
-                // 源 display list 以 src 自身 (0,0) 为原点；平移使源内容中
-                // 与本键重合（含 padding 外扩）的区域落入画布原点。
                 src.getLocationInWindow(sourceLocation)
                 getLocationInWindow(actionLocation)
-                // drawRenderNode includes the source node's parent-space position.
-                // The padded input centre is (pad+w/2,pad+h/2), not (-pad+w/2,...).
-                recording.translate(
-                    (sourceLocation[0] - actionLocation[0] - src.left).toFloat() + pad,
-                    (sourceLocation[1] - actionLocation[1] - src.top).toFloat() + pad,
-                )
-                recording.drawRenderNode(srcNode)
-                recording.restore()
-                blurNode.endRecording()
+                val x = sourceLocation[0] - actionLocation[0] - src.left
+                val y = sourceLocation[1] - actionLocation[1] - src.top
+                // The retained display list reads the current native child. Only
+                // source replacement, geometry or movement needs a new wrapper.
+                if (!blurNode.hasDisplayList() || recordedSource !== srcNode ||
+                    recordedX != x || recordedY != y || blurNode.width != nodeW || blurNode.height != nodeH) {
+                    blurNode.setPosition(0, 0, nodeW, nodeH)
+                    val recording = blurNode.beginRecording()
+                    try {
+                        recording.clipRect(0, 0, nodeW, nodeH)
+                        recording.translate(x + pad, y + pad)
+                        recording.drawRenderNode(srcNode)
+                    } finally {
+                        blurNode.endRecording()
+                    }
+                    recordedSource = srcNode
+                    recordedX = x
+                    recordedY = y
+                }
                 if (!lensEffectApplied) {
                     // 宿主同款分支（applyEffectsForConfig）：模糊半径取设置页
                     // 滑块 config.blurRadius（dp → px，X 无 secondaryBlurScale
@@ -398,7 +426,7 @@ internal class XFloatingFab(
             pad + 0.5f, pad + 0.5f, pad + w - 0.5f, pad + h - 0.5f)
         // 宿主 setOuterLensUniforms 默认 24dp；小圆上加大位移让折射可感知。
         lens.setFloatUniform("refractionHeight", 24f * density)
-        lens.setFloatUniform("refractionAmount", -30f * density)
+        lens.setFloatUniform("refractionAmount", -30f * density * (liveConfig?.refractionScale ?: 1f))
         lens.setFloatUniform("depthEffect", 0f)
         lens.setFloatUniform("tiltBias", 0f, 0f)
         lens.setFloatUniformExact("flowingLiquidEnabled", 0f)

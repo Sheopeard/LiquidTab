@@ -83,8 +83,9 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
     private val edgeGradient = WeiboBottomGradient()
     override fun onHostFrame(host: View) {
         val glassHost = host as? GlassHostLayout ?: return
+        glassHost.opticalSurfaceViewForAdapter?.let { if (it.isForceDarkAllowed) it.setForceDarkAllowed(false) }
         activeHost = glassHost
-        edgeGradient.update(glassHost, glassHost.config.enabled)
+        edgeGradient.update(glassHost, glassHost.config.enabled, glassHost.isDarkGlass())
         WeiboHomeTopBar.observe(glassHost)
         messageSafety.update(glassHost)
         if (messageSafety.active) glassHost.resetMessageScrollStopState()
@@ -136,8 +137,6 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
     override fun refreshNavigationSource(host: View) =
         (host as? GlassHostLayout)?.refreshWeiboNavigationSource() == true
 
-    override fun resolveAutoDarkMode(host: View): Boolean? =
-        (host as? GlassHostLayout)?.adapterContentOrSystemDark()
 
     override fun pageAllowsNavigation(root: View?): Boolean? =
         activeHost?.weiboPageAllowsNavigation()
@@ -203,7 +202,7 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
             contentBottom = maxOf(contentBottom, bottom)
         }
         val textBounds = Rect()
-        frame.enabledIndices.forEach { index ->
+        if (!frame.iconOnly) frame.enabledIndices.forEach { index ->
             val text = frame.localizeNavigationLabel(LABELS[index])
             labelPaint.getTextBounds(text, 0, text.length, textBounds)
             contentTop = minOf(contentTop, LABEL_BASELINE_DP * frame.density + textBounds.top)
@@ -213,7 +212,7 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
             WeiboGeometry.centerOffset(frame.height.toFloat(), contentTop, contentBottom) else 0f
         frame.enabledIndices.forEachIndexed { visualIndex, index ->
             val selected = index == frame.selectedIndex
-            val bitmap = (if (selected) selectedIcons else icons).getOrNull(index) ?: return@forEachIndexed
+            val bitmap = (if (selected) selectedIcons else icons).getOrNull(index)
             val centerX = horizontalPadding + (visualIndex + .5f) * frame.slotWidth
             canvas.save(); canvas.scale(itemScale, itemScale, centerX, frame.height / 2f)
             canvas.translate(0f, centerOffset)
@@ -221,11 +220,11 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
             iconPaint.colorFilter = if (frame.darkGlass && !selected)
                 BlendModeColorFilter(Color.WHITE, BlendMode.SRC_IN) else null
             val centerY = ICON_CENTER_Y_DP * frame.density
-            canvas.drawBitmap(bitmap, null, RectF(centerX - iconSize / 2f, centerY - iconSize / 2f,
+            if (bitmap != null) canvas.drawBitmap(bitmap, null, RectF(centerX - iconSize / 2f, centerY - iconSize / 2f,
                 centerX + iconSize / 2f, centerY + iconSize / 2f), iconPaint)
             labelPaint.color = if (selected) ACCENT_COLOR else normalColor
             labelPaint.alpha = if (selected) 255 else 238
-            canvas.drawText(frame.localizeNavigationLabel(LABELS[index]), centerX, LABEL_BASELINE_DP * frame.density, labelPaint)
+            if (!frame.iconOnly) canvas.drawText(frame.localizeNavigationLabel(LABELS[index]), centerX, LABEL_BASELINE_DP * frame.density, labelPaint)
             badgeTexts.getOrNull(index)?.takeUnless(String::isNullOrBlank)?.let { badge ->
                 val bx = centerX + 13f * frame.density; val by = 13f * frame.density
                 canvas.drawCircle(bx, by, (if (badge.length <= 1) 8f else 10f) * frame.density, badgePaint)
@@ -258,7 +257,9 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
                 .open(path).use(BitmapFactory::decodeStream)
         }.getOrNull()?.let { return it }
         return runCatching { javaClass.classLoader?.getResourceAsStream(path)?.use(BitmapFactory::decodeStream) }
-            .onFailure { XposedBridge.log("[LiquidTab][WeiboIcons] $fileName: $it") }.getOrNull()
+            .getOrNull() ?: WeiboEmbeddedIcons.decode(fileName).also { bitmap ->
+                if (bitmap == null) XposedBridge.log("[LiquidTab][WeiboIcons] Unable to decode $fileName")
+            }
     }
 
     private companion object {

@@ -35,6 +35,16 @@ internal class JdContentViewport {
     ) {
         val nav = source?.takeIf { it.isAttachedToWindow } ?: return
         val scene = root ?: return
+        if (JdNativeContentBinding.content(nav) != null) {
+            if (adjustedSource?.get() === nav && adjustedRootWidth == scene.width &&
+                adjustedRootHeight == scene.height && adjustedTab == host.navigationIndex) return
+            adjustedSource = WeakReference(nav)
+            adjustedRootWidth = scene.width
+            adjustedRootHeight = scene.height
+            adjustedTab = host.navigationIndex
+            liftFloatingControls(scene, scene.height)
+            return
+        }
         if (JdClassicLayout.adjust(host, nav, !newProductsActive)) {
             liftFloatingControls(scene, scene.height)
             return

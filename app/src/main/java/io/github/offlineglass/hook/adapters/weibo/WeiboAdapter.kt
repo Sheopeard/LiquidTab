@@ -21,6 +21,7 @@ internal object WeiboAdapter : TargetAdapter {
     override val forceCompositorFrames = true
     override val usesContentDarkMode = true
     override val disablePlatformForceDark = true
+    override fun glassSurfaceFillBlendMode(dark: Boolean) = weiboGlassFillBlendMode(dark)
     override val liveBackdropFramePump = true
     override val refreshOpticsOnBarShow = true
     override val releaseOutlineClipping = true
@@ -82,3 +83,7 @@ internal object WeiboAdapter : TargetAdapter {
         "com.sina.weibo.SplashActivity",
     )
 }
+
+/** The dark tint attenuates the sampled scene, including on ColorOS. */
+internal fun weiboGlassFillBlendMode(dark: Boolean): android.graphics.BlendMode? =
+    if (dark) android.graphics.BlendMode.MULTIPLY else null

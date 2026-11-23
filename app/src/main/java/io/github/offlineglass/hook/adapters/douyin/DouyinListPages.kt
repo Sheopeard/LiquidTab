@@ -28,7 +28,7 @@ internal object DouyinListPages {
                 // the same page role through the native feed EVENT_TYPE contract.
                 val id = args.getString("extra_tab_id")
                     ?: args.getString("com.ss.android.ugc.aweme.intent.extra.EVENT_TYPE") ?: return
-                if (id != "homepage_groupon" && id != "homepage_mediumvideo") return
+                if (id != "homepage_groupon" && id != "homepage_mediumvideo" && id != "homepage_mall") return
                 val root = view.invoke(p.thisObject) as? ViewGroup ?: return
                 roots[root] = id
             }
@@ -69,17 +69,34 @@ internal object DouyinListPages {
         private var searchedAt = 0L
         private var report = ""
         private var reports = 0
+        var activeGrouponRoot: View? = null
+            private set
+        var activeMallRoot: View? = null
+            private set
+        private val visible = android.graphics.Rect()
+        fun isRecycler(view: View): Boolean = recycler.isInstance(view)
+        fun isGrouponViewport(view: View): Boolean = view === list.get() && role(view) == "homepage_groupon"
         private data class Original(val height: Int, val margin: Int?, val padding: Int, val clip: Boolean?)
         private val owned = WeakHashMap<View, Original>()
 
         fun update(window: ViewGroup, releaseLift: (View) -> Unit) {
+            activeGrouponRoot = null
+            activeMallRoot = null
             val state = runCatching { binding.state() }.getOrNull() ?: return
-            if (state.current != "homepage_groupon" && state.current != "homepage_mediumvideo") return
+            if (state.current != "homepage_groupon" && state.current != "homepage_mediumvideo" && state.current != "homepage_mall") return
             val candidates = roots.entries.filter { (root, role) ->
                 role == state.current && root.isAttachedToWindow && root.rootView === window && root.isShown
             }
             if (candidates.size != 1) return
             val root = candidates.single().key
+            if (state.current == "homepage_mall") {
+                if (root.getGlobalVisibleRect(visible) && visible.width() > window.width / 2) {
+                    activeMallRoot = root
+                }
+                return
+            }
+            if (state.current == "homepage_groupon" && root.getGlobalVisibleRect(visible) &&
+                visible.width() > window.width / 2) activeGrouponRoot = root
             if (page.get() !== root) { page = WeakReference(root); list.clear(); searchedAt = 0 }
             var viewport = list.get()?.takeIf { it.isAttachedToWindow && descendant(it, root) }
             val now = SystemClock.uptimeMillis()
@@ -103,7 +120,7 @@ internal object DouyinListPages {
                 list = WeakReference(viewport)
             }
             val target = viewport ?: return
-            val evidence = StringBuilder("page=${state.current}\n")
+            val evidence = if (reports < 8) StringBuilder("page=${state.current}\n") else null
             // Only the actual scrolling viewport and its containing layers. Headers,
             // overlays, cards and AppBar siblings are never changed.
             var node: View? = target
@@ -112,9 +129,9 @@ internal object DouyinListPages {
                 releaseLift(current)
                 val lp = current.layoutParams
                 val margin = lp as? ViewGroup.MarginLayoutParams
-                evidence.append(current.javaClass.name).append(" h=").append(current.height)
-                    .append(" lp=").append(lp?.height).append(" mb=").append(margin?.bottomMargin)
-                    .append(" pb=").append(current.paddingBottom).append('\n')
+                evidence?.append(current.javaClass.name)?.append(" h=")?.append(current.height)
+                    ?.append(" lp=")?.append(lp?.height)?.append(" mb=")?.append(margin?.bottomMargin)
+                    ?.append(" pb=")?.append(current.paddingBottom)?.append('\n')
                 owned.getOrPut(current) { Original(lp?.height ?: -2, margin?.bottomMargin,
                     current.paddingBottom, (current as? ViewGroup)?.clipToPadding) }
                 var changed = false
@@ -124,14 +141,14 @@ internal object DouyinListPages {
                 if (margin != null && margin.bottomMargin > 0) { margin.bottomMargin = 0; changed = true }
                 if (current is ViewGroup) {
                     if (current.paddingBottom > 0) current.setPadding(current.paddingLeft, current.paddingTop, current.paddingRight, 0)
-                    current.clipToPadding = false
+                    if (current.clipToPadding) current.clipToPadding = false
                 }
                 if (changed) current.layoutParams = lp
                 if (current === root) { node = null; return@repeat }
                 node = current.parent as? View
             }
-            val text = evidence.toString()
-            if (text != report && reports < 8) {
+            val text = evidence?.toString()
+            if (text != null && text != report) {
                 report = text
                 reports++
                 runCatching { java.io.File(window.context.getExternalFilesDir(null), "dy_list_page_status.txt")
@@ -152,6 +169,8 @@ internal object DouyinListPages {
                 if (view is ViewGroup && old.clip != null) view.clipToPadding = old.clip
             }
             owned.clear(); page.clear(); list.clear()
+            activeGrouponRoot = null
+            activeMallRoot = null
         }
     }
 }

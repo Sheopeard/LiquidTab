@@ -99,12 +99,70 @@ internal class XhsNavigationState : AppNavigationState {
     private val actionHostPosition = IntArray(2)
     private val actionPosition = IntArray(2)
     private val renderer = XhsNavigationRenderer()
+    private var diagnosticTapGeneration = 0
+
+    private fun pagerIndex(view: View): Int? =
+        runCatching { view.javaClass.getMethod("getCurrentItem").invoke(view) as? Int }.getOrNull()
+
+    private fun pagerCount(view: View): Int? = runCatching {
+        val adapter = view.javaClass.getMethod("getAdapter").invoke(view) ?: return null
+        adapter.javaClass.getMethod("getCount").invoke(adapter) as? Int
+    }.getOrNull()
+
+    private fun diagnosticPager(host: View): View? {
+        val queue = ArrayDeque<View>()
+        queue.add(host.rootView)
+        var result: View? = null
+        repeat(600) {
+            val view = queue.removeFirstOrNull() ?: return result
+            if (view is ViewGroup && view.javaClass.name == SCROLLABLE_PAGER_CLASS &&
+                view.isShown && (pagerCount(view) ?: -1) in 4..5 && pagerIndex(view) != null) {
+                if (result != null) return null
+                result = view
+            }
+            if (view is ViewGroup) for (i in 0 until view.childCount) queue.add(view.getChildAt(i))
+        }
+        return null
+    }
+
+    private fun observePagerCommit(pager: View, index: Int, previous: Int) {
+        val target = if (pagerCount(pager) == 4 && index > 2) index - 1 else index
+        if (target == previous || !pager.isHardwareAccelerated) return
+        val generation = ++diagnosticTapGeneration
+        val observer = pager.viewTreeObserver
+        if (!observer.isAlive) return
+        val listener = object : android.view.ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (generation != diagnosticTapGeneration || pagerIndex(pager) == target) {
+                    if (observer.isAlive) observer.removeOnPreDrawListener(this)
+                    if (generation == diagnosticTapGeneration && pager.isShown && observer.isAlive) {
+                        observer.registerFrameCommitCallback {
+                            if (generation == diagnosticTapGeneration && pagerIndex(pager) == target &&
+                                pager.isShown && android.os.Trace.isEnabled()) {
+                                android.os.Trace.beginSection("LiquidTab.Xhs.PagerCommitCandidate.$index")
+                                android.os.Trace.endSection()
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+        }
+        observer.addOnPreDrawListener(listener)
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (observer.isAlive) observer.removeOnPreDrawListener(listener)
+        }, 1800L)
+    }
     override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
         val tabBar = findTabBar(host, source) ?: return false
         val getter = TAB_GETTERS.getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return false
         val target = runCatching { XposedHelpers.callMethod(tabBar, getter) as? View }.getOrNull()
             ?: return false
+        val pager = if (index != 2 && io.github.offlineglass.BuildConfig.DEBUG && android.os.Trace.isEnabled())
+            diagnosticPager(host) else null
+        val before = pager?.let(::pagerIndex)
         val clicked = performClickThroughTab(target, tabBar)
+        if (clicked && pager != null && before != null) observePagerCommit(pager, index, before)
         if (clicked && index == 2) {
             // Publish opens a native action, not a page. This callback's true
             // result commits the page index in the host; keep the existing page.
@@ -167,6 +225,22 @@ internal class XhsNavigationState : AppNavigationState {
 
     override fun drawForeground(canvas: Canvas, frame: AdapterNavigationFrame,
         selectionPath: android.graphics.Path, drawSource: () -> Unit): Boolean {
+        if (frame.detachedDirectSelection && !selectionPath.isEmpty) {
+            val outside = canvas.save()
+            try {
+                canvas.clipOutPath(selectionPath)
+                drawSource()
+            } finally { canvas.restoreToCount(outside) }
+            val inside = canvas.save()
+            try {
+                canvas.clipPath(selectionPath)
+                renderer.draw(canvas, frame.copy(
+                    extraScale = (frame.height / (64f * frame.density)).coerceIn(0.875f, 1f),
+                    hideSelectedForOptics = true,
+                ))
+            } finally { canvas.restoreToCount(inside) }
+            return true
+        }
         val mix = frame.navigationOpticalMix.coerceIn(0f, 1f)
         if (mix <= 0f || selectionPath.isEmpty) { drawSource(); return true }
         // Match Spotify's live geometry mask: outside is always normal artwork;

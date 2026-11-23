@@ -1,6 +1,6 @@
 # LiquidTab
 
-LiquidTab 是适用于 LSPosed 的 Android 液态底栏模块。2.1.0 包含模块管理界面、共享玻璃渲染和按应用组织的适配代码。此分支版本应用 ID 修改为 `com.sheopeard.liquidtab`，并补充适配了欧陆词典与 Share。
+LiquidTab 是适用于 LSPosed 的 Android 液态玻璃界面模块。2.1.21 基于上游 2.1.2，包含管理界面、共享玻璃渲染核心与 37 款应用的适配。此分支版本应用 ID 修改为 `com.sheopeard.liquidtab`，并补充适配了欧陆词典、Share、百度地图与网易邮箱大师。
 
 ## 特别致谢：kyant0 / AndroidLiquidGlass
 
@@ -8,30 +8,33 @@ LiquidTab 是适用于 LSPosed 的 Android 液态底栏模块。2.1.0 包含模�
 
 LiquidTab 同时使用 Miuix、AndroidX 和 Android 原生渲染能力，并包含自身的原生 View 桥接、动态高光、生命周期管理和应用适配代码。具体许可见 [NOTICE.md](NOTICE.md)。
 
+感谢酷安博主 **小郑大王** 提供顶栏布局创意。
+
 ## 运行条件
 
 - Android 15（API 35）或更高版本
-- 已安装并启用 LSPosed；将 LiquidTab 的作用域限制在需要适配的应用
+- 已安装并启用支持现代模块接口（API 101）的 LSPosed；将 LiquidTab 的作用域限制在需要适配的应用
 - 建议每次设置应用适配后重启目标应用进程
 
-模块离线运行，不需要账号、网络授权或在线更新。底栏设置通过本地配置接口传递给目标进程。
+模块离线运行，底栏设置通过本地配置接口传递给目标进程。
 
 ## 当前正式适配范围
 
-正式版作用域见 [LSPosed 作用域清单](app/src/main/resources/META-INF/xposed/scope.list)。其中包含 31 个适配应用，以及供哔哩哔哩超级岛联动使用的 SystemUI 作用域；后者不是独立底栏适配。
+正式作用域由 `app/src/main/resources/META-INF/xposed/scope.list` 提供，与模块的应用列表一致：
 
-2.1.0 不包含 Reddit、超级小爱或小米相册适配。
+高德地图、哔哩哔哩、哔哩哔哩国际版、美团外卖、美团、米家、小米社区、小米运动健康、小米应用商店、网易云音乐、QQ 音乐、Spotify、Apple Music、小红书、拼多多、淘宝、抖音、TikTok、菜鸟、闲鱼、京东、百度贴吧、YouTube、微博、微信、移动交通大学、知乎、ChatGPT、华为运动健康、X、Instagram、Reddit、Quora。
+
+小米桌面、小米系统界面、小米相册和超级小爱不属于本次正式适配范围。
 
 ## 主要设置与默认值
 
-- 默认中文；液态玻璃和描边开启。
-- 纯色模式、磨砂玻璃、姿态动态效果、经典导航键、动态配色及底部渐变模糊关闭。
-- 底色透明度 30%（深浅色一致），模糊半径 0，底栏高度 50 dp，深色高光描边强度 50%。
-- 以上为未保存偏好时的默认值，覆盖安装保留已保存设置。
+- 首次安装默认中文，主题跟随系统；开启液态玻璃、滑块照亮、描边和底栏无字模式；关闭纯色、磨砂、姿态动态、简化切页动画、经典导航和动态配色。
+- 默认模糊半径 0、底栏高度 56 dp、底色透明度 50%、高光描边强度 60%、高光透明度 45%、折射强度 120%、粘滞感 25%。已有设置不覆盖。
+- 调节模糊半径仍影响底栏和隐藏层，点按放大、拖动时的滑块不附加模糊。升级安装保留已有设置。
 
 ## 项目结构
 
-- `app/src/main/java/io/github/offlineglass/hook/adapters/<应用键>/`：应用专属配置、适配器、Hook 信号与该应用的工作说明。
+- `app/src/main/java/io/github/offlineglass/hook/adapters/<应用键>/`：应用专属配置、适配器和 Hook 信号。
 - `app/src/main/java/io/github/offlineglass/targets/`：按稳定顺序汇总应用配置，并管理正式列表和查找。
 - `app/src/main/java/io/github/offlineglass/hook/`：模块入口、适配调度、通用导航发现和共享宿主/绘制生命周期。
 - `app/src/main/java/io/github/offlineglass/rendering/`：跨应用共享的液态玻璃、模糊和材质绘制实现。
@@ -40,7 +43,7 @@ LiquidTab 同时使用 Miuix、AndroidX 和 Android 原生渲染能力，并包�
 
 ## 构建
 
-需要 JDK 21、Android SDK Platform 37、Build Tools 37 和网络可用的 Gradle 依赖源。Windows PowerShell：
+需要 JDK 21、Android SDK Platform 37 和 Build Tools 37。Windows PowerShell：
 
 ```powershell
 ./gradlew.bat :app:assembleRelease

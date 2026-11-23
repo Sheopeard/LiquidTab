@@ -6,7 +6,8 @@ import android.view.View
 
 /** One verified producer capability shared by every material, including popup windows. */
 internal object ChatGptHazeBackdrop {
-    fun recordingKey(consumer:Any):Long?=ChatGptPageSource.recordingKey(consumer)
+    fun recordingKey(consumer: Any, retainTranslation: Boolean): Long? =
+        ChatGptPageSource.recordingKey(consumer, retainTranslation)
     fun draw(canvas:Canvas,anchor:View,consumer:Any,screen:Rect,localWidth:Float,localHeight:Float,padding:Int)=
         ChatGptPageSource.draw(canvas,consumer,screen,localWidth,localHeight,padding)
 }

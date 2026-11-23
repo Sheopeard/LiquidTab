@@ -322,7 +322,7 @@ internal class SpotifyMiniPlayerGlass {
             val w = bounds.width()
             val h = bounds.height()
             val blur = config.blurRadius * density
-            val pad = NativeBackdropBlur.padding(blur, 24f * density).toInt()
+            val pad = NativeBackdropBlur.padding(blur, 24f * density * config.refractionPaddingScale).toInt()
             val radius = h * config.cornerRadiusPercent / 100f
             rect.set(bounds)
             val newPathKey = "$bounds:$radius:${config.cornerSmoothing}"
@@ -368,7 +368,7 @@ internal class SpotifyMiniPlayerGlass {
             val pose = motion.pose
             val motionChanged = motion.active || motionWasActive
             motionWasActive = motion.active
-            val key = "$w:$h:$pad:$radius:$blur:${config.liquidGlassEnabled}:$flowEnabled"
+            val key = "$w:$h:$pad:$radius:$blur:${config.liquidGlassEnabled}:$flowEnabled:${config.refractionStrength}"
             val poseChanged = (kotlin.math.abs(pose[0] - appliedFlowX) > 0.0005f ||
                 kotlin.math.abs(pose[1] - appliedFlowY) > 0.0005f)
             if (key != effectKey || poseChanged || motionChanged) {
@@ -396,7 +396,7 @@ internal class SpotifyMiniPlayerGlass {
                     // its signed-distance normal flips there and would sample
                     // two different scene rows, producing a horizontal seam.
                     shader.setFloatUniform("refractionHeight", minOf(24f * density, h * 0.45f))
-                    shader.setFloatUniform("refractionAmount", -24f * density)
+                    shader.setFloatUniform("refractionAmount", -24f * density * config.refractionScale)
                     shader.setFloatUniform("depthEffect", 0f)
                     effect = RenderEffect.createChainEffect(
                         RenderEffect.createRuntimeShaderEffect(shader, "content"), effect)
@@ -418,7 +418,7 @@ internal class SpotifyMiniPlayerGlass {
             canvas.drawPath(path,surfacePaint)
             progressFill.draw(canvas, rect, path, opacity, density)
             val highlightSave = if (opacity == 255) canvas.save() else canvas.saveLayerAlpha(rect, opacity)
-            host.get()?.drawAccessoryPanelHighlight(canvas, rect, radius)
+            host.get()?.drawAccessoryPanelHighlight(canvas, rect, radius, path)
             canvas.restoreToCount(highlightSave)
         }
         override fun setAlpha(alpha: Int) { opacity = alpha.coerceIn(0, 255); invalidateSelf() }

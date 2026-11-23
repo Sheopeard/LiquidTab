@@ -24,6 +24,7 @@ import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.topbar.TopBarMaterialPolicy
 import io.github.offlineglass.hook.topbar.TopBarRole
+import io.github.offlineglass.hook.topbar.TopBarChannelHost
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.HookConfigReader
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
@@ -103,6 +104,8 @@ internal object DouyinTopBar {
         private var lastBindingReport: String? = null
         private var bindingReports = 0
         private var touchX = Float.NaN
+        private val channelMeasure = io.github.offlineglass.hook.topbar.TopBarTabMeasure()
+        private var channelSizing: io.github.offlineglass.hook.topbar.TopBarTabLayout? = null
         private var touchAt = 0L
         private var touching = false
         private var selected: Tab? = null
@@ -198,10 +201,10 @@ internal object DouyinTopBar {
             if (hosts.isEmpty()) {
                 for (role in 0..2) {
                     val state = PanelState(this, role)
-                    val panel = GlassHostLayout(row.context, config, if (role == 1) shown.size + 1 else 1,
+                    val panel = TopBarChannelHost.createPanel(row.context, config, if (role == 1) shown.size + 1 else 1,
                         nonSelectableIndices = if (role == 1) setOf(0) else emptySet(),
                         nativeSelectionReliable = false, navigationSource = row,
-                        sliderEnabled = role == 1, adapterOverride = PanelAdapter(state)).apply {
+                        sliderEnabled = role == 1, adapterOverride = PanelAdapter(state), isChannel = role == 1).apply {
                         elevation = 0f; clipChildren = false; clipToPadding = false
                         contentDescription = when(role) { 0 -> "侧边栏"; 2 -> "搜索"; else -> "频道：更多、${shown.joinToString("、") { it.text.text }}" }
                     }
@@ -226,7 +229,10 @@ internal object DouyinTopBar {
             val size = (h * .92f).roundToInt()
             val gap = (12*d).roundToInt()
             visual = motion.frame(now)
-            val pill = minOf((visual.slots()*42*d).roundToInt(), content.width - 2*size - 4*gap).coerceAtLeast(h)
+            channelSizing = channelMeasure.update(listOf<String?>(null) + shown.map { captions[it.id] ?: it.text.text.toString() },
+                d, 14f * row.resources.displayMetrics.scaledDensity)
+            val pill = minOf((channelSizing?.desiredWidth ?: visual.slots()*42*d).roundToInt(),
+                content.width - 2*size - 4*gap).coerceAtLeast(h)
             val total = pill + 2*gap + 2*size
             val x = ((content.width-total)/2).coerceAtLeast(0)
             val y = rowPos[1]-contentPos[1]+(row.height-h)/2
@@ -323,7 +329,7 @@ internal object DouyinTopBar {
                 val host = hosts.getOrNull(1) ?: return false
                 val pad = 4f*row.resources.displayMetrics.density
                 val available = (host.width-2*pad).coerceAtLeast(1f)
-                val fraction = (touchX-pad)/available
+                val fraction = ((channelSizing?.toUniform(touchX, host.width, pad) ?: touchX)-pad)/available
                 if (fraction <= visual.menuCenter()+.5f/visual.slots()) resolved = 0
                 else {
                     val point = visual.points().filter { it.id() in motion.visible() && it.alpha() > .35f }
@@ -421,9 +427,15 @@ internal object DouyinTopBar {
             val host = hosts.getOrNull(1) ?: return null
             val pad = 4f*row.resources.displayMetrics.density
             val available = (host.width-2*pad).coerceAtLeast(1f)
-            val width = available/visual.slots()
+            val slot = available/visual.slots()
+            val fraction = visual.selectionCenter()
+            val proportion = channelSizing?.fraction(fraction) ?: fraction
+            val left = fraction - .5f / visual.slots()
+            val right = fraction + .5f / visual.slots()
+            val width = channelSizing?.let { available * (it.fraction(right) - it.fraction(left)) }
+                ?.takeIf { it > 0f } ?: slot
             val center = if (touching && touchX.isFinite()) touchX.coerceIn(pad+width/2,host.width-pad-width/2)
-                else pad+available*visual.selectionCenter()
+                else pad+available*proportion
             return center to width
         }
 
@@ -444,7 +456,8 @@ internal object DouyinTopBar {
             if (role != 1) { glyph(if (role == 0) 0 else 2, frame.width/2f); return }
             val available = (frame.width-8*d).coerceAtLeast(1f)
             val slot = available/visual.slots()
-            glyph(1, 4*d+available*visual.menuCenter())
+            fun projected(f: Float) = channelSizing?.fraction(f) ?: f
+            glyph(1, 4*d+available*projected(visual.menuCenter()))
             visual.points().forEach { point ->
                 if (point.alpha() <= .001f) return@forEach
                 labelPaint.color = color
@@ -452,11 +465,13 @@ internal object DouyinTopBar {
                 labelPaint.typeface = if (point.id() == selected?.id) android.graphics.Typeface.DEFAULT_BOLD else android.graphics.Typeface.DEFAULT
                 labelPaint.textSize = 14f*frame.scaledDensity
                 val value = captions[point.id()] ?: return@forEach
-                val max = slot-6*d
+                val half = .5f / visual.slots()
+                val max = (available * (projected(point.center() + half) - projected(point.center() - half)) - 6*d)
+                    .coerceAtLeast(1f)
                 val measured = labelPaint.measureText(value)
                 if (measured > max) labelPaint.textSize *= max/measured
                 val fm = labelPaint.fontMetrics
-                canvas.drawText(value, 4*d+available*point.center(), cy-(fm.ascent+fm.descent)/2, labelPaint)
+                canvas.drawText(value, 4*d+available*projected(point.center()), cy-(fm.ascent+fm.descent)/2, labelPaint)
             }
         }
 
@@ -470,6 +485,8 @@ internal object DouyinTopBar {
         }
 
         private class PanelState(val session: Session, val role: Int) : AppNavigationState {
+            override fun uniformSlotTouchX(x: Float, hostWidth: Int, padding: Float): Float =
+                if (role == 1) session.channelSizing?.toUniform(x, hostWidth, padding) ?: x else x
             override fun indicatorHorizontalGeometry(center: Float, width: Float) =
                 if (role == 1) session.indicatorGeometry() else null
             private var probeFrames = 0
@@ -509,7 +526,8 @@ internal object DouyinTopBar {
             // Shares the homepage window with the bottom bar. Returning false
             // restores the old inset every pre-draw and fights that bar's
             // immersive policy, visibly lifting the system gesture handle.
-            override fun forceNavigationBarImmersed(host: GlassHostLayout) = true
+            override fun forceNavigationBarImmersed(host: GlassHostLayout) =
+                !DouyinCommentLayoutHooks.requiresNativeNavigationFit(host.rootView)
             override fun setNativeBarTouchable(view: View?, touchable: Boolean) = true
             override fun suppressRedrawnSource() = false
             override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int) = if (role == 1) session.selectedIndex() else 0

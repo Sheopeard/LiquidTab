@@ -77,7 +77,9 @@ object HookConfigReader {
 
     /** Only real snapshots may decide cold-start hooks; never promote defaults. */
     fun startupSnapshot(packageName: String): GlassConfig? =
-        if (committedConfigs.hasVerifiedRevision(packageName)) committedConfigs.get(packageName) else null
+        if (committedConfigs.hasVerifiedRevision(packageName)) committedConfigs.get(packageName)?.also {
+            io.github.offlineglass.rendering.GlassEdgeHighlight.transparency = it.highlightTransparency
+        } else null
 
     fun readStartupConfig(context: Context, packageName: String): GlassConfig? {
         startupSnapshot(packageName)?.let { return it }
@@ -113,6 +115,7 @@ object HookConfigReader {
         }
 
         val value = readCurrent(context, packageName)
+        io.github.offlineglass.rendering.GlassEdgeHighlight.transparency = value.highlightTransparency
         cached = Cached(packageName, value, now)
         return value
     }
@@ -121,16 +124,18 @@ object HookConfigReader {
     fun readFresh(context: Context, packageName: String): GlassConfig {
         requestConfigSync(context, packageName)
         val value = readCurrent(context, packageName)
+        io.github.offlineglass.rendering.GlassEdgeHighlight.transparency = value.highlightTransparency
         cached = Cached(packageName, value, System.currentTimeMillis())
         return value
     }
 
     @Synchronized
-    fun acceptPushedConfig(packageName: String, config: GlassConfig, transient: Boolean = false,
+    fun acceptPushedConfig(packageName: String, config: GlassConfig,
         revision: Long = -1L): Boolean {
         if (AppCatalog.forPackage(packageName) == null) return false
-        val value = config.normalized()
-        if (!transient && !committedConfigs.acceptVersioned(packageName, value, revision)) return false
+        val value = config.normalized(packageName)
+        if (!committedConfigs.acceptVersioned(packageName, value, revision)) return false
+        io.github.offlineglass.rendering.GlassEdgeHighlight.transparency = value.highlightTransparency
         // Adapter-owned storage is optional, not a prerequisite for accepting
         // a committed module snapshot. Otherwise most adapters discarded the
         // push here and the next poll/rebind restored an older fallback value.
@@ -325,8 +330,9 @@ object HookConfigReader {
             lightAlpha = global.lightAlpha,
             darkAlpha = global.darkAlpha,
             darkBarHighlightStrength = global.darkBarHighlightStrength,
+            highlightTransparency = global.highlightTransparency,
             bottomGradientBlurEnabled = false,
-        ).normalized()
+        ).normalized(canonicalPackage)
         if (commitStartup) {
             val accepted = acceptPushedConfig(packageName, value, revision = revision)
             startupPreferenceStatus = "accepted=$accepted revision=$revision enabled=${value.enabled} " +
@@ -341,10 +347,14 @@ object HookConfigReader {
 
     private fun readConfig(p: SharedPreferences, prefix: String, defaults: GlassConfig): GlassConfig = GlassConfig(
         postureEffectsEnabled = p.getBoolean(GLOBAL + ConfigContract.KEY_POSTURE_EFFECTS, false),
+        indicatorInteractionLightEnabled = p.getBoolean(GLOBAL + ConfigContract.KEY_INDICATOR_INTERACTION_LIGHT, true),
+        simplifyTabSwitch = p.getBoolean(GLOBAL + ConfigContract.KEY_SIMPLIFY_TAB_SWITCH, GlassConfig.DEFAULT_SIMPLIFY_TAB_SWITCH),
         liquidViscosity = p.getFloat(GLOBAL + ConfigContract.KEY_LIQUID_VISCOSITY, 25f),
+        refractionStrength = p.getFloat(GLOBAL + ConfigContract.KEY_REFRACTION_STRENGTH, GlassConfig.DEFAULT_REFRACTION_STRENGTH),
         flowHorizontalStrength = p.getFloat(GLOBAL + ConfigContract.KEY_FLOW_HORIZONTAL, 100f),
         flowVerticalStrength = p.getFloat(GLOBAL + ConfigContract.KEY_FLOW_VERTICAL, 100f),
         classicNavigation = if (prefix == GLOBAL) p.getBoolean(GLOBAL + ConfigContract.KEY_CLASSIC_NAVIGATION, false) else defaults.classicNavigation,
+        bottomBarIconOnly = p.getBoolean(GLOBAL + ConfigContract.KEY_BOTTOM_BAR_ICON_ONLY, GlassConfig.DEFAULT_BOTTOM_BAR_ICON_ONLY),
         enabled = defaults.enabled,
         themeMode = p.getInt(prefix + ConfigContract.KEY_THEME_MODE, defaults.themeMode),
         tabWidth = p.getFloat(prefix + ConfigContract.KEY_TAB_WIDTH, defaults.tabWidth),
@@ -356,6 +366,7 @@ object HookConfigReader {
         lightAlpha = p.getFloat(prefix + ConfigContract.KEY_LIGHT_ALPHA, defaults.lightAlpha),
         darkAlpha = p.getFloat(prefix + ConfigContract.KEY_DARK_ALPHA, defaults.darkAlpha),
         darkBarHighlightStrength = p.getFloat(prefix + ConfigContract.KEY_DARK_BAR_HIGHLIGHT_STRENGTH, defaults.darkBarHighlightStrength),
+        highlightTransparency = p.getFloat(prefix + ConfigContract.KEY_HIGHLIGHT_TRANSPARENCY, defaults.highlightTransparency),
         iconScale = p.getFloat(prefix + ConfigContract.KEY_ICON_SCALE, defaults.iconScale),
         textSize = p.getFloat(prefix + ConfigContract.KEY_TEXT_SIZE, defaults.textSize),
         iconOnly = p.getBoolean(prefix + ConfigContract.KEY_ICON_ONLY, defaults.iconOnly),
@@ -366,13 +377,15 @@ object HookConfigReader {
         bilibiliSolidTopGradient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_SOLID_TOP_GRADIENT, defaults.bilibiliSolidTopGradient),
         bilibiliBottomColorGradient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_BOTTOM_COLOR_GRADIENT, defaults.bilibiliBottomColorGradient),
         bilibiliTopBar = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_TOP_BAR, defaults.bilibiliTopBar),
+        bilibiliEdgeToEdgeFeed = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_EDGE_TO_EDGE_FEED, defaults.bilibiliEdgeToEdgeFeed),
         bilibiliInDetachedSearch = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_DETACHED_SEARCH, defaults.bilibiliInDetachedSearch),
+        bilibiliDetachedSearch = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_DETACHED_SEARCH, defaults.bilibiliDetachedSearch),
         bilibiliInVideoAmbient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_VIDEO_AMBIENT, defaults.bilibiliInVideoAmbient),
         bilibiliVideoAmbient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_VIDEO_AMBIENT, defaults.bilibiliVideoAmbient),
         douyinTopBar = p.getBoolean(prefix + ConfigContract.KEY_DOUYIN_TOP_BAR, defaults.douyinTopBar),
         tiktokTopBar = p.getBoolean(prefix + ConfigContract.KEY_TIKTOK_TOP_BAR, defaults.tiktokTopBar),
         xhsTopBar = p.getBoolean(prefix + ConfigContract.KEY_XHS_TOP_BAR, defaults.xhsTopBar),
-        youtubeTopBar = p.getBoolean(prefix + ConfigContract.KEY_YOUTUBE_TOP_BAR, defaults.youtubeTopBar),
+        xhsEdgeToEdgeFeed = p.getBoolean(prefix + ConfigContract.KEY_XHS_EDGE_TO_EDGE_FEED, defaults.xhsEdgeToEdgeFeed),
         weiboHomeTopBar = p.getBoolean(prefix + ConfigContract.KEY_WEIBO_HOME_TOP_BAR, defaults.weiboHomeTopBar),
         managerEnglishNavigationLabels = if (p.contains("manager_language"))
             io.github.offlineglass.config.ManagerLanguage.fromValue(p.getString("manager_language", null)) ==

@@ -2,6 +2,7 @@ package io.github.offlineglass.hook.adapters.jd
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Rect
 import android.os.Bundle
 import android.os.Looper
 import android.os.SystemClock
@@ -33,6 +34,41 @@ internal object JdHomeColdBatch {
     }
     private fun active(): Boolean = configured && (host.get()?.config?.enabled ?: initialEnabled) &&
         SystemClock.uptimeMillis() < until
+
+    private fun installPullPreload(loader: ClassLoader) {
+        runCatching {
+            val pullPackage = "com.jingdong.app.mall.home.pullrefresh.pulldoor"
+            val owner = Class.forName("$pullPackage.HomePullServe", false, loader)
+            val wrapper = Class.forName("$pullPackage.ChannelWrapper", false, loader)
+            val model = Class.forName("com.jingdong.app.mall.home.floor.model.entity.HomeWebFloorViewEntity", false, loader)
+            check(ViewGroup::class.java.isAssignableFrom(owner) && ViewGroup::class.java.isAssignableFrom(wrapper) &&
+                model.getField("newPullUrl").type == String::class.java)
+            wrapper.getConstructor(Context::class.java, owner)
+            val ownerField = wrapper.declaredFields.single { it.type == owner && !Modifier.isStatic(it.modifiers) }
+                .apply { isAccessible = true }
+            val wrapperField = owner.declaredFields.single { it.type == wrapper && !Modifier.isStatic(it.modifiers) }
+                .apply { isAccessible = true }
+            val params = arrayOf(model, Long::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+            val load = wrapper.declaredMethods.single {
+                Modifier.isPublic(it.modifiers) && !Modifier.isStatic(it.modifiers) &&
+                    it.returnType == Boolean::class.javaPrimitiveType && it.parameterTypes.contentEquals(params)
+            }
+            val visible = Rect()
+            XposedBridge.framework().hook(load).setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                .intercept { chain ->
+                    if (Looper.myLooper() != Looper.getMainLooper() || chain.getArg(2) != false ||
+                        !configured || !(host.get()?.config?.enabled ?: initialEnabled)) return@intercept chain.proceed()
+                    val view = chain.thisObject as ViewGroup
+                    val pull = ownerField.get(view) ?: return@intercept chain.proceed()
+                    if (wrapperField.get(pull) !== view || (view.isShown && view.getGlobalVisibleRect(visible)))
+                        return@intercept chain.proceed()
+                    // Native PullLoadOnlyDrag already has this behavior. A false
+                    // preload result leaves JD's forced drag-load flag intact.
+                    if (android.os.Trace.isEnabled()) android.os.Trace.setCounter("LiquidTab.JD.hiddenPullPreload", 1)
+                    false
+                }
+        }.onFailure { XposedBridge.log("LiquidTab JD Home pull preload contract unavailable: $it") }
+    }
     private fun isHome(value: Any): Boolean {
         var type: Class<*>? = value.javaClass
         repeat(16) {
@@ -44,6 +80,7 @@ internal object JdHomeColdBatch {
     }
 
     fun install(loader: ClassLoader) {
+        installPullPreload(loader)
         runCatching {
             val fragment = Class.forName("androidx.fragment.app.Fragment", false, loader)
             val activityGetter = fragment.getMethod("getActivity")

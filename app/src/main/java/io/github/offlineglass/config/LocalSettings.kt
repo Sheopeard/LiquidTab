@@ -112,6 +112,15 @@ object LocalSettings {
                 prefs.edit().putBoolean("_migrated_from_de", true).apply()
             }
         }
+        // Undo the temporary blur-only migration once for affected installs.
+        // New installs use the optical default; later manual choices still win.
+        if (prefs.getBoolean("blur_only_debug_defaults_20261001", false) &&
+            !prefs.getBoolean("liquid_glass_defaults_restored_20261001", false)) {
+            prefs.edit()
+                .putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, true)
+                .putBoolean("liquid_glass_defaults_restored_20261001", true)
+                .commit()
+        }
         return prefs
     }
 
@@ -159,14 +168,15 @@ object LocalSettings {
                 lightAlpha = global.lightAlpha,
                 darkAlpha = global.darkAlpha,
                 darkBarHighlightStrength = global.darkBarHighlightStrength,
+                highlightTransparency = global.highlightTransparency,
                 bottomGradientBlurEnabled = false,
-            )
+            ).normalized(target.packageName)
         }
         return ManagerSettings(
             language = ManagerLanguage.fromValue(p.getString("manager_language", "zh")),
             uiMode = UiMode.fromValue(p.getString("ui_mode", UiMode.MIUIX.value)),
             colorMode = ColorMode.fromValue(p.getString("color_mode", ColorMode.SYSTEM.value)),
-            dynamicColor = p.getBoolean("dynamic_color", true),
+            dynamicColor = p.getBoolean("dynamic_color", false),
             liquidGlassEnabled = liquidGlassEnabled,
             bottomGradientBlurEnabled = bottomGradientBlurEnabled,
             solidBarEnabled = solidBarEnabled,
@@ -221,11 +231,12 @@ object LocalSettings {
             lightAlpha = global.lightAlpha,
             darkAlpha = global.darkAlpha,
             darkBarHighlightStrength = global.darkBarHighlightStrength,
+            highlightTransparency = global.highlightTransparency,
             liquidGlassEnabled = liquidGlassEnabled,
             bottomGradientBlurEnabled = false,
             solidBarEnabled = solidBarEnabled,
             outlineEnabled = outlineEnabled,
-        ).normalized()
+        ).normalized(canonicalPackage)
     }
 
     fun setUiMode(context: Context, value: UiMode) = edit(context) { putString("ui_mode", value.value) }
@@ -251,21 +262,21 @@ object LocalSettings {
         edit(context) {
             putBoolean(ConfigContract.KEY_SOLID_BAR_ENABLED, false)
             putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, !value)
-            if (value && p.getFloat(GLOBAL + ConfigContract.KEY_BLUR_RADIUS, 0f) == 0f) {
+            if (value && p.getFloat(GLOBAL + ConfigContract.KEY_BLUR_RADIUS, GlassConfig().blurRadius) == 0f) {
                 putFloat(GLOBAL + ConfigContract.KEY_BLUR_RADIUS, 4f)
             }
         }
     }
 
-    /** Applies the public 1.0 defaults once, including when upgrading from a debug build. */
+    /** Publishes initial settings without overwriting stored preferences on upgrade. */
     fun applyFormalDefaultsOnce(context: Context) {
         val p = prefs(context)
         val edit = p.edit()
         var changed = false
         if (!p.getBoolean("douyin_apk_top_defaults_20261024", false)) {
             edit.putBoolean("douyin_apk_top_defaults_20261024", true)
-                .putString(appPrefix("com.ss.android.ugc.aweme") + ConfigContract.KEY_DOUYIN_PINNED_TABS,
-                    DouyinTopChannels.DEFAULT_PINS)
+            val pins = appPrefix("com.ss.android.ugc.aweme") + ConfigContract.KEY_DOUYIN_PINNED_TABS
+            if (!p.contains(pins)) edit.putString(pins, DouyinTopChannels.DEFAULT_PINS)
             changed = true
         }
         // StartupPreferencesPolicy requires an explicit global glass decision in
@@ -335,7 +346,7 @@ object LocalSettings {
                 !spotifyNativeOrigin && (old.spotifyCreateCommand || ((old.hiddenMask xor value.hiddenMask) and 16 != 0)))
         }
         putBoolean(overrideKey(packageName), true)
-        writeConfig(appPrefix(packageName), value.normalized())
+        writeConfig(appPrefix(packageName), value.normalized(packageName))
     }
 
     fun clearAppConfig(context: Context, packageName: String) = edit(context) {
@@ -352,21 +363,28 @@ object LocalSettings {
 
     private fun readConfig(p: SharedPreferences, prefix: String, defaults: GlassConfig): GlassConfig = GlassConfig(
         postureEffectsEnabled = p.getBoolean(GLOBAL + ConfigContract.KEY_POSTURE_EFFECTS, false),
+        indicatorInteractionLightEnabled = p.getBoolean(GLOBAL + ConfigContract.KEY_INDICATOR_INTERACTION_LIGHT, true),
+        simplifyTabSwitch = p.getBoolean(GLOBAL + ConfigContract.KEY_SIMPLIFY_TAB_SWITCH, GlassConfig.DEFAULT_SIMPLIFY_TAB_SWITCH),
         liquidViscosity = p.getFloat(GLOBAL + ConfigContract.KEY_LIQUID_VISCOSITY, 25f),
+        refractionStrength = p.getFloat(GLOBAL + ConfigContract.KEY_REFRACTION_STRENGTH, GlassConfig.DEFAULT_REFRACTION_STRENGTH),
         flowHorizontalStrength = p.getFloat(GLOBAL + ConfigContract.KEY_FLOW_HORIZONTAL, 100f),
         flowVerticalStrength = p.getFloat(GLOBAL + ConfigContract.KEY_FLOW_VERTICAL, 100f),
         classicNavigation = if (prefix == GLOBAL) p.getBoolean(GLOBAL + ConfigContract.KEY_CLASSIC_NAVIGATION, false) else defaults.classicNavigation,
+        bottomBarIconOnly = p.getBoolean(GLOBAL + ConfigContract.KEY_BOTTOM_BAR_ICON_ONLY, GlassConfig.DEFAULT_BOTTOM_BAR_ICON_ONLY),
         enabled = defaults.enabled,
         themeMode = p.getInt(prefix + ConfigContract.KEY_THEME_MODE, defaults.themeMode),
         tabWidth = p.getFloat(prefix + ConfigContract.KEY_TAB_WIDTH, defaults.tabWidth),
         bottomPadding = p.getFloat(prefix + ConfigContract.KEY_BOTTOM_PADDING, defaults.bottomPadding),
         blurRadius = p.getFloat(prefix + ConfigContract.KEY_BLUR_RADIUS, defaults.blurRadius),
+        // configFor/snapshot force legacy blurRadius to the global value. Inherit that
+        // effective value until a dedicated SystemUI value has actually been saved.
         cornerRadiusPercent = p.getFloat(prefix + ConfigContract.KEY_CORNER_RADIUS_PERCENT, defaults.cornerRadiusPercent),
         cornerSmoothing = p.getFloat(prefix + ConfigContract.KEY_CORNER_SMOOTHING, defaults.cornerSmoothing),
         barHeight = p.getFloat(prefix + ConfigContract.KEY_BAR_HEIGHT, defaults.barHeight),
         lightAlpha = p.getFloat(prefix + ConfigContract.KEY_LIGHT_ALPHA, defaults.lightAlpha),
         darkAlpha = p.getFloat(prefix + ConfigContract.KEY_DARK_ALPHA, defaults.darkAlpha),
         darkBarHighlightStrength = p.getFloat(prefix + ConfigContract.KEY_DARK_BAR_HIGHLIGHT_STRENGTH, defaults.darkBarHighlightStrength),
+        highlightTransparency = p.getFloat(prefix + ConfigContract.KEY_HIGHLIGHT_TRANSPARENCY, defaults.highlightTransparency),
         iconScale = p.getFloat(prefix + ConfigContract.KEY_ICON_SCALE, defaults.iconScale),
         textSize = p.getFloat(prefix + ConfigContract.KEY_TEXT_SIZE, defaults.textSize),
         iconOnly = p.getBoolean(prefix + ConfigContract.KEY_ICON_ONLY, defaults.iconOnly),
@@ -376,13 +394,15 @@ object LocalSettings {
         bilibiliSolidTopGradient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_SOLID_TOP_GRADIENT, defaults.bilibiliSolidTopGradient),
         bilibiliBottomColorGradient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_BOTTOM_COLOR_GRADIENT, defaults.bilibiliBottomColorGradient),
         bilibiliTopBar = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_TOP_BAR, defaults.bilibiliTopBar),
+        bilibiliEdgeToEdgeFeed = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_EDGE_TO_EDGE_FEED, defaults.bilibiliEdgeToEdgeFeed),
         bilibiliInDetachedSearch = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_DETACHED_SEARCH, defaults.bilibiliInDetachedSearch),
+        bilibiliDetachedSearch = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_DETACHED_SEARCH, defaults.bilibiliDetachedSearch),
         bilibiliInVideoAmbient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_VIDEO_AMBIENT, defaults.bilibiliInVideoAmbient),
         bilibiliVideoAmbient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_VIDEO_AMBIENT, defaults.bilibiliVideoAmbient),
         douyinTopBar = p.getBoolean(prefix + ConfigContract.KEY_DOUYIN_TOP_BAR, defaults.douyinTopBar),
         tiktokTopBar = p.getBoolean(prefix + ConfigContract.KEY_TIKTOK_TOP_BAR, defaults.tiktokTopBar),
         xhsTopBar = p.getBoolean(prefix + ConfigContract.KEY_XHS_TOP_BAR, defaults.xhsTopBar),
-        youtubeTopBar = p.getBoolean(prefix + ConfigContract.KEY_YOUTUBE_TOP_BAR, defaults.youtubeTopBar),
+        xhsEdgeToEdgeFeed = p.getBoolean(prefix + ConfigContract.KEY_XHS_EDGE_TO_EDGE_FEED, defaults.xhsEdgeToEdgeFeed),
         weiboHomeTopBar = p.getBoolean(prefix + ConfigContract.KEY_WEIBO_HOME_TOP_BAR, defaults.weiboHomeTopBar),
         managerEnglishNavigationLabels = if (prefix == GLOBAL)
             ManagerLanguage.fromValue(p.getString("manager_language", null)) == ManagerLanguage.ENGLISH
@@ -417,10 +437,14 @@ object LocalSettings {
 
     private fun SharedPreferences.Editor.writeConfig(prefix: String, value: GlassConfig) {
         putBoolean(prefix + ConfigContract.KEY_POSTURE_EFFECTS, value.postureEffectsEnabled)
+        putBoolean(prefix + ConfigContract.KEY_INDICATOR_INTERACTION_LIGHT, value.indicatorInteractionLightEnabled)
+        putBoolean(prefix + ConfigContract.KEY_SIMPLIFY_TAB_SWITCH, value.simplifyTabSwitch)
         putFloat(prefix + ConfigContract.KEY_LIQUID_VISCOSITY, value.liquidViscosity)
+        if (prefix == GLOBAL) putFloat(prefix + ConfigContract.KEY_REFRACTION_STRENGTH, value.refractionStrength)
         putFloat(prefix + ConfigContract.KEY_FLOW_HORIZONTAL, value.flowHorizontalStrength)
         putFloat(prefix + ConfigContract.KEY_FLOW_VERTICAL, value.flowVerticalStrength)
         if (prefix == GLOBAL) putBoolean(prefix + ConfigContract.KEY_CLASSIC_NAVIGATION, value.classicNavigation)
+        if (prefix == GLOBAL) putBoolean(prefix + ConfigContract.KEY_BOTTOM_BAR_ICON_ONLY, value.bottomBarIconOnly)
         putInt(prefix + ConfigContract.KEY_THEME_MODE, value.themeMode)
         putFloat(prefix + ConfigContract.KEY_TAB_WIDTH, value.tabWidth)
         putFloat(prefix + ConfigContract.KEY_BOTTOM_PADDING, value.bottomPadding)
@@ -431,6 +455,7 @@ object LocalSettings {
         putFloat(prefix + ConfigContract.KEY_LIGHT_ALPHA, value.lightAlpha)
         putFloat(prefix + ConfigContract.KEY_DARK_ALPHA, value.darkAlpha)
         putFloat(prefix + ConfigContract.KEY_DARK_BAR_HIGHLIGHT_STRENGTH, value.darkBarHighlightStrength)
+        putFloat(prefix + ConfigContract.KEY_HIGHLIGHT_TRANSPARENCY, value.highlightTransparency)
         putFloat(prefix + ConfigContract.KEY_ICON_SCALE, value.iconScale)
         putFloat(prefix + ConfigContract.KEY_TEXT_SIZE, value.textSize)
         putBoolean(prefix + ConfigContract.KEY_ICON_ONLY, value.iconOnly)
@@ -440,13 +465,15 @@ object LocalSettings {
         putBoolean(prefix + ConfigContract.KEY_BILIBILI_SOLID_TOP_GRADIENT, value.bilibiliSolidTopGradient)
         putBoolean(prefix + ConfigContract.KEY_BILIBILI_BOTTOM_COLOR_GRADIENT, value.bilibiliBottomColorGradient)
         putBoolean(prefix + ConfigContract.KEY_BILIBILI_TOP_BAR, value.bilibiliTopBar)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_EDGE_TO_EDGE_FEED, value.bilibiliEdgeToEdgeFeed)
         putBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_DETACHED_SEARCH, value.bilibiliInDetachedSearch)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_DETACHED_SEARCH, value.bilibiliDetachedSearch)
         putBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_VIDEO_AMBIENT, value.bilibiliInVideoAmbient)
         putBoolean(prefix + ConfigContract.KEY_BILIBILI_VIDEO_AMBIENT, value.bilibiliVideoAmbient)
         putBoolean(prefix + ConfigContract.KEY_DOUYIN_TOP_BAR, value.douyinTopBar)
         putBoolean(prefix + ConfigContract.KEY_TIKTOK_TOP_BAR, value.tiktokTopBar)
         putBoolean(prefix + ConfigContract.KEY_XHS_TOP_BAR, value.xhsTopBar)
-        putBoolean(prefix + ConfigContract.KEY_YOUTUBE_TOP_BAR, value.youtubeTopBar)
+        putBoolean(prefix + ConfigContract.KEY_XHS_EDGE_TO_EDGE_FEED, value.xhsEdgeToEdgeFeed)
         putBoolean(prefix + ConfigContract.KEY_WEIBO_HOME_TOP_BAR, value.weiboHomeTopBar)
         if (prefix == GLOBAL) putBoolean(prefix + ConfigContract.KEY_MANAGER_ENGLISH_LABELS, value.managerEnglishNavigationLabels)
         putString(prefix + ConfigContract.KEY_TIKTOK_PINNED_TABS, value.tiktokPinnedTabs)
@@ -530,17 +557,12 @@ object LocalSettings {
 
     fun publishConfig(context: Context, packageName: String) {
         val spec = AppCatalog.forPackage(packageName) ?: return
-        val targets = buildList {
-            add(spec.packageName)
-            addAll(spec.aliasPackages)
-        }
-        targets.forEach { targetPackage ->
+        (listOf(spec.packageName) + spec.aliasPackages).forEach { targetPackage ->
             context.sendBroadcast(Intent(ConfigContract.ACTION_CONFIG_RESPONSE)
                 .setPackage(targetPackage)
                 .putExtras(configSnapshot(context, targetPackage)))
         }
     }
-
     fun reportNavigationLabels(context: Context, packageName: String, labels: List<String>) {
         if (AppCatalog.forPackage(packageName) == null || labels.size !in 2..7) return
         val value = org.json.JSONArray(labels).toString()

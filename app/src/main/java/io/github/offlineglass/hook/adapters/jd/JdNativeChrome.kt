@@ -48,7 +48,8 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
             host.config.liquidViscosity, host.config.flowHorizontalStrength, host.config.flowVerticalStrength)
         val signature = (width.toLong() shl 32) xor height.toLong() xor
             (blurRadius * 100f).roundToInt().toLong() xor
-            ((cornerRadiusPercent * 100f).roundToInt().toLong() shl 12)
+            ((cornerRadiusPercent * 100f).roundToInt().toLong() shl 12) xor
+            (host.config.refractionStrength.toRawBits().toLong() shl 24)
         if (signature == outerEffectSignature) return
         outerEffectSignature = signature
         val corner = minOf(width, height) * (cornerRadiusPercent / 100f)
@@ -56,7 +57,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
         shader.setFloatUniform("offset", 0f, 0f)
         shader.setFloatUniform("cornerRadii", corner, corner, corner, corner)
         shader.setFloatUniform("refractionHeight", 24f * density)
-        shader.setFloatUniform("refractionAmount", -24f * density)
+        shader.setFloatUniform("refractionAmount", -24f * density * host.config.refractionScale)
         shader.setFloatUniform("depthEffect", 0f)
         view.setRenderEffect(RenderEffect.createRuntimeShaderEffect(shader, "content"))
         view.invalidate()
@@ -72,6 +73,15 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
         view is GlassHostLayout || view is AdapterOwnedOverlay ||
         view is android.view.SurfaceView || view is android.view.TextureView
     private var resumeGeneration = 0
+    private val browseVisibility = java.util.WeakHashMap<View, Int>()
+
+    fun hideBrowse(row: JdNavigationBinding.Row) {
+        val button = row.slots[JdNavigationBinding.BROWSE].button
+        if (button.visibility == View.VISIBLE) {
+            browseVisibility.putIfAbsent(button, button.visibility)
+            button.visibility = View.INVISIBLE
+        }
+    }
 
     fun onWindowResumed(onSettled: () -> Unit = {}) {
         val generation = ++resumeGeneration
@@ -98,7 +108,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
 
     private fun discoverDecorations(source: ViewGroup) {
         decorations.clear()
-        val parent = source.parent as? ViewGroup ?: return
+        val parent = source.parent as? ViewGroup ?: run { JdHiddenNavigationBlur.release(host); return }
         decorationParent = WeakReference(parent)
         decorationChildCount = parent.childCount
         // Native navigation decorations can draw an ImageView drawable or
@@ -121,13 +131,12 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
                 name == "com.jingdong.app.mall.navigationbar.refactor.view.BottomGradientMask" ||
                 name == "com.jingdong.app.mall.navigationbar.refactor.view.BottomBgBlur" ||
                 name == "com.jingdong.app.mall.navigationbar.refactor.view.NavBgBlur") {
-                // JD's own island-hidden state prevents i()/h() from showing
-                // and repositioning its redundant native indicator every click.
-                if (name.endsWith(".AiTabSelectShadow")) runCatching {
-                    io.github.offlineglass.hook.compat.XposedHelpers.callMethod(view, "c")
-                }
+                if (name.endsWith(".AiTabSelectShadow"))
+                    JdNavigationBinding.resolve(source)?.hideSelectionShadow()
                 decorations += WeakReference(view)
                 view.alpha = 0f
+                if (name.endsWith(".NavBgBlur") || name.endsWith(".BottomBgBlur"))
+                    JdHiddenNavigationBlur.suspend(view, host)
                 continue
             }
             val simple = view.javaClass.simpleName
@@ -136,6 +145,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
                 for (index in 0 until view.childCount) stack += view.getChildAt(index) to depth + 1
             }
         }
+        JdHiddenNavigationBlur.release(host, decorations)
     }
 
     private fun suppressDecorations(source: ViewGroup) {
@@ -308,6 +318,11 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
     }
 
     fun reset() {
+        JdHiddenNavigationBlur.release(host)
+        browseVisibility.forEach { (button, visibility) ->
+            if (button.visibility == View.INVISIBLE) button.visibility = visibility
+        }
+        browseVisibility.clear()
         resumeGeneration++
         decorationParent = null
         decorationChildCount = -1

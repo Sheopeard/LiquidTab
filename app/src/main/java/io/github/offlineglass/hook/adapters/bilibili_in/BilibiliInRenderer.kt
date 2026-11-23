@@ -67,7 +67,7 @@ internal object BilibiliInRenderer {
         val groupTop = baseIconCenterY - iconSize / 2f
         val groupBottom = baseLabelBaseline + labelPaint.fontMetrics.bottom
         val groupOffsetY = height / 2f - (groupTop + groupBottom) / 2f
-        val iconCenterY = baseIconCenterY + groupOffsetY
+        val iconCenterY = if (iconOnly) height / 2f else baseIconCenterY + groupOffsetY
         val labelBaseline = baseLabelBaseline + groupOffsetY
         for ((visualIndex, index) in enabledIndices.withIndex()) {
             if (index !in 0..3) continue

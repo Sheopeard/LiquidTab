@@ -4,11 +4,15 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.StateListDrawable
+import android.graphics.Rect
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.SLOT_COUNT
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.VIDEO
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.XIAOTUAN
 
 /** Two immutable visual states, independent of the real page selection.
  * Android setSelected dispatches to the native visual-state implementation.
@@ -48,17 +52,25 @@ internal class MeituanMainStateArtwork {
 
     fun prepare(row: ViewGroup?): Boolean {
         if (Looper.myLooper() != Looper.getMainLooper()) return false
-        if (row == null || row.childCount !in 4..5 || row.width <= 0 || row.height <= 0)
+        if (row == null || row.width <= 0 || row.height <= 0)
             return failed("native navigation source missing or not laid out")
         if (source !== row) { signature = Long.MIN_VALUE }
         val native = MeituanMainNativeTabs.bind(row) ?: return failed("native navigation binding unavailable")
-        val slotCount = row.childCount
-        val actionIndex = native.actionIndex
-        val glyphs = native.cells.map { it.glyph }
-        val extras = native.cells.map { it.extraTabs }
+        val cells = native.cells.filter { it.role != VIDEO }
+        val bounds = cells.associate { cell ->
+            cell.role to Rect(cell.slot.left, 0, cell.slot.right, row.height)
+        }
+        if (bounds.values.any { it.left < 0 || it.right > row.width || it.isEmpty } ||
+            bounds.values.sortedBy { it.left }.zipWithNext().any { (left, right) -> left.right > right.left })
+            return failed("native navigation cell bounds unavailable or overlapping")
         var key = row.width.toLong() * 31 + row.height
-        key = key * 31 + slotCount
-        for (glyph in glyphs) {
+        for (cell in cells) {
+            val glyph = cell.glyph
+            key = key * 31 + cell.role
+            key = key * 31 + bounds.getValue(cell.role).hashCode()
+            key = key * 31 + System.identityHashCode(glyph)
+            key = key * 31 + cell.slot.visibility
+            key = key * 31 + glyph.visibility
             key = key * 31 + glyph.width
             key = key * 31 + glyph.height
             val icon = runCatching { XposedHelpers.callMethod(glyph, "getIcon") as? android.graphics.drawable.Drawable }.getOrNull()
@@ -75,35 +87,30 @@ internal class MeituanMainStateArtwork {
         // never continuously as a compatibility fallback during scrolling.
         if (attemptedSource === row && attemptedSignature == key) return false
         attemptedSource = row; attemptedSignature = key
-        val selected = glyphs.map { it.isSelected }
-        val extraSelected = extras.map { list -> list.map { it.isSelected } }
+        val selected = cells.map { it.glyph.isSelected }
         val alpha = row.alpha
         var restored = true
         val result = runCatching {
             row.alpha = 1f
             fun capture(active: Boolean): MeituanMainTabsRenderer {
-                glyphs.forEachIndexed { index, glyph ->
+                cells.forEach { cell ->
                     // Xiaotuan is a branded action: retain its complete native art.
-                    if (index != actionIndex) {
-                        setCaptureState(glyph, active)
-                        extras[index].forEach { extra -> runCatching { setCaptureState(extra, active) } }
-                    }
+                    if (cell.role != XIAOTUAN) setCaptureState(cell.glyph, active)
                 }
                 val bitmap = Bitmap.createBitmap(row.width, row.height, Bitmap.Config.ARGB_8888)
                 // The native wrapper owns delegated artwork/animation. Drawing
                 // its leaf directly bypasses that strategy and can yield blank art.
                 row.draw(Canvas(bitmap))
-                return MeituanMainTabsRenderer().apply { accept(bitmap, slotCount, actionIndex) }
+                return MeituanMainTabsRenderer().apply {
+                    check(accept(bitmap, bounds)) { "native artwork missing from a visible role" }
+                }
             }
             Pair(capture(false), capture(true), row.width, row.height)
         }
         try {
-            glyphs.forEachIndexed { index, glyph ->
-                if (index != actionIndex) try {
-                    setCaptureState(glyph, selected[index])
-                    extras[index].forEachIndexed { extraIdx, extra ->
-                        runCatching { setCaptureState(extra, extraSelected[index][extraIdx]) }
-                    }
+            cells.forEachIndexed { index, cell ->
+                if (cell.role != XIAOTUAN) try {
+                    setCaptureState(cell.glyph, selected[index])
                 } catch (error: Exception) {
                     restored = false
                     android.util.Log.e("MeituanBinding", "native selected-state restoration failed; takeover cancelled", error)
@@ -119,11 +126,11 @@ internal class MeituanMainStateArtwork {
     fun draw(canvas: Canvas, frame: AdapterNavigationFrame, active: Boolean) {
         val art = pair ?: return
         val renderer = if (active) art.active else art.idle
-        val divisor = frame.slotCount.coerceAtLeast(1).toFloat()
-        val scale = minOf(frame.slotWidth / (art.width / divisor), frame.height / art.height.toFloat()) * frame.extraScale
+        val referenceWidth = art.width.toFloat() / SLOT_COUNT
+        val scale = minOf(frame.slotWidth / referenceWidth, frame.height / art.height.toFloat()) * frame.extraScale
         frame.barLayout?.takeIf { !active }?.let { layout ->
             renderer.draw(canvas, layout.actionIndex, layout.actionLeft + layout.actionSize / 2f,
-                frame.height / 2f, minOf(layout.actionSize / (art.width / divisor),
+                frame.height / 2f, minOf(layout.actionSize / referenceWidth,
                     frame.height / art.height.toFloat()) * frame.extraScale,
                 maxIconSize = layout.actionSize * .78f)
         }
@@ -131,7 +138,8 @@ internal class MeituanMainStateArtwork {
             val left = 4f * frame.density + slot * frame.slotWidth
             val save = canvas.save()
             canvas.clipRect(left, 0f, left + frame.slotWidth, frame.height.toFloat())
-            renderer.draw(canvas, index, left + frame.slotWidth / 2f, frame.height / 2f, scale)
+            renderer.draw(canvas, index, left + frame.slotWidth / 2f, frame.height / 2f, scale,
+                iconOnly = frame.iconOnly)
             canvas.restoreToCount(save)
         }
     }

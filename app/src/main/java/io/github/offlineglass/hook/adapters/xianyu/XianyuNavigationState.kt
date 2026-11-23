@@ -173,7 +173,7 @@ internal class XianyuNavigationState(private val host: GlassHostLayout) : AppNav
                     drawPart(canvas, artwork, it, x, y - 3f * frame.density, scale)
                 }
             } else drawView(canvas, content, x - content.width * scale * .06f,
-                y - 3f * frame.density - content.height * scale * .06f, scale * 1.12f)
+                y - content.height * scale * .06f, scale * 1.12f)
             tab.badge?.takeIf { it.visibility == View.VISIBLE && it.width > 0 }?.let { badge ->
                 content.getLocationInWindow(origin)
                 badge.getLocationInWindow(position)

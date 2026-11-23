@@ -33,6 +33,7 @@ import io.github.offlineglass.hook.adapters.cainiao.CainiaoAdapter
 import io.github.offlineglass.hook.adapters.jd.JdAdapter
 import io.github.offlineglass.hook.adapters.qqmusic.QqMusicAdapter
 import io.github.offlineglass.hook.adapters.spotify.SpotifyAdapter
+import io.github.offlineglass.hook.adapters.apple_music.AppleMusicAdapter
 import io.github.offlineglass.hook.adapters.xjtu.XjtuAdapter
 import io.github.offlineglass.hook.adapters.chatgpt.ChatGptAdapter
 import io.github.offlineglass.hook.adapters.x.XAdapter
@@ -73,6 +74,10 @@ internal interface TargetAdapter {
     val key: String
     /** Opt-in: apply the outer dynamic-highlight setting in either theme. */
     val panelHighlightFollowsAllThemes: Boolean get() = false
+    /** Opt-in for the main panel and its sampled copy, never the action or indicator rim. */
+    val featheredInnerPanelHighlight: Boolean get() = true
+    /** Exact contour-search pilot; unrelated to material/animation settings. */
+    val useBoundedContourSearch: Boolean get() = false
     val ownsNavigationFinding: Boolean get() = false
     /** Recover when startup or home reconstruction replaces an already installed source. */
     val recheckNavigationBindingOnLayout: Boolean get() = false
@@ -117,6 +122,10 @@ internal interface TargetAdapter {
     val hostLiftDp: Float? get() = null
     /** Optional width reference; actual tab count and hit slots stay unchanged. */
     fun hostWidthSlotCount(slots: Int, config: GlassConfig): Int = slots
+    /** Optional compound width built from the standard tab-row widths. */
+    fun compactHostWidth(
+        config: GlassConfig, density: Float, height: Int, tabRowWidth: (Int) -> Int,
+    ): Int? = null
     val hasPerFrameScene: Boolean get() = false
     /** Null keeps the normal immersive fitting; an app may pin its own navigation inset. */
     val navigationImmersionOverride: Boolean? get() = null
@@ -127,12 +136,16 @@ internal interface TargetAdapter {
     val sourceParentVisibilityOnly: Boolean get() = false
     val sourceSwapGraceMs: Long get() = 0L
     val panelShadowBlurDp: Float? get() = null
+    /** Local panel shadow opacity; leaves glass tint and scene content unchanged. */
+    val panelShadowAlphaScale: Float get() = 1f
     val synchronousConfigPolling: Boolean get() = false
     val nativeNavigationDrawsInSourceSpace: Boolean get() = false
     val indicatorInnerShadow: Boolean get() = false
     val continuousIndicatorMask: Boolean get() = true
     /** Scale only the slider's border inset; tab hit slots and panel geometry stay shared. */
     val indicatorInsetScale: Float get() = 1f
+    /** Opt-in pilot: bounded vertical finger follow on the primary bar only. */
+    val indicatorDragVerticalLimitDp: Float get() = 0f
     /** Optional local tint gain; default preserves the shared resting material. */
     fun restingIndicatorTintScale(config: io.github.offlineglass.config.GlassConfig): Float = 1f
     /** Shared slider curve; the visible outer panel is unchanged. */
@@ -180,9 +193,20 @@ internal interface TargetAdapter {
     val floatingPillUsesSharedInsets: Boolean get() = false
     val preserveNativeParentBackground: Boolean get() = false
     val preserveNativeSourceMetrics: Boolean get() = false
+    /** The adapter owns reversible source suppression and leaves native layout intact. */
+    val managesNavigationSourceAppearance: Boolean get() = false
     val foregroundNavigationOverSelection: Boolean get() = false
     val usesNavigationOpticalMix: Boolean get() = false
     val persistentNavigationOpticalMix: Boolean get() = false
+    val foregroundUsesRenderedSelectionOutline: Boolean get() = false
+    val foregroundRequiresSubmittedIndicatorArtwork: Boolean get() = false
+    val usesDetachedDirectSelectionFill: Boolean get() = false
+    val defersColdTapUntilMotionSettles: Boolean get() = true
+    /** Whether the shared tap inset outline can replace the adapter's existing selection geometry. */
+    val supportsInsetTapOutline: Boolean get() = true
+    /** Keep the inset base outline under the existing drag transform. */
+    /** Keep artwork in the foreground when using the inset tap contour. */
+    val insetTapArtworkForegroundOnly: Boolean get() = false
     val foregroundMaskInsetDp: Float get() = 1f
     /** Include the lower glass panel's own specular in the upper selection lens. */
     val samplesPanelHighlightInIndicator: Boolean get() = true
@@ -199,8 +223,6 @@ internal interface TargetAdapter {
     val outerPanelPressScale: Float? get() = null
     val sampledPanelHighlightWidthDp: Float get() = io.github.offlineglass.rendering.BottomBarIndicatorStyle.SPECULAR_WIDTH_DP
     val sampledPanelHighlightMinimumAlpha: Float get() = io.github.offlineglass.rendering.BottomBarIndicatorStyle.SPECULAR_MIN_ALPHA
-    fun indicatorSampleHighlightInset(rowHeight: Float, density: Float,
-        pressProgress: Float, scaleY: Float): Float = 0f
     val requestedFrameRateMax: Float? get() = null
     val continuousFramePump: Boolean get() = false
     val observeWindowTouches: Boolean get() = false
@@ -273,6 +295,7 @@ internal interface TargetAdapter {
     /** Opt-in factor after the shared global surface opacity. */
     fun surfaceOpacityScale(config: GlassConfig): Float = 1f
     fun glassSurfaceFillColor(dark: Boolean, selectedIndex: Int, defaultColor: Int): Int = defaultColor
+    fun glassSurfaceFillBlendMode(dark: Boolean): android.graphics.BlendMode? = null
     fun dispatchNavigationTap(source: ViewGroup?, index: Int, slotCount: Int): Boolean = false
     fun configureNavigationInsets(decor: View, enabled: Boolean) = Unit
     fun immersionWasReset(immersiveStub: Any?): Boolean = false
@@ -321,6 +344,10 @@ internal data class AdapterBarLayout(
     val localActionOptics: Boolean = false,
     /** Opt-in: main capsule owns a separate local lens, never a compound SDF. */
     val localMainOptics: Boolean = false,
+    /** Strength of the detached action's liquid highlight relative to the panel default. */
+    val actionHighlightScale: Float = 1f,
+    /** Keep the supplied RGB and use the surface slider, including in solid bar mode. */
+    val actionFillUsesOnlySurfaceOpacity: Boolean = false,
 )
 
 internal data class AdapterNavigationFrame(
@@ -344,10 +371,22 @@ internal data class AdapterNavigationFrame(
     val hideSelectedForOptics: Boolean = false,
     val targetKey: String = "",
     val managerEnglishLabels: Boolean = false,
-)
+    val detachedDirectSelection: Boolean = false,
+    val topBarTabs: io.github.offlineglass.hook.topbar.TopBarTabLayout? = null,
+) {
+    fun channelCenter(index: Int): Float =
+        topBarTabs?.takeIf { index in 0 until it.size }?.center(index, width, 4f * density)
+            ?: 4f * density + (index + .5f) * slotWidth
+    fun channelEdge(index: Int): Float =
+        topBarTabs?.takeIf { index in 0..it.size }?.edge(index, width, 4f * density)
+            ?: 4f * density + index * slotWidth
+}
 
 internal fun AdapterNavigationFrame.localizeNavigationLabel(label: String): String =
     if (managerEnglishLabels) NavigationLabelLocalization.toEnglish(targetKey, label) else label
+
+/** A verified scene node, positioned in physical screen coordinates. */
+internal data class RetainedNavigationBackdrop(val node: android.graphics.RenderNode, val toScreen: android.graphics.Matrix)
 
 internal data class AppVideoBackdrop(
     val bitmap: android.graphics.Bitmap,
@@ -436,10 +475,14 @@ internal interface AppNavigationState {
                                       snapshot: android.graphics.Bitmap?) = Unit
     /** Whether the current app mode needs a sampled copy of content behind the bar. */
     fun requiresSampledBackdrop(): Boolean = true
+    /** Refract adapter-owned navigation artwork even when the page owns its own compositor. */
+    val usesArtworkOnlyIndicatorLens: Boolean get() = false
     fun needsSurfaceBackdrop(): Boolean = false
     fun maintainsCompositorSamplingWithoutSurface(): Boolean = false
     /** Desired renderer mode, independent of asynchronous Surface lifecycle. */
     fun allowsOpticalSurfacePipeline(): Boolean = true
+    /** Window-strip capture needs a transparent output surface before its first frame. */
+    fun preparesOpticalSurfaceForWindowCapture(): Boolean = false
     /** Reject readbacks requested for a scene that has since been replaced. */
     fun opticalCaptureEpoch(): Long = 0L
     /** Optional app-owned worker for PixelCopy callbacks; null keeps the shared worker. */
@@ -497,10 +540,12 @@ internal interface AppNavigationState {
     fun onHostFocusLost() = Unit
     fun onHostWindowFocusChanged(hasFocus: Boolean) = Unit
     fun onHostDetached() = Unit
+    fun onHostPreDrawDuringTapTransition(host: View) = Unit
     fun syncVisibilityCompanion(host: View, selectedIndex: Int): Boolean = false
     fun beforeHostDraw(host: View, source: ViewGroup?): Boolean = true
     fun hostChromeAlpha(host: View, selectedIndex: Int): Float = 1f
     fun drawAdditionalAmbientShadow(canvas: Canvas, dark: Boolean, alphaScale: Float) = Unit
+    fun drawsPanelAmbientShadow(): Boolean = true
     fun drawPanelEdgeGlow(canvas: Canvas, path: android.graphics.Path, density: Float) = Unit
     fun drawSampledBackdrop(canvas: Canvas, bitmap: android.graphics.Bitmap,
                             destination: android.graphics.RectF, paint: android.graphics.Paint): Boolean = false
@@ -553,15 +598,27 @@ internal interface AppNavigationState {
     val pauseBackdropDuringBarExit: Boolean get() = false
     /** Keep page/lifecycle tracking active while an invisible panel needs no sampling. */
     fun pauseBackdropWork(host: View): Boolean = false
+    /** The focused native window of a control whose material is drawn in its parent window. */
+    fun focusedOpticalWindow(host: View): View? = null
     /** Pause only optical readback/probe wakeups while retaining a hidden Surface. */
     fun pauseOpticalSurfaceProbe(): Boolean = false
     fun drawsNavigationContent(): Boolean = true
     /** Per-host opt-out for optional artwork modes; default preserves adapters. */
+
     fun navigationOpticalMixEnabled(): Boolean = true
+
+    /** Page-owned tint animation, independent of artwork and optical strength. */
+    fun surfaceTintFraction(): Float = 1f
+    fun drawsSelectionFillOnly(): Boolean = false
+    fun selectionOpticalFraction(): Float = 1f
+    /** Restrict sampled artwork to the same footprint excluded from foreground artwork. */
+    fun clipsSampledNavigationToIndicator(): Boolean = false
     fun suppressRedrawnSource(): Boolean? = null
     fun forceDarkMode(selectedIndex: Int): Boolean? = null
     fun resolveAutoDarkMode(host: View): Boolean? = null
     fun resolveBackdropScene(host: View): View? = null
+    val suppliesRetainedNavigationBackdrop: Boolean get() = false
+    fun retainedNavigationBackdrop(): RetainedNavigationBackdrop? = null
     /** Opt in to a filtered descendant list inside resolveBackdropScene's root. */
     val backdropSceneViewsAreDescendants: Boolean get() = false
     /** Optional safe subtrees; ancestor nodes containing media surfaces must not be replayed. */
@@ -587,6 +644,8 @@ internal interface AppNavigationState {
     fun pageAllowsNavigation(root: View?): Boolean? = null
     fun hostPageAllowsNavigation(host: io.github.offlineglass.hook.GlassHostLayout, root: View?): Boolean? =
         pageAllowsNavigation(root)
+    /** Opt in when a native destination must cover the bar in its first frame. */
+    fun skipNavigationExitAnimation(root: View?): Boolean = false
     /** Null leaves system navigation-bar immersion to the common page policy. */
     fun forceNavigationBarImmersed(host: io.github.offlineglass.hook.GlassHostLayout): Boolean? = null
     fun handleSystemBack(host: View): Boolean = false
@@ -605,6 +664,7 @@ internal object TargetAdapterRegistry {
     private val custom = listOf(
         QqMusicAdapter,
         SpotifyAdapter,
+        AppleMusicAdapter,
         DouyinAdapter,
         io.github.offlineglass.hook.adapters.tiktok.TikTokAdapter,
         NeteaseAdapter,
@@ -635,6 +695,7 @@ internal object TargetAdapterRegistry {
         io.github.offlineglass.hook.adapters.huawei_health.HuaweiHealthAdapter,
         XAdapter,
         InstagramAdapter,
+        io.github.offlineglass.hook.adapters.reddit.RedditAdapter,
         io.github.offlineglass.hook.adapters.quora.QuoraAdapter,
         io.github.offlineglass.hook.adapters.eudic.EudicAdapter,
         io.github.offlineglass.hook.adapters.share.ShareAdapter,

@@ -209,7 +209,7 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
         val hasLabel = !frame.iconOnly
         val labelGap = 2f * frame.density
         val totalHeight = iconSize + if (hasLabel) labelGap + textSize else 0f
-        val iconTop = (frame.height - totalHeight) / 2f - 2f * frame.density
+        val iconTop = (frame.height - totalHeight) / 2f - if (hasLabel) 2f * frame.density else 0f
         for ((visual, index) in frame.enabledIndices.withIndex()) {
             val cell = current.getOrNull(index) ?: continue
             val art = holders[cell] ?: continue
@@ -236,8 +236,9 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
                     drawable.intrinsicWidth.toFloat() / drawable.intrinsicHeight else 1f
                 val w = if (ratio > 1f) iconSize else iconSize * ratio
                 val h = if (ratio > 1f) iconSize / ratio else iconSize
-                drawable.setBounds((center - w / 2).roundToInt(), iconTop.roundToInt(),
-                    (center + w / 2).roundToInt(), (iconTop + h).roundToInt())
+                val artworkTop = if (hasLabel) iconTop else (frame.height - h) / 2f
+                drawable.setBounds((center - w / 2).roundToInt(), artworkTop.roundToInt(),
+                    (center + w / 2).roundToInt(), (artworkTop + h).roundToInt())
                 try { drawable.draw(canvas) } finally {
                     drawable.bounds = oldBounds
                     drawable.state = oldState

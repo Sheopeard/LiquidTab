@@ -9,7 +9,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
-import android.view.PixelCopy
 import android.view.SurfaceControl
 import android.view.SurfaceView
 import android.view.TextureView
@@ -182,7 +181,7 @@ internal class TikTokVideoSampler(private val fullWidthBand: Boolean = false, pr
             location[1] + height <= hostLocation[1] - padding ||
             location[1] >= hostLocation[1] + host.height + padding) {
             // A feed/mini-player video away from the glass cannot contribute
-            // pixels. Avoid full TextureView/PixelCopy buffers in that case.
+            // pixels. Avoid full TextureView buffers in that case.
             // Retain the valid band during a swipe's decoder gap. Leaving the
             // adapted page or detaching still clears it through request/clear.
             main.removeCallbacks(wakeup)
@@ -196,18 +195,18 @@ internal class TikTokVideoSampler(private val fullWidthBand: Boolean = false, pr
         if (!layerCaptureFailed && Build.VERSION.SDK_INT >= 29) {
             captureLayer(host, surface, ticket, location, width, height)
         } else {
-            copyBuffer(host, surface, ticket, location, width, height)
+            complete(host, surface, ticket, null, location[0], location[1], width, height)
         }
     }
 
     private fun captureLayer(host: GlassHostLayout, video: SurfaceView, ticket: Int,
                              location: IntArray, width: Int, height: Int) {
-        // The decoder's queue may not support PixelCopy on HyperOS. Capture its
+        // Capture the decoder's
         // own compositor layer, restricted to this process, as in the proven
         // Douyin path. Do not sample the window or duplicate its SurfaceView hole.
         val control = runCatching { video.surfaceControl }.getOrNull()
         if (control?.isValid != true) {
-            copyBuffer(host, video, ticket, location, width, height)
+            complete(host, video, ticket, null, location[0], location[1], width, height)
             return
         }
         val hostLocation = IntArray(2).also(host::getLocationInWindow)
@@ -256,7 +255,7 @@ internal class TikTokVideoSampler(private val fullWidthBand: Boolean = false, pr
                     main.post {
                         if (frame == null && ticket == generation) {
                             layerCaptureFailed = true
-                            copyBuffer(host, video, ticket, location, width, height)
+                            complete(host, video, ticket, null, location[0], location[1], width, height)
                         } else complete(host, video, ticket, frame,
                             location[0] + crop.left, location[1] + crop.top, crop.width(), crop.height())
                     }
@@ -269,38 +268,10 @@ internal class TikTokVideoSampler(private val fullWidthBand: Boolean = false, pr
                 main.post {
                     if (ticket == generation) {
                         layerCaptureFailed = true
-                        copyBuffer(host, video, ticket, location, width, height)
+                        complete(host, video, ticket, null, location[0], location[1], width, height)
                     }
                 }
             }
-        }
-    }
-
-    private fun copyBuffer(host: GlassHostLayout, video: SurfaceView, ticket: Int,
-                           location: IntArray, width: Int, height: Int) {
-        val frame = video.holder.surfaceFrame
-        val hostLocation = IntArray(2).also(host::getLocationInWindow)
-        val padding = (24f*host.resources.displayMetrics.density + host.config.blurRadius*host.resources.displayMetrics.density*3f).toInt()
-        val crop = Rect((if (fullWidthBand) -location[0]-padding else hostLocation[0]-location[0]-padding).coerceAtLeast(0),
-            (hostLocation[1]-location[1]-padding).coerceAtLeast(0),
-            (if (fullWidthBand) host.rootView.width-location[0]+padding else hostLocation[0]-location[0]+host.width+padding).coerceAtMost(width),
-            (hostLocation[1]-location[1]+host.height+padding).coerceAtMost(height))
-        if (crop.isEmpty) { inFlight=false; return }
-        val sx = (frame.width().takeIf { it > 0 } ?: width).toFloat()/width
-        val sy = (frame.height().takeIf { it > 0 } ?: height).toFloat()/height
-        val bufferCrop = Rect((crop.left*sx).toInt(), (crop.top*sy).toInt(),
-            kotlin.math.ceil(crop.right*sx).toInt(), kotlin.math.ceil(crop.bottom*sy).toInt())
-        val target = Bitmap.createBitmap((crop.width()/3).coerceAtLeast(1),
-            (crop.height()/3).coerceAtLeast(1), Bitmap.Config.ARGB_8888)
-        runCatching {
-            PixelCopy.request(video, bufferCrop, target, { result ->
-                if (result != PixelCopy.SUCCESS) target.recycle()
-                complete(host, video, ticket, target.takeIf { result == PixelCopy.SUCCESS },
-                    location[0]+crop.left, location[1]+crop.top, crop.width(), crop.height())
-            }, main)
-        }.onFailure {
-            target.recycle()
-            complete(host, video, ticket, null, location[0], location[1], width, height)
         }
     }
 
@@ -315,7 +286,7 @@ internal class TikTokVideoSampler(private val fullWidthBand: Boolean = false, pr
         if (frame == null) {
             if (!loggedFailure) {
                 loggedFailure = true
-                XposedBridge.log("[OfflineGlass][TikTokVideo] decoder layer and PixelCopy unavailable")
+                XposedBridge.log("[OfflineGlass][TikTokVideo] decoder layer unavailable")
             }
             main.removeCallbacks(wakeup)
             main.postDelayed(wakeup, 250L)

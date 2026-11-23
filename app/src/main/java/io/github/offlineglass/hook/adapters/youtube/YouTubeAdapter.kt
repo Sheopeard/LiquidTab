@@ -14,9 +14,42 @@ import io.github.offlineglass.hook.adapters.TargetAdapter
 internal object YouTubeAdapter : TargetAdapter {
     override val key = "youtube"
     override val deferCompanionRemovalOnDetach = true
+    override val ownsNavigationFinding = true
+    override val recheckNavigationBindingOnLayout = true
+    override val ownsNavigationTap = true
+    private var pivotDiagnosticWritten = false
+
+    override fun findNavigation(root: android.view.View, spec: io.github.offlineglass.targets.TargetSpec): NavigationCandidate? {
+        val id = root.resources.getIdentifier("pivot_bar", "id", spec.packageName)
+        val source = if (id != 0) root.findViewById<android.view.ViewGroup>(id) else null
+        if (source == null || !source.isShown || source.width <= 0 || source.height <= 0) return null
+        val binding = YouTubePivotBinding.resolve(source)
+        if (io.github.offlineglass.BuildConfig.DEBUG && !pivotDiagnosticWritten && binding != null) {
+            pivotDiagnosticWritten = true
+            val roles = (0..4).filter { binding?.entry(it) != null }
+            val rows = (0 until source.childCount).mapNotNull { source.getChildAt(it) as? android.view.ViewGroup }
+                .take(4).map { row ->
+                    (0 until row.childCount.coerceAtMost(7)).map { i ->
+                        row.getChildAt(i).let { "${it.contentDescription} listener=${it.hasOnClickListeners()}" }
+                    }
+                }
+            source.post {
+                runCatching {
+                    java.io.File(source.context.getExternalFilesDir(null), "youtube_pivot_binding.txt")
+                        .writeText("semantic-pivot roles=$roles rows=$rows")
+                }
+            }
+        }
+        if (binding == null) {
+            android.util.Log.w("YouTubeGlassDiag", "Pivot row roles or native click targets could not be verified")
+            return null
+        }
+        // Host indices remain the settings indices even if the native row
+        // omits a role. Availability and dispatch use the verified cell map.
+        return NavigationCandidate(source, 5, 100)
+    }
     override val supportsNativeEnglishLocale = true
     override fun onConfigurationReady(context: Context, param: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam) {
-        YouTubeTopBar.installLifecycle()
         YouTubeSpeedHaptics.install(context, param.classLoader)
     }
     override val accentColor = 0xFFFF0033.toInt()
@@ -32,6 +65,9 @@ internal object YouTubeAdapter : TargetAdapter {
     // Split the visible row at the moving lens boundary, then use the same
     // selected/unselected artwork inside the lens source before refraction.
     override val usesNavigationOpticalMix = true
+    override val foregroundNavigationOverSelection = true
+    override val foregroundUsesRenderedSelectionOutline = true
+    override val foregroundRequiresSubmittedIndicatorArtwork = true
     override val suppressPlatformElevation = true
     override val usesOpticalSurfacePipeline = true
     override val usesDirectOpticalBackdropMode = true
@@ -49,8 +85,8 @@ internal object YouTubeAdapter : TargetAdapter {
     override fun barLayout(
         config: GlassConfig, width: Int, height: Int, density: Float, slots: Int,
     ): io.github.offlineglass.hook.adapters.AdapterBarLayout? {
-        if (!config.detachedPublish || !config.showPostButton || slots != 5 ||
-            config.hiddenMask and (1 shl 2) != 0 || width <= height || height <= 0
+        if (!config.detachedPublish || !config.isYouTubeCreateVisible() || slots != 5 ||
+            width <= height || height <= 0
         ) return null
         val gap = 12f * density
         val actionLeft = width - height.toFloat()
@@ -64,10 +100,6 @@ internal object YouTubeAdapter : TargetAdapter {
             localActionOptics = true,
             localMainOptics = true,
         )
-    }
-
-    override fun beforeNavigationScan(activity: android.app.Activity) {
-        YouTubeTopBar.attach(activity)
     }
 
     override fun opticalSurfaceLayout(

@@ -4,10 +4,7 @@ import io.github.offlineglass.rendering.setFloatUniformExact
 
 import android.graphics.*
 import android.graphics.drawable.Drawable
-import android.os.Handler
-import android.os.Looper
 import android.os.SystemClock
-import android.view.PixelCopy
 import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
@@ -28,7 +25,6 @@ internal class BilibiliStoryDanmakuGlass(private val activity: Activity, private
     private var texture: TextureView? = null
     private var videoLayer: View? = null
     private val posterLayers = ArrayList<View>()
-    private val handler = Handler(Looper.getMainLooper())
     private val visible = Rect()
     private var framePosted = false
     private var active = false
@@ -163,42 +159,29 @@ internal class BilibiliStoryDanmakuGlass(private val activity: Activity, private
     }
     private inner class Material(val owner: View, val original: Drawable?) : Drawable() {
         private val path = Path()
+        private val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
         private val rect = RectF()
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val node = RenderNode("Bilibili-story-danmaku-glass")
         private val shade = RenderNode("Bilibili-story-danmaku-shadow")
         private val lens = PostureGlass.shader(GlassHostLayout.ROUNDED_RECT_REFRACTION_SHADER)
-        private var front: Bitmap? = null
-        private var back: Bitmap? = null
-        private var pending = false
         private var released = false
         private val position = IntArray(2)
         private val sourcePosition = IntArray(2)
         private var pad = 0
         private var geometry = ""
-        private var frontX = 0f
-        private var frontY = 0f
-        private var frontScaleX = 1f
-        private var frontScaleY = 1f
-        private val sampling = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        private val sampleMatrix = Matrix()
-        private var samplingShader: BitmapShader? = null
         private val sourceToWindow = Matrix()
         private val ownerToWindow = Matrix()
         private val windowToOwner = Matrix()
         private val localSourceClip = Rect()
         private var rim: Shader? = null
-        private var sampledSurface: SurfaceView? = null
         private var sampledTexture: TextureView? = null
         private var sampledX = Int.MIN_VALUE
         private var sampledY = Int.MIN_VALUE
-        private var reportAt = 0L
-        private var copied = 0
-        private var latency = 0L
         fun needsSample(): Boolean {
             owner.getLocationInWindow(position)
-            return (if (texture != null) sampledTexture !== texture else front == null || sampledSurface !== surface) ||
-                position[0] != sampledX || position[1] != sampledY
+            return texture != null && (sampledTexture !== texture ||
+                position[0] != sampledX || position[1] != sampledY)
         }
         private fun shape() {
             rect.set(0f, 0f, owner.width.toFloat(), owner.height.toFloat())
@@ -213,55 +196,12 @@ internal class BilibiliStoryDanmakuGlass(private val activity: Activity, private
                 invalidateSelf()
                 return
             }
-            val source = surface ?: return
-            if (released || pending || !source.holder.surface.isValid || owner.width <= 0 || owner.height <= 0) return
-            val dp = owner.resources.displayMetrics.density
-            pad = NativeBackdropBlur.padding(minOf(config.blurRadius, 6f) * dp, 24f * dp).toInt()
-            owner.getLocationInWindow(position); source.getLocationInWindow(sourcePosition)
-            val crop = Rect(position[0] - sourcePosition[0] - pad, position[1] - sourcePosition[1] - pad,
-                position[0] - sourcePosition[0] + owner.width + pad, position[1] - sourcePosition[1] + owner.height + pad)
-            val desiredX = crop.left; val desiredY = crop.top
-            if (!crop.intersect(0, 0, source.width, source.height)) return
-            // Keep a separate write buffer; RenderThread may still read front.
-            // The background is blurred anyway: half-resolution copy reduces
-            // readback/upload area by four while retaining full-size optics.
-            val copyWidth = (crop.width() + 1) / 2
-            val copyHeight = (crop.height() + 1) / 2
-            val target = back?.takeIf { it.width == copyWidth && it.height == copyHeight }
-                ?: Bitmap.createBitmap(copyWidth, copyHeight, Bitmap.Config.ARGB_8888)
-            pending = true
-            val beganAt = SystemClock.uptimeMillis()
-            val copyX = position[0]; val copyY = position[1]
-            PixelCopy.request(source, crop, target, { result ->
-                pending = false
-                owner.getLocationInWindow(position)
-                if (!released && texture == null && source === surface && visibleMaterial() === this &&
-                    position[0] == copyX && position[1] == copyY && result == PixelCopy.SUCCESS) {
-                    back = front; front = target
-                    frontX = (crop.left - desiredX).toFloat(); frontY = (crop.top - desiredY).toFloat()
-                    frontScaleX = crop.width().toFloat() / target.width
-                    frontScaleY = crop.height().toFloat() / target.height
-                    samplingShader = BitmapShader(target, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-                    sampledSurface = source; sampledX = copyX; sampledY = copyY
-                    val now = SystemClock.uptimeMillis()
-                    if (reportAt == 0L) reportAt = now
-                    copied++; latency += now - beganAt
-                    if (now - reportAt >= 3000L) {
-                        val report = "state=$lastPlayerState copyFps=${copied * 1000L / (now - reportAt)} meanCopyMs=${latency / copied} roi=${target.width}x${target.height}"
-                        android.util.Log.i("LiquidTabBiliGlass", report)
-                        val context = activity.applicationContext
-                        worker.execute { context.getExternalFilesDir(null)?.resolve("liquidtab-story-glass-performance.txt")?.writeText(report) }
-                        reportAt = now; copied = 0; latency = 0L
-                    }
-                    invalidateSelf()
-                }
-            }, handler)
         }
         override fun draw(canvas: Canvas) {
             if (!canvas.isHardwareAccelerated || owner.width <= 0 || owner.height <= 0) return
             shape()
             val dp = owner.resources.displayMetrics.density
-            pad = NativeBackdropBlur.padding(minOf(config.blurRadius, 6f) * dp, 24f * dp).toInt()
+            pad = NativeBackdropBlur.padding(minOf(config.blurRadius, 6f) * dp, 24f * dp * config.refractionPaddingScale).toInt()
             val width = owner.width; val height = owner.height
             val w = width + pad * 2; val h = height + pad * 2
             PostureGlass.sync(lens, owner, config.postureEffectsEnabled && config.liquidGlassEnabled && !config.solidBarEnabled,
@@ -276,7 +216,7 @@ internal class BilibiliStoryDanmakuGlass(private val activity: Activity, private
                 lens.setFloatUniform("cornerRadii", height / 2f, height / 2f, height / 2f, height / 2f)
                 lens.setFloatUniform("safeSampleBounds", .5f, .5f, w - .5f, h - .5f)
                 lens.setFloatUniform("refractionHeight", 12f * dp)
-                lens.setFloatUniform("refractionAmount", -24f * dp)
+                lens.setFloatUniform("refractionAmount", -24f * dp * config.refractionScale)
                 lens.setFloatUniform("depthEffect", 0f)
                 lens.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
                 lens.setFloatUniformExact("flowingLiquidEnabled", 1f)
@@ -338,21 +278,15 @@ internal class BilibiliStoryDanmakuGlass(private val activity: Activity, private
                 node.endRecording()
                 val saved = canvas.save(); canvas.clipPath(path); canvas.translate(-pad.toFloat(), -pad.toFloat())
                 canvas.drawRenderNode(node); canvas.restoreToCount(saved)
-            } else front?.takeIf { !config.solidBarEnabled }?.let { bitmap ->
-                node.setPosition(0, 0, w, h)
-                val recording = node.beginRecording()
-                sampleMatrix.setScale(frontScaleX, frontScaleY)
-                sampleMatrix.postTranslate(frontX, frontY)
-                samplingShader?.setLocalMatrix(sampleMatrix)
-                sampling.shader = samplingShader
-                recording.drawRect(0f, 0f, w.toFloat(), h.toFloat(), sampling); node.endRecording()
-                val saved = canvas.save(); canvas.clipPath(path); canvas.translate(-pad.toFloat(), -pad.toFloat())
-                canvas.drawRenderNode(node); canvas.restoreToCount(saved)
             }
             paint.style = Paint.Style.FILL; paint.color = if (config.solidBarEnabled) 0xFF1C1C20.toInt() else 0x251C1C20; canvas.drawPath(path, paint)
+            if (config.liquidGlassEnabled && !config.solidBarEnabled) {
+                if (config.outlineEnabled) glassEdge.draw(canvas, path, dp, true, .84f * config.darkBarHighlightStrength)
+            } else {
             paint.style = Paint.Style.STROKE; paint.strokeWidth = .7f * dp
             paint.shader = rim
             canvas.drawPath(path, paint); paint.shader = null; paint.style = Paint.Style.FILL
+            }
         }
         fun exclude(canvas: Canvas) {
             if (!owner.isShown) return
@@ -370,7 +304,7 @@ internal class BilibiliStoryDanmakuGlass(private val activity: Activity, private
             released = true
             PostureGlass.track(owner, false)
             if (owner.background === this) owner.background = original
-            node.discardDisplayList(); shade.discardDisplayList(); front = null; back = null
+            node.discardDisplayList(); shade.discardDisplayList()
         }
         override fun setAlpha(alpha: Int) = Unit
         override fun setColorFilter(filter: ColorFilter?) = Unit
