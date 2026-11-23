@@ -10,6 +10,7 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.RenderEffect
+import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
@@ -22,10 +23,12 @@ import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.WindowGpuBackdropCapture
 import io.github.offlineglass.hook.adapters.localizeNavigationLabel
+import java.util.WeakHashMap
 import kotlin.math.max
 
-/** Per-host state, PixelCopy compositor control, tab icons/labels, and detached AI touch forwarding. */
+/** Per-host state, GPU window-strip capture, tab icons/labels, and detached AI touch forwarding. */
 internal class BaiduMapNavigationState(
     private var host: GlassHostLayout? = null,
 ) : AppNavigationState {
@@ -35,6 +38,7 @@ internal class BaiduMapNavigationState(
     private var aiOrbBitmap: Bitmap? = null
     private var lastRetryAt = 0L
     private var lastSource: ViewGroup? = null
+    private var lastActiveUfo: ViewGroup? = null
     private var lastUiBarAnimating = false
     private var pendingSelection: Int? = null
     private var selectionGuardUntil = 0L
@@ -44,13 +48,27 @@ internal class BaiduMapNavigationState(
     private val aiTouchLoc = IntArray(2)
     private val hostLoc = IntArray(2)
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var gpuCapture: WindowGpuBackdropCapture? = null
+    private var captureEpoch = 0L
+    private var captureGeneration = 0L
+    private var surfaceDirty = true
+
     private var blurredBitmap: Bitmap? = null
-    private var blurredGeneration = -1
+    private var blurredGeneration = -1L
     private var blurredWidth = 0
     private var blurredHeight = 0
     private var blurredEffect: RenderEffect? = null
     private var blurredConfig: GlassConfig? = null
     private var backdropDirty = true
+
+    private var outerRecordedBackdrop: Bitmap? = null
+    private var outerRecordedGeneration = -1L
+    private var outerRecordedWidth = 0
+    private var outerRecordedHeight = 0
+
+    private val savedNearbyMargins = WeakHashMap<View, Int>()
+    private val savedNearbyPaddings = WeakHashMap<View, Int>()
 
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val orbPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
@@ -65,10 +83,50 @@ internal class BaiduMapNavigationState(
     override val retainHiddenSourceFillWhileExpanded: Boolean get() = true
     override val allowsSoftwareBackdropCapture: Boolean get() = false
 
+    private fun ensureCapture(glass: GlassHostLayout): WindowGpuBackdropCapture =
+        gpuCapture ?: WindowGpuBackdropCapture(
+            host = glass,
+            tag = "BaiduMap",
+            downscale = 2f,
+            activeIntervalMs = 16L,
+            idleIntervalMs = 120L,
+        ).also { gpuCapture = it }
+
+    override fun requiresSampledBackdrop(): Boolean {
+        val cfg = host?.config ?: return true
+        return cfg.enabled && cfg.backdropCapture && !cfg.solidBarEnabled &&
+            (cfg.liquidGlassEnabled || cfg.blurRadius > 0f)
+    }
+
+    override fun allowsOpticalSurfacePipeline(): Boolean =
+        requiresSampledBackdrop() && gpuCapture?.isPermanentlyUnsupported != true
+
+    override fun preparesOpticalSurfaceForWindowCapture(): Boolean = true
+    override fun opticalCaptureEpoch(): Long = captureEpoch
+    override fun opticalSurfaceCopyHandler(): Handler = mainHandler
+    override fun pauseOpticalSurfaceProbe(): Boolean = true
+
     override fun onHostFrame(host: View) {
         val glass = host as? GlassHostLayout ?: return
         this.host = glass
-        prepare(glass.adapterNavigationSource) { delay, action -> glass.postDelayed(action, delay) }
+        val source = glass.adapterNavigationSource
+        val activeState = BaiduMapAdapter.resolveActiveUfo(glass.rootView as? ViewGroup, source)
+        if (source != null) {
+            BaiduMapAdapter.clearUfoChrome(source, expandHome = false)
+            if (!activeState.isOverlay) {
+                BaiduMapAdapter.expandTabPagesFullBleed(
+                    source,
+                    isNonHomeSelected = (glass.adapterSelectedIndex != 0),
+                    savedMargins = savedNearbyMargins,
+                    savedPaddings = savedNearbyPaddings,
+                )
+            }
+        }
+        val activeUfo = activeState.ufo
+        if (activeUfo != null && activeUfo !== source) {
+            BaiduMapAdapter.clearUfoChrome(activeUfo, expandHome = false)
+        }
+        prepare(activeUfo ?: source) { delay, action -> glass.postDelayed(action, delay) }
         updateBackdropRendererMode(glass)
     }
 
@@ -76,36 +134,104 @@ internal class BaiduMapNavigationState(
     override fun includeNavigationInIndicatorScene(surfaceActive: Boolean): Boolean = true
 
     override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
+        this.host = host
+        val capture = ensureCapture(host)
+        if (!requiresSampledBackdrop() || capture.isPermanentlyUnsupported) {
+            capture.cancel()
+            host.disableOpticalSurfaceNativeBlurForAdapter()
+            host.disableOpticalSurfaceRendererForAdapter()
+            return true
+        }
         if (host.liveBackdropActiveForAdapter) host.clearLiveBackdropForAdapter()
         host.disableOpticalSurfaceNativeBlurForAdapter()
         host.enableOpticalSurfaceRendererForAdapter()
+        if (host.isShown && host.hasWindowFocus()) {
+            capture.request(captureEpoch)
+        } else {
+            capture.cancel()
+        }
         return true
+    }
+
+    override fun onOpticalBackdropCaptured(barSource: Rect?) {
+        gpuCapture?.commitPublishedGeometry()
+        captureGeneration++
+        backdropDirty = true
+        surfaceDirty = false
     }
 
     override fun onOpticalBackdropChanged() {
         backdropDirty = true
+        surfaceDirty = true
+    }
+
+    override fun onOpticalSurfaceFrameInvalidated() {
+        backdropDirty = true
+        surfaceDirty = true
+        host?.postInvalidateOnAnimation()
+        mainHandler.post {
+            gpuCapture?.notifyMotion(1_500L, captureEpoch)
+        }
     }
 
     override fun onOpticalRendererConfigurationChanged() {
         blurredBitmap = null
-        blurredGeneration = -1
+        blurredGeneration = -1L
         blurredConfig = null
+        outerRecordedBackdrop = null
+        outerRecordedGeneration = -1L
+        outerRecordedWidth = 0
+        outerRecordedHeight = 0
         backdropDirty = true
+        surfaceDirty = true
+        gpuCapture?.notifyMotion(400L, captureEpoch)
+    }
+
+    override fun drawSampledBackdrop(
+        canvas: Canvas,
+        bitmap: Bitmap,
+        destination: RectF,
+        paint: Paint,
+    ): Boolean = gpuCapture?.drawBackdrop(canvas, bitmap, destination, paint) == true
+
+    override fun reuseOuterBackdropForSurface(surfaceActive: Boolean): Boolean = surfaceActive
+
+    override fun outerBackdropNeedsRecord(
+        backdrop: Bitmap?,
+        width: Int,
+        height: Int,
+        hasDisplayList: Boolean,
+    ): Boolean = !hasDisplayList || outerRecordedBackdrop !== backdrop ||
+        outerRecordedGeneration != captureGeneration ||
+        outerRecordedWidth != width || outerRecordedHeight != height
+
+    override fun onOuterBackdropRecorded(backdrop: Bitmap?, width: Int, height: Int) {
+        outerRecordedBackdrop = backdrop
+        outerRecordedGeneration = captureGeneration
+        outerRecordedWidth = width
+        outerRecordedHeight = height
     }
 
     override fun opticalBlurNodeNeedsRecord(
-        prepared: Boolean, backdrop: Bitmap?, width: Int, height: Int, effect: RenderEffect?,
+        prepared: Boolean,
+        backdrop: Bitmap?,
+        width: Int,
+        height: Int,
+        effect: RenderEffect?,
     ): Boolean = !prepared || backdropDirty || blurredBitmap !== backdrop ||
-        blurredGeneration != (backdrop?.generationId ?: -1) ||
+        blurredGeneration != captureGeneration ||
         blurredWidth != width || blurredHeight != height ||
         blurredEffect !== effect || blurredConfig != host?.config
 
     override fun onOpticalBlurNodeRecorded(
-        backdrop: Bitmap?, width: Int, height: Int, effect: RenderEffect?,
+        backdrop: Bitmap?,
+        width: Int,
+        height: Int,
+        effect: RenderEffect?,
     ) {
         backdropDirty = false
         blurredBitmap = backdrop
-        blurredGeneration = backdrop?.generationId ?: -1
+        blurredGeneration = captureGeneration
         blurredWidth = width
         blurredHeight = height
         blurredEffect = effect
@@ -113,38 +239,96 @@ internal class BaiduMapNavigationState(
     }
 
     override fun shouldQueueOpticalRenderFromUi(animating: Boolean): Boolean {
-        val queue = animating || lastUiBarAnimating
+        val queue = animating || lastUiBarAnimating || surfaceDirty
         lastUiBarAnimating = animating
+        surfaceDirty = false
         return queue
+    }
+
+    override fun onContentScroll() {
+        gpuCapture?.notifyMotion(1_200L, captureEpoch)
+    }
+
+    fun onWindowTouch(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_MOVE,
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> gpuCapture?.notifyMotion(1_200L, captureEpoch)
+        }
+    }
+
+    override fun onNavigationTabSwitched(index: Int, slotCount: Int, now: Long) {
+        captureEpoch++
+        backdropDirty = true
+        surfaceDirty = true
+        outerRecordedGeneration = -1L
+        gpuCapture?.notifyMotion(1_200L, captureEpoch)
+        host?.postInvalidateOnAnimation()
+    }
+
+    override fun onHostFocusLost() {
+        gpuCapture?.cancel()
+    }
+
+    override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+        if (!hasFocus) {
+            gpuCapture?.cancel()
+        } else {
+            surfaceDirty = true
+            backdropDirty = true
+            gpuCapture?.notifyMotion(800L, captureEpoch)
+            host?.postInvalidateOnAnimation()
+        }
     }
 
     override fun actionButtonPressProgress(): Float = aiPressProgress
 
+    private fun currentActiveUfo(source: ViewGroup?): ViewGroup? {
+        val rootGroup = host?.rootView as? ViewGroup
+        val state = BaiduMapAdapter.resolveActiveUfo(rootGroup, source)
+        val active = state.ufo ?: source
+        if (active !== lastActiveUfo) {
+            lastActiveUfo = active
+            if (active != null) {
+                captureEpoch++
+                backdropDirty = true
+                surfaceDirty = true
+                outerRecordedGeneration = -1L
+                gpuCapture?.notifyMotion(1_200L, captureEpoch)
+                host?.postInvalidateOnAnimation()
+            }
+        }
+        return active
+    }
+
     override fun suppressHostNativeChrome(source: ViewGroup?, root: View, selected: Int) {
-        val ufo = source ?: return
-        if (ufo.alpha != 0f) ufo.alpha = 0f
-        BaiduMapAdapter.suppressNativeBottomChrome(ufo)
+        val activeState = BaiduMapAdapter.resolveActiveUfo(root as? ViewGroup, source)
+        if (source != null) {
+            BaiduMapAdapter.clearUfoChrome(source, expandHome = false)
+            if (!activeState.isOverlay) {
+                BaiduMapAdapter.expandTabPagesFullBleed(
+                    source,
+                    isNonHomeSelected = (selected != 0),
+                    savedMargins = savedNearbyMargins,
+                    savedPaddings = savedNearbyPaddings,
+                )
+            }
+        }
+        val activeUfo = activeState.ufo
+        if (activeUfo != null && activeUfo !== source) {
+            BaiduMapAdapter.clearUfoChrome(activeUfo, expandHome = false)
+        }
     }
 
     override fun pageAllowsNavigation(root: View?): Boolean? {
         val rootGroup = root as? ViewGroup ?: return null
-        val ufo = host?.adapterNavigationSource
-        if (ufo != null && (!ufo.isAttachedToWindow || !ufo.isShown || ufo.height <= 0 || ufo.translationY > 24f)) {
-            return false
+        val source = host?.adapterNavigationSource
+        val state = BaiduMapAdapter.resolveActiveUfo(rootGroup, source)
+        if (state.allowed) {
+            currentActiveUfo(source)
         }
-        val pkg = rootGroup.context.packageName
-        val res = rootGroup.resources
-        for (overlayName in arrayOf("replace_container", "base_stack_lui")) {
-            val id = res.getIdentifier(overlayName, "id", pkg)
-            val container = (if (id != 0) rootGroup.findViewById<View>(id) else null) as? ViewGroup ?: continue
-            for (i in 0 until container.childCount) {
-                val child = container.getChildAt(i)
-                if (child.isShown && child.alpha > 0.01f && child.width > 0 && child.height > 0) {
-                    return false
-                }
-            }
-        }
-        return true
+        return state.allowed
     }
 
     override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) {
@@ -202,7 +386,7 @@ internal class BaiduMapNavigationState(
     }
 
     override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
-        val ufo = source ?: return null
+        val ufo = currentActiveUfo(source) ?: return null
         val btns = BaiduMapAdapter.findNewBtns(ufo) ?: return null
         if (btns.childCount < 5) return null
         val now = SystemClock.uptimeMillis()
@@ -213,7 +397,9 @@ internal class BaiduMapNavigationState(
             val cell = btns.getChildAt(index) as? ViewGroup ?: continue
             val drawee = findDraweeView(cell)
             val str = drawee?.toString().orEmpty()
-            if (drawee != null && (drawee.drawable?.isVisible == true || str.contains("drawableVisible=true"))) {
+            if (drawee != null && drawee.visibility == View.VISIBLE && drawee.isShown &&
+                (drawee.drawable?.isVisible == true || str.contains("drawableVisible=true"))
+            ) {
                 detected = index
                 break
             }
@@ -252,15 +438,16 @@ internal class BaiduMapNavigationState(
     }
 
     override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
-        val ufo = source ?: return false
+        val ufo = currentActiveUfo(source) ?: return false
         if (index == BaiduMapAdapter.AI_INDEX) {
             val aiTarget = findAiTouchTarget(ufo) ?: return false
+            gpuCapture?.notifyMotion(1_200L, captureEpoch)
             return aiTarget.performClick()
         }
         val btns = BaiduMapAdapter.findNewBtns(ufo) ?: return false
         val cell = btns.getChildAt(index) ?: return false
         pendingSelection = index
-        selectionGuardUntil = SystemClock.uptimeMillis() + 500L
+        selectionGuardUntil = SystemClock.uptimeMillis() + 600L
         var ok = cell.performClick()
         if (!ok) {
             val t = SystemClock.uptimeMillis()
@@ -271,13 +458,14 @@ internal class BaiduMapNavigationState(
             down.recycle()
             up.recycle()
         }
+        gpuCapture?.notifyMotion(1_200L, captureEpoch)
         host.invalidate()
         return ok
     }
 
     override fun interceptNavigationTouch(host: View, event: MotionEvent): Boolean? {
         val glass = (host as? GlassHostLayout) ?: this.host ?: return null
-        val ufo = glass.adapterNavigationSource ?: return null
+        val ufo = currentActiveUfo(glass.adapterNavigationSource) ?: return null
         val barLayout = BaiduMapAdapter.barLayout(
             glass.config,
             glass.width,
@@ -312,6 +500,7 @@ internal class BaiduMapNavigationState(
         if (aiPressed == pressed) return
         aiPressed = pressed
         aiPressProgress = if (pressed) 1f else 0f
+        surfaceDirty = true
         glass.invalidate()
     }
 
@@ -337,7 +526,13 @@ internal class BaiduMapNavigationState(
     }
 
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
-        drawTabs(canvas, frame, active = frame.hideSelectedForOptics, includeDetached = false)
+        drawTabs(
+            canvas,
+            frame,
+            active = frame.hideSelectedForOptics,
+            includeDetached = false,
+            highlightSelected = frame.hideSelectedForOptics,
+        )
     }
 
     override fun drawForeground(
@@ -348,24 +543,53 @@ internal class BaiduMapNavigationState(
     ): Boolean {
         val detached = frame.barLayout
         if (selectionPath.isEmpty) {
-            drawTabs(canvas, frame, active = false, includeDetached = detached != null)
+            drawTabs(
+                canvas,
+                frame,
+                active = false,
+                includeDetached = detached != null,
+                highlightSelected = true,
+            )
             return true
         }
         val outside = canvas.save()
         canvas.clipOutPath(selectionPath)
-        drawTabs(canvas, frame, active = false, includeDetached = detached != null)
+        drawTabs(
+            canvas,
+            frame,
+            active = false,
+            includeDetached = detached != null,
+            highlightSelected = false,
+        )
         canvas.restoreToCount(outside)
 
-        val plain = 1f - frame.navigationOpticalMix.coerceIn(0f, 1f)
+        val hasBackdrop = canvas.isHardwareAccelerated &&
+            host?.hasUsableBackdrop() == true &&
+            host?.config?.backdropCapture == true &&
+            host?.config?.solidBarEnabled != true
+        val opticalMix = if (hasBackdrop) frame.navigationOpticalMix.coerceIn(0f, 1f) else 0f
+        val plain = 1f - opticalMix
         if (plain > 0f) {
             val inside = canvas.save()
             canvas.clipPath(selectionPath)
-            canvas.saveLayerAlpha(
-                0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
-                (plain * 255f).toInt(),
-            )
-            drawTabs(canvas, frame, active = true, includeDetached = false)
-            canvas.restoreToCount(inside)
+            val layer = if (plain < 0.999f) {
+                canvas.saveLayerAlpha(
+                    0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+                    (plain * 255f).toInt().coerceIn(0, 255),
+                )
+            } else -1
+            try {
+                drawTabs(
+                    canvas,
+                    frame,
+                    active = true,
+                    includeDetached = false,
+                    highlightSelected = true,
+                )
+            } finally {
+                if (layer >= 0) canvas.restoreToCount(layer)
+                canvas.restoreToCount(inside)
+            }
         }
         return true
     }
@@ -375,10 +599,11 @@ internal class BaiduMapNavigationState(
         frame: AdapterNavigationFrame,
         active: Boolean,
         includeDetached: Boolean,
+        highlightSelected: Boolean,
     ) {
         if (frame.width <= 0 || frame.height <= 0 || frame.slotCount <= 0) return
         val heightScale = (frame.height / (64f * frame.density)).coerceIn(0.875f, 1f)
-        val itemScale = frame.iconScale * frame.extraScale * heightScale
+        val itemScale = frame.iconScale * (if (frame.hideSelectedForOptics) frame.extraScale else frame.extraScale * heightScale)
         val unselectedColor = if (frame.darkGlass) 0xFFE6E6E6.toInt() else 0xFF1F2329.toInt()
         val horizontalPadding = 4f * frame.density
         val defaultNames = arrayOf("首页", "周边", "对话", "打车", "我的")
@@ -420,7 +645,7 @@ internal class BaiduMapNavigationState(
             val bitmap = tabIcons.getOrNull(index)?.takeUnless(Bitmap::isRecycled)
             val label = tabLabels.getOrNull(index) ?: defaultNames.getOrNull(index) ?: ""
             val selected = active || index == frame.selectedIndex
-            val color = if (active || (frame.navigationOpticalMix < 0.5f && selected)) frame.accentColor else unselectedColor
+            val color = if (active || (highlightSelected && selected)) frame.accentColor else unselectedColor
 
             canvas.save()
             canvas.scale(itemScale, itemScale, centerX, frame.height / 2f)
@@ -592,11 +817,46 @@ internal class BaiduMapNavigationState(
         return trimmed
     }
 
+    private fun restoreNearbyInsets() {
+        savedNearbyMargins.forEach { (view, margin) ->
+            if (view.isAttachedToWindow) {
+                val lp = view.layoutParams as? ViewGroup.MarginLayoutParams
+                if (lp != null && lp.bottomMargin != margin) {
+                    lp.bottomMargin = margin
+                    view.layoutParams = lp
+                }
+            }
+        }
+        savedNearbyMargins.clear()
+        savedNearbyPaddings.forEach { (view, pad) ->
+            if (view.isAttachedToWindow && view.paddingBottom != pad) {
+                view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, pad)
+            }
+        }
+        savedNearbyPaddings.clear()
+    }
+
+    override fun onHostDetached() {
+        gpuCapture?.cancel()
+        restoreNearbyInsets()
+        lastSource = null
+        lastActiveUfo = null
+    }
+
     override fun dispose() {
+        gpuCapture?.dispose()
+        gpuCapture = null
+        restoreNearbyInsets()
+        blurredBitmap = null
+        blurredGeneration = -1L
+        blurredConfig = null
+        outerRecordedBackdrop = null
+        outerRecordedGeneration = -1L
         tabIcons.forEach { it?.takeUnless(Bitmap::isRecycled)?.recycle() }
         tabIcons.fill(null)
         aiOrbBitmap?.takeUnless(Bitmap::isRecycled)?.recycle()
         aiOrbBitmap = null
         lastSource = null
+        lastActiveUfo = null
     }
 }

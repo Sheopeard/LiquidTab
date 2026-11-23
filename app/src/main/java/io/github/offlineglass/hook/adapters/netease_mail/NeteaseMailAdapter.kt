@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.hook.GlassHostLayout
@@ -23,6 +24,8 @@ internal object NeteaseMailAdapter : TargetAdapter {
     override val ownsNavigationFinding = true
     override val recheckNavigationBindingOnLayout = true
     override val keepNavigationOverlayOnTop = true
+    override val ownsHostNativeChrome = true
+    override val keepsBackdropDuringTapTransition = true
     override val suppressPlatformElevation = true
     override val continuousIndicatorMask = true
 
@@ -30,6 +33,8 @@ internal object NeteaseMailAdapter : TargetAdapter {
     override val skipNavigationSnapshot = true
     override val drawsNavigationInOptics = true
     override val foregroundNavigationOverSelection = true
+    override val foregroundUsesRenderedSelectionOutline = true
+    override val foregroundRequiresSubmittedIndicatorArtwork = true
     override val foregroundMaskInsetDp = 0f
     override val usesNavigationOpticalMix = true
     override val persistentNavigationOpticalMix = true
@@ -41,18 +46,24 @@ internal object NeteaseMailAdapter : TargetAdapter {
     override val sourceSwapGraceMs = 0L
     override val accentColor: Int = 0xFFDF362F.toInt()
 
-    // Unified PixelCopy compositor pipeline across all 5 tabs eliminates flash between
+    // Unified GPU Surface compositor pipeline across all 5 tabs eliminates flash between
     // native tabs (邮件/待办/我) and WebView tabs (文件) and supplies a real backdrop on all tabs.
     override val usesOpticalSurfacePipeline = true
+    override val usesDirectOpticalBackdropMode = true
     override val allowsSystemBackgroundBlur = false
     override val keepsOpticalSurfaceDuringBarAnimation = true
     override val countsOpticalCompositorCopies = true
     override val reuseOpticalBlur = true
     override val reuseSurfaceBlurDuringBarAnimation = true
     override val deferOpticalRenderDuringBarAnimation = true
+    override val observeWindowTouches = true
 
     override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean = true
-    override fun needsContinuousOpticalSurfaceFrames(selectedIndex: Int): Boolean = true
+    override fun needsContinuousOpticalSurfaceFrames(selectedIndex: Int): Boolean = false
+
+    override fun onWindowTouch(host: View, event: MotionEvent) {
+        ((host as? GlassHostLayout)?.appNavigationState as? NeteaseMailNavigationState)?.onWindowTouch(event)
+    }
 
     override fun opticalCaptureGeometry(
         rootWidth: Int, rootHeight: Int, left: Int, top: Int, width: Int, height: Int, padding: Int,

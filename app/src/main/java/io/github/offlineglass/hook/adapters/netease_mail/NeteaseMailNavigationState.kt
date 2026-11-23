@@ -12,6 +12,7 @@ import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.RenderEffect
 import android.graphics.drawable.Animatable
+import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
@@ -25,13 +26,14 @@ import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.WindowGpuBackdropCapture
 import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 import kotlin.math.abs
 import kotlin.math.max
 
-/** Per-host state: live Lottie icon rendering, native Mail Agent purple accent, unified PixelCopy control, FAB lift, drawer hide. */
+/** Per-host state: live Lottie icon rendering, native Mail Agent purple accent, GPU window-strip capture, FAB lift, drawer hide. */
 internal class NeteaseMailNavigationState(
     private val host: GlassHostLayout? = null,
 ) : AppNavigationState {
@@ -52,6 +54,12 @@ internal class NeteaseMailNavigationState(
     private var lottieAnimatingUntil = 0L
     private var lastUiBarAnimating = false
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var gpuCapture: WindowGpuBackdropCapture? = null
+    private var captureEpoch = 0L
+    private var captureGeneration = 0L
+    private var surfaceDirty = true
+
     private val cachedFabs = ArrayList<WeakReference<View>>()
     private var cachedDateIndicator: WeakReference<View>? = null
     private var lastFabProbeAt = 0L
@@ -62,12 +70,17 @@ internal class NeteaseMailNavigationState(
     private var lastDrawerProbeAt = 0L
 
     private var blurredBitmap: Bitmap? = null
-    private var blurredGeneration = -1
+    private var blurredGeneration = -1L
     private var blurredWidth = 0
     private var blurredHeight = 0
     private var blurredEffect: RenderEffect? = null
     private var blurredConfig: GlassConfig? = null
     private var backdropDirty = true
+
+    private var outerRecordedBackdrop: Bitmap? = null
+    private var outerRecordedGeneration = -1L
+    private var outerRecordedWidth = 0
+    private var outerRecordedHeight = 0
 
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val tintPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -91,40 +104,131 @@ internal class NeteaseMailNavigationState(
     override val retainHiddenSourceFillWhileExpanded: Boolean get() = true
     override val allowsSoftwareBackdropCapture: Boolean get() = false
 
+    private fun ensureCapture(glass: GlassHostLayout): WindowGpuBackdropCapture =
+        gpuCapture ?: WindowGpuBackdropCapture(
+            host = glass,
+            tag = "NeteaseMail",
+            downscale = 2f,
+            activeIntervalMs = 16L,
+            idleIntervalMs = 220L,
+        ).also { gpuCapture = it }
+
+    override fun requiresSampledBackdrop(): Boolean {
+        val cfg = activeHost?.config ?: return true
+        return cfg.enabled && cfg.backdropCapture && !cfg.solidBarEnabled &&
+            (cfg.liquidGlassEnabled || cfg.blurRadius > 0f)
+    }
+
+    override fun allowsOpticalSurfacePipeline(): Boolean =
+        requiresSampledBackdrop() && gpuCapture?.isPermanentlyUnsupported != true
+
+    override fun preparesOpticalSurfaceForWindowCapture(): Boolean = true
+    override fun opticalCaptureEpoch(): Long = captureEpoch
+    override fun opticalSurfaceCopyHandler(): Handler = mainHandler
+    override fun pauseOpticalSurfaceProbe(): Boolean = true
+
     override fun skipLiveBackdrop(selectedIndex: Int): Boolean = true
     override fun includeNavigationInIndicatorScene(surfaceActive: Boolean): Boolean = true
 
     override fun updateBackdropRendererMode(host: GlassHostLayout): Boolean {
+        activeHost = host
+        val capture = ensureCapture(host)
+        if (!requiresSampledBackdrop() || capture.isPermanentlyUnsupported) {
+            capture.cancel()
+            host.disableOpticalSurfaceNativeBlurForAdapter()
+            host.disableOpticalSurfaceRendererForAdapter()
+            return true
+        }
         if (host.liveBackdropActiveForAdapter) host.clearLiveBackdropForAdapter()
         host.disableOpticalSurfaceNativeBlurForAdapter()
         host.enableOpticalSurfaceRendererForAdapter()
+        if (host.isShown && host.hasWindowFocus()) {
+            capture.request(captureEpoch)
+        } else {
+            capture.cancel()
+        }
         return true
+    }
+
+    override fun onOpticalBackdropCaptured(barSource: Rect?) {
+        gpuCapture?.commitPublishedGeometry()
+        captureGeneration++
+        backdropDirty = true
+        surfaceDirty = false
     }
 
     override fun onOpticalBackdropChanged() {
         backdropDirty = true
+        surfaceDirty = true
+    }
+
+    override fun onOpticalSurfaceFrameInvalidated() {
+        backdropDirty = true
+        surfaceDirty = true
+        activeHost?.postInvalidateOnAnimation()
+        mainHandler.post {
+            gpuCapture?.notifyMotion(1_500L, captureEpoch)
+        }
     }
 
     override fun onOpticalRendererConfigurationChanged() {
         blurredBitmap = null
-        blurredGeneration = -1
+        blurredGeneration = -1L
         blurredConfig = null
+        outerRecordedBackdrop = null
+        outerRecordedGeneration = -1L
+        outerRecordedWidth = 0
+        outerRecordedHeight = 0
         backdropDirty = true
+        surfaceDirty = true
+        gpuCapture?.notifyMotion(400L, captureEpoch)
+    }
+
+    override fun drawSampledBackdrop(
+        canvas: Canvas,
+        bitmap: Bitmap,
+        destination: RectF,
+        paint: Paint,
+    ): Boolean = gpuCapture?.drawBackdrop(canvas, bitmap, destination, paint) == true
+
+    override fun reuseOuterBackdropForSurface(surfaceActive: Boolean): Boolean = surfaceActive
+
+    override fun outerBackdropNeedsRecord(
+        backdrop: Bitmap?,
+        width: Int,
+        height: Int,
+        hasDisplayList: Boolean,
+    ): Boolean = !hasDisplayList || outerRecordedBackdrop !== backdrop ||
+        outerRecordedGeneration != captureGeneration ||
+        outerRecordedWidth != width || outerRecordedHeight != height
+
+    override fun onOuterBackdropRecorded(backdrop: Bitmap?, width: Int, height: Int) {
+        outerRecordedBackdrop = backdrop
+        outerRecordedGeneration = captureGeneration
+        outerRecordedWidth = width
+        outerRecordedHeight = height
     }
 
     override fun opticalBlurNodeNeedsRecord(
-        prepared: Boolean, backdrop: Bitmap?, width: Int, height: Int, effect: RenderEffect?,
+        prepared: Boolean,
+        backdrop: Bitmap?,
+        width: Int,
+        height: Int,
+        effect: RenderEffect?,
     ): Boolean = !prepared || backdropDirty || blurredBitmap !== backdrop ||
-        blurredGeneration != (backdrop?.generationId ?: -1) ||
+        blurredGeneration != captureGeneration ||
         blurredWidth != width || blurredHeight != height ||
         blurredEffect !== effect || blurredConfig != activeHost?.config
 
     override fun onOpticalBlurNodeRecorded(
-        backdrop: Bitmap?, width: Int, height: Int, effect: RenderEffect?,
+        backdrop: Bitmap?,
+        width: Int,
+        height: Int,
+        effect: RenderEffect?,
     ) {
         backdropDirty = false
         blurredBitmap = backdrop
-        blurredGeneration = backdrop?.generationId ?: -1
+        blurredGeneration = captureGeneration
         blurredWidth = width
         blurredHeight = height
         blurredEffect = effect
@@ -133,9 +237,48 @@ internal class NeteaseMailNavigationState(
 
     override fun shouldQueueOpticalRenderFromUi(animating: Boolean): Boolean {
         val lottieActive = isLottieAnimating()
-        val queue = animating || lastUiBarAnimating || lottieActive
+        val queue = animating || lastUiBarAnimating || lottieActive || surfaceDirty
         lastUiBarAnimating = animating || lottieActive
+        surfaceDirty = false
         return queue
+    }
+
+    override fun onContentScroll() {
+        gpuCapture?.notifyMotion(1_200L, captureEpoch)
+    }
+
+    fun onWindowTouch(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_MOVE,
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> gpuCapture?.notifyMotion(1_200L, captureEpoch)
+        }
+    }
+
+    override fun onNavigationTabSwitched(index: Int, slotCount: Int, now: Long) {
+        captureEpoch++
+        backdropDirty = true
+        surfaceDirty = true
+        outerRecordedGeneration = -1L
+        lottieAnimatingUntil = maxOf(lottieAnimatingUntil, now + 900L)
+        gpuCapture?.notifyMotion(1_200L, captureEpoch)
+        activeHost?.postInvalidateOnAnimation()
+    }
+
+    override fun onHostFocusLost() {
+        gpuCapture?.cancel()
+    }
+
+    override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+        if (!hasFocus) {
+            gpuCapture?.cancel()
+        } else {
+            surfaceDirty = true
+            backdropDirty = true
+            gpuCapture?.notifyMotion(800L, captureEpoch)
+            activeHost?.postInvalidateOnAnimation()
+        }
     }
 
     override fun onHostFrame(host: View) {
@@ -372,12 +515,18 @@ internal class NeteaseMailNavigationState(
             down.recycle()
             up.recycle()
         }
+        gpuCapture?.notifyMotion(1_200L, captureEpoch)
         host.invalidate()
         return dispatched
     }
 
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
-        drawTabs(canvas, frame, active = frame.hideSelectedForOptics)
+        drawTabs(
+            canvas,
+            frame,
+            active = frame.hideSelectedForOptics,
+            highlightSelected = frame.hideSelectedForOptics,
+        )
     }
 
     override fun drawForeground(
@@ -387,32 +536,48 @@ internal class NeteaseMailNavigationState(
         drawSource: () -> Unit,
     ): Boolean {
         if (selectionPath.isEmpty) {
-            drawTabs(canvas, frame, active = false)
+            drawTabs(canvas, frame, active = false, highlightSelected = true)
             return true
         }
         val outside = canvas.save()
         canvas.clipOutPath(selectionPath)
-        drawTabs(canvas, frame, active = false)
+        drawTabs(canvas, frame, active = false, highlightSelected = false)
         canvas.restoreToCount(outside)
 
-        val plain = 1f - frame.navigationOpticalMix.coerceIn(0f, 1f)
+        val hasBackdrop = canvas.isHardwareAccelerated &&
+            activeHost?.hasUsableBackdrop() == true &&
+            activeHost?.config?.backdropCapture == true &&
+            activeHost?.config?.solidBarEnabled != true
+        val opticalMix = if (hasBackdrop) frame.navigationOpticalMix.coerceIn(0f, 1f) else 0f
+        val plain = 1f - opticalMix
         if (plain > 0f) {
             val inside = canvas.save()
             canvas.clipPath(selectionPath)
-            canvas.saveLayerAlpha(
-                0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
-                (plain * 255f).toInt(),
-            )
-            drawTabs(canvas, frame, active = true)
-            canvas.restoreToCount(inside)
+            val layer = if (plain < 0.999f) {
+                canvas.saveLayerAlpha(
+                    0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+                    (plain * 255f).toInt().coerceIn(0, 255),
+                )
+            } else -1
+            try {
+                drawTabs(canvas, frame, active = true, highlightSelected = true)
+            } finally {
+                if (layer >= 0) canvas.restoreToCount(layer)
+                canvas.restoreToCount(inside)
+            }
         }
         return true
     }
 
-    private fun drawTabs(canvas: Canvas, frame: AdapterNavigationFrame, active: Boolean) {
+    private fun drawTabs(
+        canvas: Canvas,
+        frame: AdapterNavigationFrame,
+        active: Boolean,
+        highlightSelected: Boolean,
+    ) {
         if (frame.width <= 0 || frame.height <= 0 || frame.slotCount <= 0) return
         val heightScale = (frame.height / (64f * frame.density)).coerceIn(0.875f, 1f)
-        val itemScale = frame.iconScale * frame.extraScale * heightScale
+        val itemScale = frame.iconScale * (if (frame.hideSelectedForOptics) frame.extraScale else frame.extraScale * heightScale)
         val unselectedColor = if (frame.darkGlass) 0xFFE6E6E6.toInt() else 0xFF1F2329.toInt()
         val horizontalPadding = 4f * frame.density
         val defaultNames = arrayOf("邮件", "文件", "Mail Agent", "待办", "我")
@@ -434,7 +599,7 @@ internal class NeteaseMailNavigationState(
             val label = tabLabels.getOrNull(index) ?: defaultNames.getOrNull(index) ?: ""
             val selected = active || index == frame.selectedIndex
             val slotAccent = if (index == AI_AGENT_INDEX) aiAccentColor else frame.accentColor
-            val color = if (active || (frame.navigationOpticalMix < 0.5f && selected)) slotAccent else unselectedColor
+            val color = if (active || (highlightSelected && selected)) slotAccent else unselectedColor
 
             canvas.save()
             canvas.scale(itemScale, itemScale, centerX, frame.height / 2f)
@@ -449,7 +614,7 @@ internal class NeteaseMailNavigationState(
                 val dw = w * scale
                 val dh = h * scale
                 val needsTint = when {
-                    index == nativeSelected && selected -> false // Keep native Lottie active color (red or Mail Agent purple)
+                    index == nativeSelected && (active || (highlightSelected && selected)) -> false // Keep native Lottie active color (red or Mail Agent purple)
                     active -> true                               // Pill dragging over another slot -> tint with slotAccent
                     frame.darkGlass -> true                      // Dark glass unselected -> bright tint
                     else -> false                                // Light glass unselected -> native Lottie dark outline & reverse anim
@@ -531,16 +696,29 @@ internal class NeteaseMailNavigationState(
     }
 
     private fun refreshLiveBadges(nav: ViewGroup) {
+        var changed = false
         for (i in 0 until minOf(5, nav.childCount)) {
             val cell = nav.getChildAt(i) as? ViewGroup ?: continue
             val countView = findTabText(cell, "count_view")
-            badgeTexts[i] = if (countView != null && countView.visibility == View.VISIBLE) {
+            val nextText = if (countView != null && countView.visibility == View.VISIBLE) {
                 countView.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
             } else {
                 null
             }
+            if (badgeTexts[i] != nextText) {
+                badgeTexts[i] = nextText
+                changed = true
+            }
             val newView = findChildByIdName(cell, "new_view")
-            badgeDots[i] = newView != null && newView.visibility == View.VISIBLE
+            val nextDot = newView != null && newView.visibility == View.VISIBLE
+            if (badgeDots[i] != nextDot) {
+                badgeDots[i] = nextDot
+                changed = true
+            }
+        }
+        if (changed) {
+            surfaceDirty = true
+            activeHost?.postInvalidateOnAnimation()
         }
     }
 
@@ -674,15 +852,23 @@ internal class NeteaseMailNavigationState(
         return trimmed
     }
 
+    override fun onHostDetached() {
+        gpuCapture?.cancel()
+    }
+
     override fun dispose() {
+        gpuCapture?.dispose()
+        gpuCapture = null
         appliedOffsets.forEach { (view, applied) ->
             if (view.isAttachedToWindow) view.translationY -= applied
         }
         appliedOffsets.clear()
         cachedDateIndicator = null
         blurredBitmap = null
-        blurredGeneration = -1
+        blurredGeneration = -1L
         blurredConfig = null
+        outerRecordedBackdrop = null
+        outerRecordedGeneration = -1L
         paddedScrollViews.forEach { (view, base) ->
             if (view.isAttachedToWindow) {
                 view.setPadding(view.paddingLeft, view.paddingTop, view.paddingRight, base)

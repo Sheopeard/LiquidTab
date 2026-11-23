@@ -67,6 +67,8 @@ internal interface TargetAdapter {
     val unifiedDropletPilot: Boolean get() = false
     val directionalRimPilot: Boolean get() = false
     val outerRefractionScale: Float get() = io.github.offlineglass.rendering.PostureGlass.REFRACTION_SCALE
+    /** Outer lens rim depth in dp; 24dp preserves the default shared bottom-bar profile. */
+    val outerRefractionHeightDp: Float get() = 24f
     val tiltShadowStrength: Float get() = io.github.offlineglass.rendering.PostureGlass.SHADOW_STRENGTH
     fun barLayout(config: GlassConfig, width: Int, height: Int, density: Float, slots: Int): AdapterBarLayout? = null
     /** Adapter policy applied to drawing, optics and input through the same index mapping. */

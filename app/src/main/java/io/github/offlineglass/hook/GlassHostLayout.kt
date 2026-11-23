@@ -8317,7 +8317,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
 
-        setOuterLensUniforms(outer)
+        setOuterLensUniforms(outer, refractionHeightDp = targetAdapter?.outerRefractionHeightDp ?: 24f)
 
         combinedOuter?.let(::setTabsBackdropLensUniforms)
 
@@ -8468,7 +8468,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         // Match the manager hidden layer: opposing refraction bands must leave a neutral centre.
         val hiddenRefractionHeight = io.github.offlineglass.rendering.BottomBarRefraction.depthPx(
-            24f * density, rowHeight, density)
+            (targetAdapter?.outerRefractionHeightDp ?: 24f) * density, rowHeight, density)
         shader.setFloatUniform("refractionHeight", hiddenRefractionHeight)
 
         shader.setFloatUniform("refractionAmount", -24f * density *
@@ -9302,7 +9302,7 @@ internal fun hasUsableBackdrop(): Boolean =
         val key = listOf(config, w, h, padding, lastTiltOpticsAt)
         var effect = if (mainPanel) mainGlassEffect else actionGlassEffect
         if ((if (mainPanel) mainGlassKey else actionGlassKey) != key || effect == null) {
-            setOuterLensUniforms(shader)
+            setOuterLensUniforms(shader, refractionHeightDp = targetAdapter?.outerRefractionHeightDp ?: 24f)
             shader.setFloatUniform("size", bounds.width(), bounds.height())
             shader.setFloatUniform("detachedGeometry", 0f, 0f, 0f)
             shader.setFloatUniform("offset", -padding.toFloat(), -padding.toFloat())
